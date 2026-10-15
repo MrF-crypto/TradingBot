@@ -138,14 +138,18 @@ int main() {
         fail_n.store(1);
         fail_from.store(calls.load() + 1);              // 下一轮失败一次
         const int target = fail_from.load() + 3;
-        check(wait_until([&] { return calls.load() >= target; }), "  失败一轮后又跑了两轮");
+        check(wait_until([&] { return calls.load() >= target; }, 15000), "  失败一轮后又跑了两轮");
         {
             std::lock_guard<std::mutex> lk(lm);
             check(logs.empty(), "只失败一轮：不写日志（实际 " + std::to_string(logs.size()) + " 条）");
         }
+        // 再来一段连续 4 轮的失败。先撤掉旧窗口再改长度：反过来的话，行情线程可能在两次写之间
+        // 拿"旧起点 + 新长度"判一轮，多出一轮失败
+        fail_from.store(-1);
         fail_n.store(4);
-        fail_from.store(calls.load() + 1);              // 再来一段连续 4 轮的失败
-        check(wait_until([&] { std::lock_guard<std::mutex> lk(lm); return logs.size() >= 2; }),
+        fail_from.store(calls.load() + 1);
+        // 1 秒一轮：4 轮失败 + 1 轮恢复至少 5 秒，默认的 5 秒等待在慢机器（CI、TSan）上不够
+        check(wait_until([&] { std::lock_guard<std::mutex> lk(lm); return logs.size() >= 2; }, 15000),
               "连续失败 4 轮：报一条、恢复一条");
         {
             std::lock_guard<std::mutex> lk(lm);

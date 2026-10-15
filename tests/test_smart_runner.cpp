@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -153,7 +154,12 @@ struct FakeMarket {
             if (path.rfind("/fapi/v1/klines?symbol=", 0) == 0) {
                 const auto s = path.substr(23, path.find('&') - 23);
                 if (path.find("interval=5m") != std::string::npos) {
-                    ++k5_calls[s];
+                    {
+                        // 点火判定并发拉 5m（parallel_for 4 路）：计数要加锁，不然 TSan 报竞争
+                        static std::mutex m;
+                        std::lock_guard<std::mutex> lk(m);
+                        ++k5_calls[s];
+                    }
                     out.body = fail_klines.count(s) ? "" : bars5m(s);
                     return true;
                 }
