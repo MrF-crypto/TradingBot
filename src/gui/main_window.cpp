@@ -1591,6 +1591,12 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     const TrendBot* trendBot = nullptr;
     for (const auto& b : bots)
         if (b.cfg.symbol == symbol) { trendBot = &b; break; }
+    // 波动顺势只给智能模式用，手动表单没有这一页：在这里改会把它悄悄变成海龟
+    if (trendBot && trendBot->cfg.rule.strategy == trend::Strategy::VolFollow) {
+        QMessageBox::information(this, "波动顺势",
+            "这个 bot 是智能模式「波动顺势」管理的，参数在智能模式设置里改。");
+        return;
+    }
 
     QDialog dlg(this);
     dlg.setWindowTitle(QString("趋势策略配置 - %1").arg(QString::fromStdString(symbol)));
@@ -1779,12 +1785,15 @@ void MainWindow::onTick() {
         // 每个 bot 按自己周期该有的节奏拉：4h 的每 60 秒一次就够，3m 的要 45 秒
         // 一次才不会错过收盘。tick 是 3 秒一拍，所以除以 3 换算成拍数
         const bool forced = trendSigForce_.exchange(false);
+        const int64_t now_ms = QDateTime::currentMSecsSinceEpoch();
         std::vector<TrendBot> need;
         for (const auto& b : trend_engine_->get_bots()) {
             if (b.state != TrendBot::State::Running) continue;
             const int ticks = std::max(1,
                 TrendEngine::signal_period_sec(b.cfg.interval) / 3);
-            if (forced || (slowTickCount_ % ticks) == 1) need.push_back(b);
+            // 波动顺势看的是正在走的这根：K线一交接就补拉，不等下一个周期（最多晚 60 秒）
+            if (forced || (slowTickCount_ % ticks) == 1 || TrendEngine::vf_bar_stale(b, now_ms))
+                need.push_back(b);
         }
         if (!need.empty()) {
             trendSigBusy_.store(true);
@@ -1805,7 +1814,8 @@ void MainWindow::onTick() {
                   try {
                     const auto& b = need[idx];
                     if (!client_ || !trend_engine_) return;
-                    if (b.cfg.rule.strategy != trend::Strategy::Turtle) {
+                    if (b.cfg.rule.strategy != trend::Strategy::Turtle &&
+                        b.cfg.rule.strategy != trend::Strategy::VolFollow) {
                         auto bp = client_->fetch_bar_pattern(
                             b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
                         if (!bp.ok) { mark_failed(b.cfg.symbol); return; }
@@ -1850,7 +1860,8 @@ void MainWindow::onTick() {
                                                snap.bar_open_ms, snap.box_atr,
                                                b.cfg.rule.vol_paced ? snap.vol_ratio_paced
                                                                     : snap.vol_ratio,
-                                               snap.er_ok, snap.er, snap.prev_close);
+                                               snap.er_ok, snap.er, snap.prev_close,
+                                               snap.taker_ratio, snap.range_pace, snap.bar_open);
                   } catch (...) {
                     // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
                     mark_failed(need[idx].cfg.symbol);

@@ -38,7 +38,7 @@ std::vector<smart::Bar> closed_bars(const std::vector<TradingClient::Bar>& in) {
     v.reserve(in.size() - 1);
     for (size_t i = 0; i + 1 < in.size(); ++i) {
         const auto& b = in[i];
-        v.push_back({b.open_ms, b.open, b.high, b.low, b.close, b.volume, b.quote_volume});
+        v.push_back({b.open_ms, b.open, b.high, b.low, b.close, b.volume, b.quote_volume, b.taker_buy_quote});
     }
     return v;
 }
@@ -47,6 +47,21 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
     std::string s;
     for (size_t i = 0; i < v.size(); ++i) s += (i ? sep : "") + v[i];
     return s;
+}
+
+// 自动 bot 属于哪一套：裸K / 波动顺势看名单代码（随仓位落盘），其余都算海龟
+smart::Strategy strategy_of(const TrendBot& b) {
+    if (b.smart_list == smart::kSegBare) return smart::Strategy::BareK;
+    if (b.smart_list == smart::kSegVol)  return smart::Strategy::VolFollow;
+    return smart::Strategy::Turtle;
+}
+std::string strategy_label(smart::Strategy s) {
+    switch (s) {
+    case smart::Strategy::BareK:     return "裸K";
+    case smart::Strategy::VolFollow: return "波动顺势";
+    case smart::Strategy::Turtle:
+    default:                         return "海龟";
+    }
 }
 
 // 名单 / 分段代码 → 日志里的简称
@@ -125,7 +140,8 @@ namespace {
 // 不需要K线的那一半：交易规则 + 24h 行情 + 资金费率 → 过硬门槛的候选。海龟与裸K 共用。
 // 池里的币（pool_syms）走放宽门槛，没拿到数据 / 不合格 / 即将下架分别记进 out。
 // 返回 false = 地基没拿到，整轮作废（r.error 已填）。
-// coin_only：只要标的类型是 COIN 的（裸K：不埋伏大宗商品、股票、指数），黄金代币另排
+// coin_only：只要标的类型是 COIN 的（不做大宗商品、股票、指数），黄金代币另排。
+// 海龟和裸K 都开：币安的 TradFi 永续要另签协议才能下单，走势也不是币的逻辑
 bool gate_universe(TradingClient& c, const smart::Config& cfg,
                    const std::set<std::string>& pool_syms, int64_t now_ms,
                    MarketScan& r, std::vector<std::string>& cand, bool coin_only = false) {
@@ -156,10 +172,13 @@ bool gate_universe(TradingClient& c, const smart::Config& cfg,
         if (m.quote != "USDT" || m.contract_type != "PERPETUAL") continue;
         ++r.universe;
         seen.insert(m.symbol);
-        if (coin_only && ((!m.underlying_type.empty() && m.underlying_type != "COIN") ||
-                          smart::ambush_excluded_base(m.base)))
-            continue;
         const bool member = pool_syms.count(m.symbol) > 0;
+        // 池里已有的（升级前选进来的）记成不合格，空仓时移出；不记的话它只会慢慢掉出名单
+        if (coin_only && ((!m.underlying_type.empty() && m.underlying_type != "COIN") ||
+                          smart::ambush_excluded_base(m.base))) {
+            if (member) out.hard_fail[m.symbol] = "非加密币标的（股票 / 大宗商品 / 指数）";
+            continue;
+        }
         if (member && smart::delisting(m, now_ms)) out.delisting.insert(m.symbol);
 
         const auto it = t24.find(m.symbol);
@@ -194,7 +213,7 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
     MarketScan r;
     auto& out = r.outcome;
     std::vector<std::string> cand;
-    if (!gate_universe(c, cfg, pool_syms, now_ms, r, cand)) return r;
+    if (!gate_universe(c, cfg, pool_syms, now_ms, r, cand, /*coin_only*/ true)) return r;
 
     // 201 根 1h：去掉未收盘那根剩 200，够 7 天相对强弱（168）与 ATR100。权重 2
     const auto btc = closed_bars(c.fetch_klines("BTCUSDT", "1h", 201));
@@ -243,6 +262,22 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
     }
     out.ranking = smart::rank(eligible, cfg);
     out.ok = true;
+
+    // 持仓量：只给合格的币拉，只写进扫描记录、不参与任何决策。
+    // 拉不到的币就不在 r.oi 里（记录里留空），不影响这一轮
+    std::vector<std::string> syms;
+    for (const auto& kv : eligible) syms.push_back(kv.first);
+    std::vector<smart::OiStat> oi(syms.size());
+    parallel_for((int)syms.size(), parallel, [&](int i) {
+        try {
+            // 25 根 1h：最新一点 + 24 小时前那一点
+            std::vector<smart::OiPoint> pts;
+            for (const auto& p : c.fetch_oi_hist(syms[i], "1h", 25)) pts.push_back({p.ms, p.oi, p.value});
+            oi[i] = smart::oi_stat(pts);
+        } catch (...) {}
+    });
+    for (size_t i = 0; i < syms.size(); ++i)
+        if (oi[i].ok) r.oi[syms[i]] = oi[i];
     return r;
 }
 
@@ -294,6 +329,52 @@ BareScan scan_ambush(TradingClient& c, const smart::Config& cfg, int64_t now_ms,
     return r;
 }
 
+VolScan scan_vol(TradingClient& c, const smart::Config& cfg, const std::set<std::string>& pool_syms,
+                 int64_t now_ms, int parallel) {
+    VolScan r;
+    MarketScan g;
+    std::vector<std::string> cand;
+    // 波动顺势自己的硬门槛（成交额 / 上线天数 / 24h 涨跌）；资金费率、价格精度、拉黑与海龟共用
+    smart::Config gc = cfg;
+    gc.min_quote_vol = cfg.vol.min_quote_vol;
+    gc.min_age_days  = cfg.vol.min_age_days;
+    gc.max_abs_chg24 = cfg.vol.max_abs_chg24;
+    if (!gate_universe(c, gc, pool_syms, now_ms, g, cand, /*coin_only*/ true)) { r.error = g.error; return r; }
+    r.universe    = g.universe;
+    r.passed_gate = g.passed_gate;
+    r.hard_fail   = g.outcome.hard_fail;
+    r.unknown     = g.outcome.unknown;
+    for (const auto& s : g.outcome.delisting) r.hard_fail.emplace(s, "即将下架");
+
+    std::vector<smart::VolFeat> feats(cand.size());
+    std::vector<char> got(cand.size(), 0);
+    parallel_for((int)cand.size(), parallel, [&](int i) {
+        try {
+            // 多拉一根未收盘的，去掉后剩 kVolBars 根。不到 100 根，权重 1
+            const auto bars = closed_bars(c.fetch_klines(cand[i], cfg.vol.interval, smart::kVolBars + 1));
+            if ((int)bars.size() < smart::kVolLong + 1) return;
+            feats[i] = smart::compute_vol(bars);
+            got[i] = 1;
+        } catch (...) {}
+    });
+    for (size_t i = 0; i < cand.size(); ++i) {
+        if (got[i]) ++r.fetched;
+        if (got[i] && feats[i].ok) r.feats[cand[i]] = feats[i];
+        else if (pool_syms.count(cand[i])) r.unknown.insert(cand[i]);   // 没拿到 ≠ 不合格
+    }
+    // K线大面积拉不到：名单会缺一大块，这一轮不可信（不动已有的 bot）
+    if (!cand.empty() && r.fetched * 10 < (int)cand.size() * 7) {
+        r.error = "K线拉取失败过多（" + std::to_string(r.fetched) + "/" + std::to_string(cand.size()) + "）";
+        return r;
+    }
+    if (r.universe > 0 && r.fetched == 0) {
+        r.error = "全市场合格品种为 0（门槛通过 " + std::to_string(r.passed_gate) + "），疑似数据异常";
+        return r;
+    }
+    r.ok = true;
+    return r;
+}
+
 double sum_day_realized(const std::vector<TrendTrade>& trades, int64_t utc_day) {
     double r = 0;
     for (const auto& t : trades) {
@@ -327,16 +408,44 @@ SmartRunner::SmartRunner(std::shared_ptr<TradingClient> client, std::shared_ptr<
       state_path_(std::move(state_path)), log_(std::move(log)) {}
 
 void SmartRunner::set_config(const smart::Config& cfg) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    const std::string before = smart::config_to_json(cfg_);
-    cfg_ = cfg;
-    // 任何变化都立刻重扫一次：门槛、方向、模板变了，名单和 bot 参数都要跟上。
-    // 裸K 的埋伏池平时一天建一次，改了配置也立刻按新规则重建
-    if (smart::config_to_json(cfg_) != before) {
-        next_due_ms_ = 0;
-        built_day_   = -1;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const std::string before = smart::config_to_json(cfg_);
+        cfg_ = cfg;
+        // 任何变化都立刻重扫一次：门槛、方向、模板变了，名单和 bot 参数都要跟上。
+        // 裸K 的埋伏池平时一天建一次，改了配置也立刻按新规则重建
+        if (smart::config_to_json(cfg_) != before) {
+            next_due_ms_ = 0;
+            built_day_   = -1;
+        }
+        apply_engine_gates_locked();
     }
-    apply_engine_gates_locked();
+    sync_exit_params(cfg);
+}
+
+// 持仓中的自动 bot 跟着设置换出场参数（空仓的由各自的扫描整套换掉）。
+// 按 bot 自己属于哪一套取那一套的设置：切了策略、还在走完的老仓位同样跟着改
+int SmartRunner::sync_exit_params(const smart::Config& cfg) {
+    if (!engine_) return 0;
+    std::vector<std::string> names;
+    for (const auto& b : engine_->get_bots()) {
+        if (!b.is_auto || b.state == TrendBot::State::Stopped) continue;
+        if (b.st.pos == trend::Pos::Flat && b.qty <= 0) continue;
+        TrendConfig want;
+        switch (strategy_of(b)) {
+        case smart::Strategy::BareK:     want = smart::make_bare_bot_config(cfg, b.cfg.symbol); break;
+        case smart::Strategy::VolFollow: want = smart::make_vol_bot_config(cfg, b.cfg.symbol); break;
+        case smart::Strategy::Turtle:
+        default:
+            want = smart::make_bot_config(cfg, b.cfg.symbol, b.cfg.rule.direction, b.smart_list);
+            break;
+        }
+        if (engine_->update_exit_params(b.bot_id, want.rule)) names.push_back(b.cfg.symbol);
+    }
+    if (!names.empty() && log_)
+        log_("智能模式：" + std::to_string(names.size()) + " 个持仓换上新的出场参数（" +
+             join(names, "、") + "）", false);
+    return (int)names.size();
 }
 
 smart::Config SmartRunner::config() const {
@@ -350,12 +459,14 @@ void SmartRunner::apply_engine_gates_locked() {
     engine_->set_pause_new(cfg_.pause_new);
     if (cfg_.enabled) {
         const bool bare = (cfg_.strategy == smart::Strategy::BareK);
-        engine_->set_max_open_positions(bare ? cfg_.bare.max_positions : cfg_.max_positions);
+        const bool vol  = (cfg_.strategy == smart::Strategy::VolFollow);
+        engine_->set_max_open_positions(bare ? cfg_.bare.max_positions
+                                        : vol ? cfg_.vol.max_positions : cfg_.max_positions);
         engine_->set_daily_loss_limit(cfg_.daily_loss_limit);
         engine_->set_float_loss_limit(cfg_.float_loss_limit);
-        // 裸K 的 bot 没有综合分（确认放量就开），"名额紧张只收高分"对它不适用
-        if (bare) engine_->set_priority_reserve(0, 0);
-        else      engine_->set_priority_reserve(cfg_.prio_reserve, cfg_.prio_min_score);
+        // 裸K / 波动顺势的 bot 没有综合分，"名额紧张只收高分"对它们不适用
+        if (bare || vol) engine_->set_priority_reserve(0, 0);
+        else             engine_->set_priority_reserve(cfg_.prio_reserve, cfg_.prio_min_score);
     } else {
         // 关闭时撤掉智能模式的闸门。同时持仓上限交还应用层自己的设置
         // （应用层在 set_config 之后会重新设一次）
@@ -396,7 +507,15 @@ bool SmartRunner::same_params(const TrendConfig& a, const TrendConfig& b) {
            x.vol_paced == y.vol_paced && x.fail_exit == y.fail_exit &&
            x.fail_exit_short == y.fail_exit_short &&
            x.roi_trail == y.roi_trail && x.roi_trail_start == y.roi_trail_start &&
-           x.roi_trail_back == y.roi_trail_back;
+           x.roi_trail_back == y.roi_trail_back && x.once_per_bar == y.once_per_bar &&
+           x.max_chase_atr == y.max_chase_atr && x.max_init_loss_pct == y.max_init_loss_pct &&
+           x.breakeven == y.breakeven && x.breakeven_start == y.breakeven_start &&
+           x.expand_long == y.expand_long && x.expand_long_min == y.expand_long_min &&
+           x.vf_dead_atr == y.vf_dead_atr && x.vf_rev_open == y.vf_rev_open &&
+           x.vf_rev_loss == y.vf_rev_loss && x.vf_rev_loss_roi == y.vf_rev_loss_roi &&
+           x.vf_rev_stop == y.vf_rev_stop && x.vf_one_rev_per_bar == y.vf_one_rev_per_bar &&
+           x.max_consecutive_reverses == y.max_consecutive_reverses &&
+           x.cooldown_bars == y.cooldown_bars;
 }
 
 SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
@@ -409,12 +528,13 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     if (cancelled_.load()) return rep;
     if (!cfg.enabled || !engine_ || !client_) { housekeep(now_ms); return rep; }
     if (cfg.strategy == smart::Strategy::BareK) return run_bare_once(now_ms, cfg);
+    if (cfg.strategy == smart::Strategy::VolFollow) return run_vol_once(now_ms, cfg);
 
-    // 只跑一套：裸K 还有持仓就不启动（埋伏池已清、空仓的裸K bot 已删），一分钟后再看
+    // 只跑一套：另一套还有持仓就不启动（它的选币数据已清、空仓的 bot 已删），一分钟后再看
     if (blocked_by_foreign(retire_foreign(smart::Strategy::Turtle, now_ms), smart::Strategy::Turtle)) {
         std::lock_guard<std::mutex> lk(mtx_);
         next_due_ms_ = now_ms + 60 * 1000;
-        rep.summary  = "智能模式：等裸K 持仓走完";
+        rep.summary  = "智能模式：等另一套策略的持仓走完";
         last_ = rep;
         return rep;
     }
@@ -424,8 +544,8 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     std::vector<smart::BotView> views;
     views.reserve(bots.size());
     for (const auto& b : bots) {
-        // 裸K 留下、还在走完的 bot 不归这里管（不进候选池的评判，也不会被换参数）
-        if (b.is_auto && b.smart_list == smart::kSegBare) continue;
+        // 另一套留下、还在走完的 bot 不归这里管（不进候选池的评判，也不会被换参数）
+        if (b.is_auto && strategy_of(b) != smart::Strategy::Turtle) continue;
         views.push_back({b.bot_id, b.cfg.symbol, b.is_auto,
                          b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending,
                          b.state == TrendBot::State::Stopped});
@@ -559,7 +679,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     }
     rep.groups = build_groups(scan.outcome.ranking, plan.seg, cfg, with_bot);
     // 数据记录层：完整名单快照（全部合格币，不只是进名单的）
-    if (journal_) journal_->scan(now_ms, scan.outcome.ranking, plan.seg, with_bot);
+    if (journal_) journal_->scan(now_ms, scan.outcome.ranking, plan.seg, with_bot, scan.oi);
     rep.ok = true;
     std::string lists;
     for (const auto& g : rep.groups) {
@@ -599,8 +719,14 @@ void SmartRunner::housekeep(int64_t now_ms) {
     }
     // 开着：另一套留下、已经走完的 bot 每分钟清一次（海龟一小时才扫一轮，不能等到那时）
     if (enabled) retire_foreign(strat, now_ms);
+    // 重启恢复的持仓带的是落盘时的参数：每分钟对一次设置
+    sync_exit_params(config());
     if (!enabled) {
         clear_seeds();
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            vol_miss_.clear();
+        }
         // 关闭后：空仓的自动 bot 移除；持仓中的标待移出（管到平仓、不再开新仓），
         // 走完后下一次维护再移除。已停止的（你或对账停的）不替你删
         for (const auto& b : engine_->get_bots()) {
@@ -636,9 +762,7 @@ int64_t day_of(int64_t ms) { return ms / kDayMs; }
 int smart_holdings(const std::vector<TrendBot>& bots, smart::Strategy s) {
     int n = 0;
     for (const auto& b : bots) {
-        if (!b.is_auto) continue;
-        const bool is_bare = (b.smart_list == smart::kSegBare);
-        if (is_bare != (s == smart::Strategy::BareK)) continue;
+        if (!b.is_auto || strategy_of(b) != s) continue;
         if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending) ++n;
     }
     return n;
@@ -650,7 +774,7 @@ int SmartRunner::retire_foreign(smart::Strategy keep, int64_t now_ms) {
     for (const auto& b : engine_->get_bots()) {
         if (!b.is_auto) continue;
         const bool is_bare = (b.smart_list == smart::kSegBare);
-        if (is_bare == (keep == smart::Strategy::BareK)) {
+        if (strategy_of(b) == keep) {
             // 是这一套自己的。关掉又用同一套打开时，关闭期间标的「待移出」撤掉。
             // ⚠ 裸K 的 bot 例外：它们【一直】是待移出（自己不开仓，只由点火判定开仓）
             if (b.retiring && !is_bare) engine_->set_retiring(b.bot_id, false);
@@ -668,25 +792,39 @@ int SmartRunner::retire_foreign(smart::Strategy keep, int64_t now_ms) {
         if (journal_) journal_->pool(now_ms, b.cfg.symbol, "移出", b.smart_list, 0, 0, "切换策略");
         if (on_symbol_removed) on_symbol_removed(b.cfg.symbol);
     }
-    // 另一套的选币数据不留：海龟的候选池（加入时间、连续掉出次数、分段历史）/ 裸K 的埋伏池
-    if (keep == smart::Strategy::BareK) {
+    // 另一套的选币数据不留：海龟的候选池（加入时间、连续掉出次数、分段历史）/ 裸K 的埋伏池 /
+    // 波动顺势的连续不合格计数
+    if (keep != smart::Strategy::Turtle) {
         std::lock_guard<std::mutex> lk(mtx_);
         pool_ = smart::Pool{};
-    } else {
-        clear_seeds();
+    }
+    if (keep != smart::Strategy::BareK) clear_seeds();
+    if (keep != smart::Strategy::VolFollow) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        vol_miss_.clear();
     }
     return holding;
 }
 
 bool SmartRunner::blocked_by_foreign(int holding, smart::Strategy keep) {
-    const std::string mine  = keep == smart::Strategy::BareK ? "裸K" : "海龟";
-    const std::string other = keep == smart::Strategy::BareK ? "海龟" : "裸K";
+    const std::string mine = strategy_label(keep);
+    // 是哪一套还压着持仓（日志写名字）。走完那一刻已经数不出来了，用上次记下的
+    std::string other;
+    if (holding > 0 && engine_) {
+        const auto bots = engine_->get_bots();
+        for (const auto s : {smart::Strategy::Turtle, smart::Strategy::BareK, smart::Strategy::VolFollow})
+            if (s != keep && smart_holdings(bots, s) > 0)
+                other += (other.empty() ? "" : "/") + strategy_label(s);
+    }
     int was = -1;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         was = foreign_noted_;
         foreign_noted_ = holding > 0 ? holding : -1;
+        if (holding > 0) foreign_label_ = other;
+        else             other = foreign_label_;
     }
+    if (other.empty()) other = "另一套策略";
     if (holding <= 0) {
         if (was > 0 && log_) log_("智能模式：" + other + "持仓已全部走完，" + mine + "开始运行", false);
         return false;
@@ -734,6 +872,197 @@ SmartRunner::Report SmartRunner::run_bare_once(int64_t now_ms, const smart::Conf
         build = (built_day_ != day_of(now_ms));
     }
     return build ? build_ambush(now_ms, cfg) : refresh_ambush(now_ms, cfg);
+}
+
+// ── 波动顺势 ────────────────────────────────────────────────────────────────
+
+SmartRunner::Report SmartRunner::run_vol_once(int64_t now_ms, const smart::Config& cfg) {
+    Report rep;
+    rep.at_ms = now_ms;
+    const auto& vc = cfg.vol;
+    if (blocked_by_foreign(retire_foreign(smart::Strategy::VolFollow, now_ms), smart::Strategy::VolFollow)) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        next_due_ms_ = now_ms + 60 * 1000;
+        rep.summary  = "智能波动顺势：等另一套策略的持仓走完";
+        last_ = rep;
+        return rep;
+    }
+    const int64_t bar_ms = (int64_t)TrendConfig::bar_seconds(vc.interval) * 1000;
+    {
+        // 下一次：下一根K线收盘后 5 秒（交易所出新K线要一两秒）
+        std::lock_guard<std::mutex> lk(mtx_);
+        next_due_ms_ = (now_ms / bar_ms + 1) * bar_ms + 5000;
+    }
+
+    std::set<std::string> pool_syms;
+    for (const auto& b : engine_->get_bots())
+        if (b.is_auto && strategy_of(b) == smart::Strategy::VolFollow) pool_syms.insert(b.cfg.symbol);
+
+    const auto scan = scan_vol(*client_, cfg, pool_syms, now_ms);
+    if (cancelled_.load()) return rep;
+    rep.universe    = scan.universe;
+    rep.passed_gate = scan.passed_gate;
+    rep.eligible    = scan.fetched;
+    if (!scan.ok) {
+        int streak = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            streak = ++fail_streak_;
+            // 失败不等下一根：1 分钟后重试（5m 周期时等一根就是 5 分钟没刷新）
+            next_due_ms_ = std::min(next_due_ms_, now_ms + 60 * 1000);
+        }
+        rep.summary = "智能波动顺势：本轮扫描失败（" + scan.error + "），名单不动，1 分钟后重试" +
+                      (streak > 1 ? "（已连续 " + std::to_string(streak) + " 轮）" : std::string());
+        if (log_ && (streak == 1 || streak % 30 == 0)) log_(rep.summary, streak == 1);
+        std::lock_guard<std::mutex> lk(mtx_);
+        last_ = rep;
+        return rep;
+    }
+    {
+        int was = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            was = fail_streak_;
+            fail_streak_ = 0;
+        }
+        if (was > 0 && log_)
+            log_("智能波动顺势：扫描已恢复（此前连续失败 " + std::to_string(was) + " 轮）", false);
+    }
+
+    const auto picked = smart::select_vol(scan.feats, vc);
+    std::map<std::string, int> rank_of;
+    for (size_t i = 0; i < picked.size(); ++i) rank_of[picked[i]] = (int)i + 1;
+    int qualified = 0;
+    for (const auto& kv : scan.feats)
+        if (smart::vol_qualifies(kv.second, vc)) ++qualified;
+    auto slope_of = [&](const std::string& s) {
+        const auto it = scan.feats.find(s);
+        return it == scan.feats.end() ? 0.0 : it->second.slope;
+    };
+
+    // ── 已有的 bot：在名单 → 更新名次；不在 → 计数，空仓且连续 2 轮（硬门槛不合格立刻）才移出 ──
+    const auto bots = engine_->get_bots();
+    std::set<std::string> have, gone;
+    std::vector<std::string> rm_desc;
+    for (const auto& b : bots) {
+        if (!b.is_auto || strategy_of(b) != smart::Strategy::VolFollow) continue;
+        const auto& sym = b.cfg.symbol;
+        have.insert(sym);
+        if (b.state == TrendBot::State::Stopped) continue;   // 你或对账停的，不替你处理
+        if (const auto r = rank_of.find(sym); r != rank_of.end()) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                vol_miss_.erase(sym);
+            }
+            engine_->set_smart_meta(b.bot_id, slope_of(sym), r->second, smart::kSegVol);
+            continue;
+        }
+        const auto hf = scan.hard_fail.find(sym);
+        if (hf == scan.hard_fail.end() && scan.unknown.count(sym)) continue;   // 没拿到 ≠ 不合格
+        int miss = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            miss = ++vol_miss_[sym];
+        }
+        engine_->set_smart_meta(b.bot_id, slope_of(sym), 0, smart::kSegVol);   // 名次 0 = 已不在名单
+        const bool holding = b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending;
+        if (holding || (hf == scan.hard_fail.end() && miss < kVolDropScans)) continue;
+        if (!engine_->remove_if_flat(b.bot_id)) continue;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            vol_miss_.erase(sym);
+        }
+        gone.insert(sym);
+        ++rep.removed;
+        const std::string why = hf != scan.hard_fail.end() ? hf->second
+                                : "连续 " + std::to_string(kVolDropScans) + " 轮不在名单（波动回落）";
+        rm_desc.push_back(sym + "（" + why + "）");
+        if (journal_) journal_->pool(now_ms, sym, "移出", smart::kSegVol, 0, 0, why);
+        if (on_symbol_removed) on_symbol_removed(sym);
+    }
+
+    // ── 参数同步：设置改了，空仓的 bot 换上新参数（持仓中的只换出场参数，见 sync_exit_params）──
+    int resynced = 0;
+    for (const auto& b : bots) {
+        if (!b.is_auto || strategy_of(b) != smart::Strategy::VolFollow || gone.count(b.cfg.symbol)) continue;
+        if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending) continue;
+        if (b.state == TrendBot::State::Stopped) continue;
+        const auto want = smart::make_vol_bot_config(cfg, b.cfg.symbol);
+        if (same_params(b.cfg, want)) continue;
+        if (!engine_->replace_bot(b.bot_id, want).empty()) ++resynced;
+    }
+
+    // ── 补位：名单里还没有 bot 的，按名次补到 pool_n ──
+    int n_bots = 0;
+    for (const auto& s : have)
+        if (!gone.count(s)) ++n_bots;
+    std::vector<std::string> add_desc;
+    for (const auto& sym : picked) {
+        if (have.count(sym)) continue;
+        if (n_bots >= vc.pool_n) break;
+        const auto id = engine_->add_bot(smart::make_vol_bot_config(cfg, sym), true);
+        if (id.empty()) continue;   // 同品种已有 bot（手动的）
+        const int rank = rank_of[sym];
+        engine_->set_smart_meta(id, slope_of(sym), rank, smart::kSegVol);
+        ++n_bots;
+        ++rep.added;
+        const auto& f = scan.feats.at(sym);
+        add_desc.push_back(sym + "（#" + std::to_string(rank) + " 斜率 " + fmt(f.slope, 2) +
+                           " ATR% " + fmt(f.atr_pct, 2) + "）");
+        if (journal_)
+            journal_->pool(now_ms, sym, "加入", smart::kSegVol, rank, f.slope,
+                           "波动斜率 " + fmt(f.slope, 2) + "，ATR% " + fmt(f.atr_pct, 2));
+        if (on_symbol_added) on_symbol_added(sym);
+    }
+
+    // ── 汇总 ──
+    std::set<std::string> with_bot;
+    for (const auto& b : engine_->get_bots()) {
+        with_bot.insert(b.cfg.symbol);
+        if (!b.is_auto) continue;
+        ++rep.monitored;
+        if (b.qty > 0) ++rep.holding;
+    }
+    Group g;
+    g.title = "波动名单";
+    g.code  = smart::kSegVol;
+    g.quota = vc.pool_n;
+    for (size_t i = 0; i < picked.size(); ++i) {
+        const auto& f = scan.feats.at(picked[i]);
+        Row r;
+        r.symbol  = picked[i];
+        r.list    = smart::kSegVol;
+        r.rank    = (int)i + 1;
+        r.score   = f.slope;
+        r.slope   = f.slope;
+        r.atr_pct = f.atr_pct;
+        r.has_bot = with_bot.count(picked[i]) > 0;
+        g.rows.push_back(std::move(r));
+    }
+    rep.groups.push_back(std::move(g));
+    rep.ok = true;
+    rep.summary = "智能波动顺势（" + vc.interval + "）：过门槛 " + std::to_string(rep.passed_gate) +
+                  " → 波动合格 " + std::to_string(qualified) + " → 名单 " + std::to_string(picked.size()) +
+                  "；+" + std::to_string(rep.added) + " −" + std::to_string(rep.removed) +
+                  "，监控 " + std::to_string(rep.monitored) + "（持仓 " + std::to_string(rep.holding) + "）";
+    if (log_) {
+        // 5m 周期一小时 12 轮：名单没变化的那几轮不打汇总行，只在有增删时打
+        if (rep.added > 0 || rep.removed > 0 || resynced > 0 || now_ms % kHourMs < bar_ms)
+            log_(rep.summary, false);
+        if (!add_desc.empty()) log_("  新增：" + join(add_desc, "、"), false);
+        if (!rm_desc.empty())  log_("  移出：" + join(rm_desc, "、"), false);
+        if (resynced > 0)
+            log_("  " + std::to_string(resynced) + " 个空仓自动 bot 已换上新参数", false);
+        if (now_ms % kHourMs < bar_ms) {   // 引擎那份过滤 / 闸门汇总每小时打一次
+            const auto fs = engine_->take_filter_summary();
+            if (!fs.empty()) log_("  上一小时自动 bot：" + fs, false);
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    last_ = rep;
+    save_locked();
+    return rep;
 }
 
 SmartRunner::Report SmartRunner::build_ambush(int64_t now_ms, const smart::Config& cfg) {

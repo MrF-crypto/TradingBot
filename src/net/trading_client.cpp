@@ -306,13 +306,16 @@ int64_t TradingClient::wall_now_ms() const {
     return wall_hook_ ? wall_hook_() : wall_ms();
 }
 
-std::string TradingClient::http_get_public(const std::string& path, bool critical) {
+std::string TradingClient::http_get_public(const std::string& path, bool critical,
+                                           bool own_limit, long* out_code) {
     tl_net_err.clear();
+    if (out_code) *out_code = 0;
     if (test_hook_) {
         FakeReply fr;
         if (test_hook_("GET", path, "", fr)) {
-            gate_->observe(fr.code, fr.headers, fr.body);
+            if (!own_limit) gate_->observe(fr.code, fr.headers, fr.body);
             tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
+            if (out_code) *out_code = fr.code;
             return fr.body;
         }
     }
@@ -339,8 +342,9 @@ std::string TradingClient::http_get_public(const std::string& path, bool critica
         curl_easy_setopt(c, CURLOPT_HEADERDATA, &rhdr);
         const CURLcode rc = curl_easy_perform(c);
         long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-        gate_->observe(code, rhdr, resp);
+        if (!own_limit) gate_->observe(code, rhdr, resp);
         tl_net_err = describe_net(rc, code, resp);
+        if (out_code) *out_code = code;
         if (!transient_net(rc, code)) break;
     }
     return resp;
@@ -1463,8 +1467,8 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
         simdjson::dom::array ka;
         if (kline.get_array().get(ka) != simdjson::SUCCESS) continue;
         // klines 数组下标：0=开盘时间(整数毫秒) 1=open 2=high 3=low 4=close 5=volume
-        // 6=收盘时间 7=成交额（quote volume）
-        // （1~5、7 是字符串，0、6 是整数——类型不同，必须分开取）
+        // 6=收盘时间 7=成交额（quote volume） 8=成交笔数 9=主动买入量 10=主动买入成交额
+        // （1~5、7、9、10 是字符串，0、6、8 是整数——类型不同，必须分开取）
         Bar b;
         int idx = 0;
         bool ok = true;
@@ -1484,14 +1488,16 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
                 case 4: b.close = v; break;
                 case 5: b.volume = v; break;
                 }
-            } else if (idx == 7) {
-                // 成交额缺了不算坏行（老接口 / 测试数据只有前 6 列）：留 0，用的人自己兜底
+            } else if (idx == 7 || idx == 10) {
+                // 成交额 / 主动买入成交额缺了不算坏行（老接口 / 测试数据只有前几列）：
+                // 留 0，用的人自己兜底
                 std::string_view sv;
                 if (field.get(sv) == simdjson::SUCCESS) {
-                    try { b.quote_volume = std::stod(std::string(sv)); } catch (...) {}
+                    try { (idx == 7 ? b.quote_volume : b.taker_buy_quote) = std::stod(std::string(sv)); }
+                    catch (...) {}
                 }
             }
-            if (++idx > 7) break;
+            if (++idx > 10) break;
         }
         if (ok) out.push_back(b);
     }
@@ -1536,10 +1542,11 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
 
     out.price       = bars.back().close;
     out.bar_open_ms = bars.back().open_ms;
+    out.bar_open    = bars.back().open;
 
     std::vector<indicators::Ohlc> oh;
     oh.reserve(bars.size());
-    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
+    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close, b.open});
 
     out.atr = indicators::atr(oh, atr_period);
     if (out.atr > 0 && out.price > 0) out.atr_pct = out.atr / out.price * 100.0;
@@ -1567,8 +1574,14 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         if (bar_sec > 0 && out.bar_open_ms > 0) {
             const double frac = (double)(ts_ms() - out.bar_open_ms) / (bar_sec * 1000.0);
             out.vol_ratio_paced = indicators::paced_ratio(out.vol_ratio, frac);
+            // 多单波动放大过滤的读数：ATR 用已收盘的，和箱体倍数同一个（当前根正在拉的话不撑大分母）
+            const auto& cb = bars.back();
+            out.range_pace = indicators::paced_range(cb.high - cb.low, atr_closed, frac);
         }
         out.prev_close = bars[bars.size() - 2].close;
+        // 当前根是谁在买（数据记录层）：两项都拿到才算
+        if (const auto& cb = bars.back(); cb.quote_volume > 0 && cb.taker_buy_quote > 0)
+            out.taker_ratio = cb.taker_buy_quote / cb.quote_volume;
 
         const auto e = indicators::efficiency_ratio(oh, donchian_period);
         out.er_ok = e.ok;
@@ -1628,7 +1641,7 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
         out.prev_open = bars[n - 2].open;
         std::vector<indicators::Ohlc> oh;
         oh.reserve(bars.size());
-        for (const auto& b : bars) oh.push_back({b.high, b.low, b.close});
+        for (const auto& b : bars) oh.push_back({b.high, b.low, b.close, b.open});
         const std::vector<indicators::Ohlc> closed(oh.begin(), oh.end() - 1);
         out.bar_atr = indicators::atr(closed, kBareAtrPeriod);
 
@@ -1763,6 +1776,41 @@ std::unordered_map<std::string, double> TradingClient::fetch_all_funding_pct(boo
         try { out.emplace(std::string(sym), std::stod(std::string(fr)) * 100.0); } catch (...) {}
     }
     if (ok) *ok = !out.empty();
+    return out;
+}
+
+// 返回 [{"symbol":..,"sumOpenInterest":"..","sumOpenInterestValue":"..","timestamp":整数毫秒}, ...]。
+// 这组 /futures/data 接口单独限流（每 IP 每 5 分钟 1000 次），不占 /fapi 的权重
+std::vector<TradingClient::OiPoint> TradingClient::fetch_oi_hist(
+        const std::string& sym, const std::string& period, int limit) {
+    std::vector<OiPoint> out;
+    if (wall_now_ms() < data_api_cool_until_ms_.load()) return out;
+    long code = 0;
+    auto resp = http_get_public("/futures/data/openInterestHist?symbol=" + sym + "&period=" + period +
+                                "&limit=" + std::to_string(std::min(std::max(limit, 1), 500)),
+                                false, /*own_limit*/ true, &code);
+    // 这组接口单独限流：超了就整组停 5 分钟（窗口就是 5 分钟），其余请求不受影响
+    if (code == 429 || code == 418) {
+        data_api_cool_until_ms_.store(wall_now_ms() + 5 * 60 * 1000);
+        return out;
+    }
+    if (resp.empty()) return out;
+    simdjson::dom::parser p;
+    simdjson::dom::array arr;
+    auto ps = simdjson::padded_string(resp);
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+    for (auto e : arr) {
+        OiPoint pt;
+        std::string_view oi, val;
+        if (e["timestamp"].get(pt.ms) != simdjson::SUCCESS || pt.ms <= 0) continue;
+        if (e["sumOpenInterest"].get(oi) != simdjson::SUCCESS) continue;
+        if (e["sumOpenInterestValue"].get(val) != simdjson::SUCCESS) continue;
+        try { pt.oi = std::stod(std::string(oi)); pt.value = std::stod(std::string(val)); }
+        catch (...) { continue; }
+        if (!(pt.oi > 0)) continue;
+        out.push_back(pt);
+    }
+    std::sort(out.begin(), out.end(), [](const OiPoint& a, const OiPoint& b) { return a.ms < b.ms; });
     return out;
 }
 

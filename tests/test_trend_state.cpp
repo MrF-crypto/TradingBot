@@ -244,6 +244,7 @@ int main() {
         k.smart_list = 'K';
         k.open_trigger = 'I';
         k.open_vol_ratio = 3.25;
+        k.open_taker = 0.625;
         auto t = mk_bot("TURTAUSDT", trend::Pos::Long, 100, 100, 94, 1);
         t.is_auto = true;
         t.smart_list = 'M';
@@ -261,11 +262,12 @@ int main() {
             if (g.cfg.symbol == "BAREAUSDT")
                 k_ok = g.cfg.rule.atr_mult == 2.5 && g.cfg.rule.direction == trend::Direction::LongOnly &&
                        g.smart_list == 'K' && g.open_trigger == 'I' &&
-                       std::fabs(g.open_vol_ratio - 3.25) < 1e-6 && std::isnan(g.open_box_atr);
+                       std::fabs(g.open_vol_ratio - 3.25) < 1e-6 && std::isnan(g.open_box_atr) &&
+                       std::fabs(g.open_taker - 0.625) < 1e-6;
             if (g.cfg.symbol == "TURTAUSDT")
-                t_ok = g.cfg.rule.atr_mult != 2.5 && g.smart_list == 'M';
+                t_ok = g.cfg.rule.atr_mult != 2.5 && g.smart_list == 'M' && std::isnan(g.open_taker);
         }
-        check(k_ok, "裸K 的 bot 用裸K 模板恢复，名单代码、触发方式、开仓量比接得上（箱体没有仍是 NaN）");
+        check(k_ok, "裸K 的 bot 用裸K 模板恢复，名单代码、触发方式、开仓量比、主动买入占比接得上（箱体没有仍是 NaN）");
         check(t_ok, "  海龟的自动 bot 照旧用海龟模板");
 
         auto got2 = load_trend_state(path, {}, nullptr, &bare);

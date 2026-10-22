@@ -134,8 +134,11 @@ struct TrendBot {
     double  dc_dn   = 0;
     double  box_atr   = 0;     // ① 横盘突破过滤：通道宽度 ÷ ATR
     double  vol_ratio = 0;     // ① 横盘突破过滤：当前根量比
+    double  range_pace = 0;    // ① 多单波动放大过滤：当前根折算振幅比
     bool    er_ok = false;     // ① 横盘突破过滤：通道窗口效率比（带符号）
     double  er    = 0;
+    // 当前根主动买入占比（数据记录层，不参与决策）。NaN = 拿不到
+    double  taker_ratio = std::numeric_limits<double>::quiet_NaN();
     // 突破被过滤时日志每根K线只记一次（拦截每 3 秒都会命中）。不落盘
     int64_t squeeze_noted_bar_ms = 0;
     // ── K线快照（裸K 与 抛物线SAR 用；海龟只用上面的 ATR + 通道）──────────
@@ -277,6 +280,7 @@ struct TrendBot {
     double  forced_box     = std::numeric_limits<double>::quiet_NaN();
     double  open_vol_ratio = std::numeric_limits<double>::quiet_NaN();
     double  open_box_atr   = std::numeric_limits<double>::quiet_NaN();
+    double  open_taker     = std::numeric_limits<double>::quiet_NaN();   // 开仓那根的主动买入占比
 
     double realized_pnl = 0;
     int    trade_count  = 0;
@@ -329,6 +333,7 @@ struct TrendTrade {
     char   trigger         = 0;
     double entry_vol_ratio = std::numeric_limits<double>::quiet_NaN();
     double entry_box_atr   = std::numeric_limits<double>::quiet_NaN();
+    double entry_taker     = std::numeric_limits<double>::quiet_NaN();   // 开仓那根的主动买入占比（海龟）
 };
 
 // 一次被过滤掉的突破（每个 bot 每根K线最多一次）。数据记录层用：事后看这些被拦下的
@@ -434,6 +439,10 @@ public:
     // 把自动 bot 转成手动 bot：智能模式从此不再淘汰它、不再改它的参数。
     // 用户在策略弹窗里亲手改了一个自动 bot 的参数，就是在接管它
     void release_auto(const std::string& bot_id);
+    // 持仓中换出场参数（追踪 ATR 倍数、锁定 ATR、暴涨收紧、收益率追踪止盈、保本、假突破、
+    // 初始止损上限、波动顺势的反手触发与护栏），周期 / 杠杆 / 仓位 / 入场过滤不动。
+    // 止损线照旧走棘轮：放宽不会把线往回挪，收紧可能当拍就触线。返回 true = 有改动
+    bool update_exit_params(const std::string& bot_id, const trend::Config& want);
 
     struct DayPnl {
         int64_t day      = 0;   // UTC 日序号（自 1970-01-01 起的天数）
@@ -453,7 +462,12 @@ public:
     void update_signal(const std::string& bot_id, double atr, double atr_pct,
                        bool dc_ok, double dc_up, double dc_dn, int64_t bar_open_ms,
                        double box_atr = 0, double vol_ratio = 0,
-                       bool er_ok = false, double er = 0, double prev_close = 0);
+                       bool er_ok = false, double er = 0, double prev_close = 0,
+                       double taker_ratio = std::numeric_limits<double>::quiet_NaN(),
+                       double range_pace = 0, double bar_open = 0);
+    // ④ 波动顺势：快照停在上一根（新K线已经开始、还没拉到）= 本根开盘价不知道，不开新仓。
+    // 应用层据此在K线交接时立刻补拉，不等下一个拉取周期
+    static bool vf_bar_stale(const TrendBot& b, int64_t now_ms);
     // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：海龟要的是
     // ATR+通道，这两个要的是原始高低点，合成一个大函数会让调用方被迫为
     // 用不到的参数填占位值。

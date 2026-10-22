@@ -8,7 +8,14 @@
 namespace ccbot {
 
 namespace {
-std::string fmt(double v, int prec = 4) {
+// 不给精度 = 价格：按 6 位有效数字取小数位。固定 4 位时 0.0019 和 0.0020 看着只差一格，
+// 实际是 0.00193 与 0.00203（实盘 RSRUSDT 的日志就这样，止损距离读不出来）
+std::string fmt(double v, int prec = -1) {
+    if (prec < 0) {
+        const double a = std::fabs(v);
+        prec = (a > 0 && std::isfinite(a)) ? 5 - (int)std::floor(std::log10(a)) : 4;
+        prec = std::clamp(prec, 2, 10);
+    }
     std::ostringstream o;
     o << std::fixed << std::setprecision(prec) << v;
     return o.str();
@@ -25,6 +32,7 @@ void fill_trade_meta(TrendTrade& tr, const TrendBot& b) {
     tr.trigger         = b.open_trigger;
     tr.entry_vol_ratio = b.open_vol_ratio;
     tr.entry_box_atr   = b.open_box_atr;
+    tr.entry_taker     = b.open_taker;
     tr.strategy = b.cfg.rule.strategy;
     tr.interval = b.cfg.interval;
 
@@ -122,6 +130,12 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg, bool is_auto) {
                  (cfg.rule.chop_er_max > 0
                       ? " / 震荡效率比<" + fmt(cfg.rule.chop_er_max, 2) : std::string());
         break;
+    case trend::Strategy::VolFollow:
+        params = "顺势死区" + fmt(cfg.rule.vf_dead_atr, 2) + "ATR / k=" + fmt(cfg.rule.atr_mult, 1) +
+                 " / 反手：" + (cfg.rule.vf_rev_open ? "回到开盘价另一边 " : "") +
+                 (cfg.rule.vf_rev_loss ? "收益率−" + fmt(cfg.rule.vf_rev_loss_roi, 1) + "% " : std::string()) +
+                 (cfg.rule.vf_rev_stop ? "打到止损线" : "");
+        break;
     case trend::Strategy::Turtle:
     default:
         params = "通道" + std::to_string(cfg.rule.donchian_period) +
@@ -133,6 +147,15 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg, bool is_auto) {
                            ? "（或效率比≥" + fmt(cfg.rule.trend_er_min, 2) + "）" : "");
         if (cfg.rule.breakout_vol_ratio > 0)
             params += " / 量比≥" + fmt(cfg.rule.breakout_vol_ratio, 1) + "x";
+        if (cfg.rule.max_chase_atr > 0)
+            params += " / 追高≤" + fmt(cfg.rule.max_chase_atr, 1) + "ATR";
+        if (cfg.rule.expand_long)
+            params += " / 多单波动≥" + fmt(cfg.rule.expand_long_min, 1);
+        if (cfg.rule.max_init_loss_pct > 0)
+            params += " / 初始止损≤" + fmt(cfg.rule.max_init_loss_pct, 1) + "%";
+        if (cfg.rule.breakeven)
+            params += " / 收益率" + fmt(cfg.rule.breakeven_start, 1) + "%后保本";
+        if (cfg.rule.once_per_bar) params += " / 每根限一次";
         if (cfg.rule.lock_atr)   params += " / 锁定ATR";
         if (cfg.rule.accel_exit) params += " / 加速收紧";
         break;
@@ -160,7 +183,7 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.sig_ok  = false;
     snap.atr = snap.atr_pct = 0;
     snap.dc_ok = false;
-    snap.box_atr = snap.vol_ratio = snap.er = 0;
+    snap.box_atr = snap.vol_ratio = snap.range_pace = snap.er = 0;
     snap.er_ok = false;
     snap.sig_time = {};
     // 冷却与"这根K线数过没有"跨重启都失去意义：bar_open_ms 对不上新拉的K线
@@ -580,6 +603,10 @@ std::string TrendEngine::replace_bot(const std::string& old_id, const TrendConfi
     const double score    = it->second.smart_score;
     const int    rank     = it->second.smart_rank;
     const char   list     = it->second.smart_list;
+    // "这一根开过了"要搬：智能模式盘中重扫会重建刚平仓的 bot，不搬的话同一根里还能再开
+    const int64_t entry_bar = it->second.st.last_entry_bar_ms;
+    // 冷却（连续反手到上限后）也要搬：换参数不该把正在冷却的 bot 放出来
+    const int cooldown = it->second.st.cooldown_left;
     bots_.erase(it);
 
     const std::string id = add_bot(cfg, is_auto);
@@ -592,6 +619,8 @@ std::string TrendEngine::replace_bot(const std::string& old_id, const TrendConfi
     b.smart_score  = score;
     b.smart_rank   = rank;
     b.smart_list   = list;
+    b.st.last_entry_bar_ms = entry_bar;
+    b.st.cooldown_left     = cooldown;
     return id;
 }
 
@@ -620,7 +649,8 @@ void TrendEngine::set_pending_for_test(const std::string& id, bool v) {
 void TrendEngine::update_signal(const std::string& id, double atr, double atr_pct,
                               bool dc_ok, double dc_up, double dc_dn,
                               int64_t bar_open_ms, double box_atr, double vol_ratio,
-                              bool er_ok, double er, double prev_close) {
+                              bool er_ok, double er, double prev_close, double taker_ratio,
+                              double range_pace, double bar_open) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);
     if (it == bots_.end()) return;
@@ -635,19 +665,32 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     b.dc_dn   = dc_dn;
     b.box_atr   = box_atr;
     b.vol_ratio = vol_ratio;
+    b.range_pace = range_pace;
     b.er_ok     = er_ok;
     b.er        = er;
+    b.taker_ratio = taker_ratio;
     b.sig_time = host_.now_steady();
     // ⚠ 只有海龟的 sig_ok 由这里决定。裸K 与 抛物线SAR 根本不算通道也不用 ATR，
     //   它们的 sig_ok 由 update_bars 设——这里若一并覆盖，会把刚设好的 true
     //   打回 false，表现为"永远数据不足、一单不开"
     if (b.cfg.rule.strategy == trend::Strategy::Turtle)
         b.sig_ok = (atr > 0 && dc_ok);
+    // ④ 波动顺势也走这条（要 ATR），另外要当前这根的开盘价
+    if (b.cfg.rule.strategy == trend::Strategy::VolFollow) {
+        b.bar_open = bar_open;
+        b.sig_ok   = (atr > 0 && bar_open > 0);
+    }
     // bar_open_ms 变了 = 跨入新K线。冷却按K线计数，不按 tick——
     // 3 秒一个 tick 的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
     if (bar_open_ms > 0 && bar_open_ms != b.bar_open_ms) {
         b.bar_open_ms = bar_open_ms;   // 实际的冷却递减在 tick 里，见 last_counted_bar_ms
     }
+}
+
+bool TrendEngine::vf_bar_stale(const TrendBot& b, int64_t now_ms) {
+    if (b.cfg.rule.strategy != trend::Strategy::VolFollow || b.bar_open_ms <= 0) return false;
+    const int64_t len = (int64_t)TrendConfig::bar_seconds(b.cfg.interval) * 1000;
+    return len > 0 && now_ms / len * len > b.bar_open_ms;
 }
 
 int TrendEngine::signal_period_sec(const std::string& interval) {
@@ -784,6 +827,45 @@ void TrendEngine::set_retiring(const std::string& id, bool on) {
     auto it = bots_.find(id);
     if (it == bots_.end()) return;
     it->second.retiring = on;
+}
+
+bool TrendEngine::update_exit_params(const std::string& id, const trend::Config& want) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    auto it = bots_.find(id);
+    if (it == bots_.end()) return false;
+    auto& r = it->second.cfg.rule;
+    if (r.atr_mult == want.atr_mult && r.lock_atr == want.lock_atr &&
+        r.accel_exit == want.accel_exit && r.roi_trail == want.roi_trail &&
+        r.roi_trail_start == want.roi_trail_start && r.roi_trail_back == want.roi_trail_back &&
+        r.breakeven == want.breakeven && r.breakeven_start == want.breakeven_start &&
+        r.fail_exit == want.fail_exit && r.fail_exit_short == want.fail_exit_short &&
+        r.max_init_loss_pct == want.max_init_loss_pct &&
+        r.vf_rev_open == want.vf_rev_open && r.vf_rev_loss == want.vf_rev_loss &&
+        r.vf_rev_loss_roi == want.vf_rev_loss_roi && r.vf_rev_stop == want.vf_rev_stop &&
+        r.vf_one_rev_per_bar == want.vf_one_rev_per_bar &&
+        r.max_consecutive_reverses == want.max_consecutive_reverses &&
+        r.cooldown_bars == want.cooldown_bars)
+        return false;
+    r.atr_mult        = want.atr_mult;
+    r.lock_atr        = want.lock_atr;
+    r.accel_exit      = want.accel_exit;
+    r.roi_trail       = want.roi_trail;
+    r.roi_trail_start = want.roi_trail_start;
+    r.roi_trail_back  = want.roi_trail_back;
+    r.breakeven       = want.breakeven;
+    r.breakeven_start = want.breakeven_start;
+    r.fail_exit       = want.fail_exit;
+    r.fail_exit_short = want.fail_exit_short;
+    // 只影响之后开的仓（波动顺势反手开出来的那一腿）
+    r.max_init_loss_pct  = want.max_init_loss_pct;
+    r.vf_rev_open        = want.vf_rev_open;
+    r.vf_rev_loss        = want.vf_rev_loss;
+    r.vf_rev_loss_roi    = want.vf_rev_loss_roi;
+    r.vf_rev_stop        = want.vf_rev_stop;
+    r.vf_one_rev_per_bar = want.vf_one_rev_per_bar;
+    r.max_consecutive_reverses = want.max_consecutive_reverses;
+    r.cooldown_bars      = want.cooldown_bars;
+    return true;
 }
 
 void TrendEngine::release_auto(const std::string& id) {
@@ -982,10 +1064,17 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             in.dc_dn = b.dc_dn;
             in.box_atr   = fresh ? b.box_atr : 0;
             in.vol_ratio = fresh ? b.vol_ratio : 0;
+            in.range_pace = fresh ? b.range_pace : 0;
             in.er_ok     = fresh && b.er_ok;
             in.er        = b.er;
             in.bar_ok      = fresh && b.bar_ok;
             in.bar_open    = b.bar_open;
+            // ④ 新K线已经开始、快照还停在上一根：上一根的开盘价不能当这一根的用，不开新仓
+            //   （持仓不受影响：方向反了看的是开仓那根的开盘价，止损线看 ATR）
+            if (b.cfg.rule.strategy == trend::Strategy::VolFollow &&
+                (!fresh || vf_bar_stale(b, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               host_.now_wall().time_since_epoch()).count())))
+                in.bar_open = 0;
             in.prev_close  = b.prev_close;
             in.prev_high   = b.prev_high;
             in.prev_low    = b.prev_low;
@@ -1029,11 +1118,25 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                 if (b.st.pos != trend::Pos::Flat) {
                     d << " 止损线=" << fmt(b.st.stop);
                     // 加速收紧生效时把当前 k 与浮盈显示出来，看得出止损为什么贴近了
-                    if (b.cfg.rule.strategy == trend::Strategy::Turtle && b.cfg.rule.accel_exit) {
+                    if (trend::atr_stop_strategy(b.cfg.rule.strategy) && b.cfg.rule.accel_exit) {
                         const double k = trend::turtle_k(b.st, b.cfg.rule);
                         if (k < b.cfg.rule.atr_mult)
                             d << " k=" << fmt(k, 1) << "（浮盈" << fmt(trend::turtle_mfe_atr(b.st), 1)
                               << "ATR）";
+                    }
+                    // ④ 方向反了的判据（开仓那根的开盘价）与连续反手了几次
+                    if (b.cfg.rule.strategy == trend::Strategy::VolFollow) {
+                        if (b.st.entry_edge > 0) d << " 开仓根开盘" << fmt(b.st.entry_edge);
+                        if (b.st.consec_reverses > 0) d << " 连续反手" << b.st.consec_reverses;
+                    }
+                }
+                else if (b.cfg.rule.strategy == trend::Strategy::VolFollow) {
+                    if (in.bar_open > 0) {
+                        const double band = trend::vf_band(in, b.cfg.rule);
+                        d << " 本根开盘" << fmt(in.bar_open);
+                        if (band > 0) d << " ±" << fmt(band);
+                    } else {
+                        d << " 等本根开盘价";
                     }
                 }
                 else if (b.cfg.rule.strategy == trend::Strategy::BareK && in.bar_ok) {
@@ -1059,6 +1162,8 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                         d << " 效率比" << (in.er >= 0 ? "+" : "") << fmt(in.er, 2);
                     d << " 量比" << fmt(in.vol_ratio, 1) << "x";
                 }
+                if (b.st.pos == trend::Pos::Flat && trend::expand_filter_on(b.cfg.rule))
+                    d << " 波动" << fmt(in.range_pace, 1);
                 if (!fresh) d << " 信号过期";
                 d << " | " << v.reason;
                 b.last_decision = d.str();
@@ -1104,6 +1209,16 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                                            : std::string("缺失")) +
                                  " 不是趋势（需" + (lg ? "≥+" : "≤−") + fmt(r.trend_er_min, 2) + "）";
                     }
+                } else if (trend::chase_block(in, r, lg)) {
+                    // 价格回到限度以内、其他条件仍满足的话，这根里还会开
+                    cat = "追高";
+                    m += "突破不追：离通道边沿 " + fmt(trend::chase_atr(in, lg), 1) + "ATR（限≤" +
+                         fmt(r.max_chase_atr, 1) + "），回到以内再开";
+                } else if (!trend::squeeze_block(in, r, lg) && trend::expand_block(in, r, lg)) {
+                    // 同量比：波动在这根里起来了还会开
+                    cat = "波动";
+                    m += "突破待波动放大：" + fmt(in.range_pace, 1) + "（需≥" +
+                         fmt(r.expand_long_min, 1) + "），本根内放大即入场";
                 } else {
                     m += "突破待放量：量比 " + fmt(in.vol_ratio, 1) + "x（需≥" +
                          fmt(r.breakout_vol_ratio, 1) + "），本根内量够即入场";
@@ -1192,6 +1307,11 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                     reverse_to = (v.action == trend::Action::CloseReverseLong)  ? trend::Pos::Long
                                : (v.action == trend::Action::CloseReverseShort) ? trend::Pos::Short
                                                                              : trend::Pos::Flat;
+                    // 待移出的只把手上这笔管完：反手开出来的是一笔新仓，不开
+                    if (b.retiring && reverse_to != trend::Pos::Flat) {
+                        reverse_to   = trend::Pos::Flat;
+                        close_reason = std::string(v.reason) + "（待移出，不反手）";
+                    }
                 }
                 break;
             }
@@ -1239,6 +1359,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
             double entry_atr = 0;
             // 数据记录层：开仓时的通道边沿（算"入场离边沿多远"）
             double edge_up = 0, edge_dn = 0;
+            int64_t vf_bar_ms = 0;   // ④ 那个开盘价属于哪一根
             // force_open 带进来的（智能裸K 点火）：止损用点火K线最低点，读数记进这一笔
             bool   forced = false;
             double forced_vol = std::numeric_limits<double>::quiet_NaN();
@@ -1253,6 +1374,12 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 if (cfg.rule.strategy == trend::Strategy::Turtle) {
                     entry_atr = b.atr;
                     if (b.dc_ok) { edge_up = b.dc_up; edge_dn = b.dc_dn; }
+                }
+                // ④ 记开仓那根的开盘价（方向反了的判据）；"入场离边沿"也按它算 = 离开盘价几个 ATR
+                if (cfg.rule.strategy == trend::Strategy::VolFollow) {
+                    entry_atr = b.atr;
+                    if (b.bar_open > 0) edge_up = edge_dn = b.bar_open;
+                    vf_bar_ms = b.bar_open_ms;
                 }
                 // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
                 // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
@@ -1340,7 +1467,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 // 把当前K线的开盘时间一并写进去：裸K 的 once_per_bar 护栏靠它
                 // 判定"这一根已经开过了"
                 // 被突破的那条边（假突破提前出场判"收盘跌回通道内"用）
-                const double entry_edge = (dir == trend::Pos::Long) ? edge_up : edge_dn;
+                double entry_edge = (dir == trend::Pos::Long) ? edge_up : edge_dn;
                 // 开仓所在的K线。整点刚过时快照可能还停在上一根（信号最多 1 分钟拉一次）——
                 // 照快照记，引擎会把"开仓那根"记成上一根：新快照一到就以为它已经收完，
                 // 拿开仓【之前】的收盘价去判假突破，开完马上被平（实盘 4 笔）。
@@ -1353,6 +1480,10 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                     const int64_t wall_bar = now_ms / bar_len * bar_len;
                     if (wall_bar > entry_bar && wall_bar - entry_bar <= bar_len) entry_bar = wall_bar;
                 }
+                // ④ 快照里的开盘价不是开仓这一根的（反手正好落在K线交接时）：按成交价当开盘价，
+                //   不拿上一根的开盘价去判"方向反了"
+                if (cfg.rule.strategy == trend::Strategy::VolFollow && (entry_edge <= 0 || vf_bar_ms != entry_bar))
+                    entry_edge = fill;
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  entry_bar, entry_atr, entry_edge > 0 ? entry_edge : 0);
                 // 假突破从哪一根的收盘开始判：这根已经走到最后 1/4 才开仓的，留到下一根
@@ -1376,6 +1507,8 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 b.open_box_atr   = forced ? forced_box
                                  : (entry_atr > 0 && b.box_atr > 0)
                                        ? b.box_atr : std::numeric_limits<double>::quiet_NaN();
+                b.open_taker     = (!forced && entry_atr > 0) ? b.taker_ratio
+                                                              : std::numeric_limits<double>::quiet_NaN();
                 b.open_dist_atr = std::numeric_limits<double>::quiet_NaN();
                 if (entry_atr > 0) {
                     if (dir == trend::Pos::Long && edge_up > 0)
@@ -1960,8 +2093,10 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
             // 撤单放在锁外。ds_only_cancel 时后面的反手/回调一律跳过——
             // 仓位在交易所侧已经没了，没有可平的也没有可反的
             if (need_ds_cancel) cancel_disaster_stop(id);
-            if (ds_only_cancel) return;
+            // 成交回调要在 ds_only_cancel 的 return 之前：硬止损先触发那一笔也是成交，
+            // 以前排在后面，这类出场从没进过成交记录（trades.csv / 成交历史）
             if (emit_trade && trade_cb_) trade_cb_(tr);
+            if (ds_only_cancel) return;
 
             if (reverse_to != trend::Pos::Flat) {
                 // ⚠ 这道闸原本是无条件的 atr<=0，那是只有海龟一个策略时留下的。
@@ -1970,7 +2105,7 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 //   这一个来源，等于开完第一笔就再也不交易了，而日志里只有一行
                 //   "ATR缺失未反手"、界面上一切正常。
                 //   非海龟策略的止损线可用性由 submit_open 里的 stop_ok 统一把关
-                if (cfg.rule.strategy == trend::Strategy::Turtle && atr <= 0) {
+                if (trend::atr_stop_strategy(cfg.rule.strategy) && atr <= 0) {
                     std::lock_guard<std::recursive_mutex> lk(mtx_);
                     auto it = bots_.find(id);
                     if (it != bots_.end()) {

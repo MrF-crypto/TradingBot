@@ -110,6 +110,9 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            << (std::isfinite(b.open_box_atr)
                    ? "\"open_box_atr\":" + std::to_string(b.open_box_atr) + ","
                    : std::string())
+           << (std::isfinite(b.open_taker)
+                   ? "\"open_taker\":" + std::to_string(b.open_taker) + ","
+                   : std::string())
            << "\"open_trigger\":" << (int)b.open_trigger << ","
            << "\"smart_list\":"  << (int)b.smart_list << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
@@ -191,7 +194,8 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
                                    const TrendConfig* auto_tmpl,
-                                   const TrendConfig* bare_tmpl) {
+                                   const TrendConfig* bare_tmpl,
+                                   const TrendConfig* vol_tmpl) {
     std::vector<TrendBot> out;
 
     std::ifstream f(path, std::ios::binary);
@@ -226,7 +230,13 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         const TrendConfig* cfg = nullptr;
         TrendConfig auto_cfg;
         if (is_auto) {
-            if (auto_tmpl && smart_list == smart::kSegBare && bare_tmpl) {
+            // 波动顺势（V）与裸K（K）各认自己的模板；开关关着、持仓中的也按它管完
+            const bool keep_open = auto_tmpl || saved_pos != (int)trend::Pos::Flat;
+            if (smart_list == smart::kSegVol && vol_tmpl && keep_open) {
+                auto_cfg = *vol_tmpl;
+            } else if (smart_list == smart::kSegVol && !keep_open) {
+                continue;   // 智能模式已关，空仓的自动 bot 不再需要
+            } else if (auto_tmpl && smart_list == smart::kSegBare && bare_tmpl) {
                 auto_cfg = *bare_tmpl;
             } else if (auto_tmpl) {
                 auto_cfg = *auto_tmpl;
@@ -271,6 +281,7 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.open_stop          = get_num(o, "open_stop", 0);
         b.open_vol_ratio     = get_num(o, "open_vol_ratio", std::numeric_limits<double>::quiet_NaN());
         b.open_box_atr       = get_num(o, "open_box_atr", std::numeric_limits<double>::quiet_NaN());
+        b.open_taker         = get_num(o, "open_taker", std::numeric_limits<double>::quiet_NaN());
         b.open_trigger       = (char)(int)get_num(o, "open_trigger", 0);
         b.smart_list         = smart_list;
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);

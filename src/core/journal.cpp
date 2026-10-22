@@ -1,6 +1,7 @@
 #include "core/journal.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 #include <filesystem>
@@ -103,6 +104,26 @@ void Journal::append(const std::string& file, const std::string& header, const s
         std::error_code ec;
         fs::create_directories(dir_, ec);
         const fs::path p = fs::path(dir_) / file;
+        // 新版本加了列：老文件的表头对不上，接着写会错列。每个文件每次运行核对一次，
+        // 对不上就把老文件改名（xxx-old-时间.csv）留着，另起一份
+        if (header_checked_.insert(file).second && fs::exists(p, ec)) {
+            std::string first;
+            {
+                std::ifstream in(p, std::ios::binary);
+                std::getline(in, first);
+            }
+            if (!first.empty() && first.back() == '\r') first.pop_back();
+            if (first != "\xEF\xBB\xBF" + header) {
+                const auto now = std::chrono::system_clock::now();
+                const std::string stamp = utc_date(ms_of(now)) + "T" +
+                                          utc_time(ms_of(now)).substr(11, 8);
+                std::string old = file.substr(0, file.rfind('.')) + "-old-" + stamp + ".csv";
+                for (char& ch : old) if (ch == ':') ch = '-';
+                fs::rename(p, fs::path(dir_) / old, ec);
+                // 改名失败（多半是 Excel 开着这个文件）：这一行不写进错列的老文件，下次再试
+                if (ec) { header_checked_.erase(file); return; }
+            }
+        }
         const bool fresh = !fs::exists(p, ec);
         std::ofstream f(p, std::ios::binary | std::ios::app);
         if (!f) return;
@@ -153,14 +174,14 @@ void Journal::trade(const TrendTrade& t) {
       << num(t.mfe_atr, 4) << "," << num(t.mae_atr, 4) << ","
       << num(t.mfe_r, 4)   << "," << num(t.mae_r, 4)   << ","
       << trigger_name(t.trigger) << "," << num(t.entry_vol_ratio, 4) << ","
-      << num(t.entry_box_atr, 4) << ","
+      << num(t.entry_box_atr, 4) << "," << num(t.entry_taker, 4) << ","
       << csv_field(t.reason) << "\n";
     std::lock_guard<std::mutex> lk(mtx_);
     append("trades.csv",
            "平仓时间UTC,开仓时间UTC,持仓小时,品种,方向,策略,周期,手动自动,开仓时所在段,段内名次,"
            "分数,开仓价,平仓价,数量,盈亏U,估算手续费U,净盈亏U,入场离通道边沿ATR,"
            "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,浮盈亏最低ATR,"
-           "浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,原因",
+           "浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,入场主动买入占比,原因",
            l.str());
 }
 
@@ -186,7 +207,8 @@ void Journal::pool(int64_t ms, const std::string& symbol, const std::string& eve
 }
 
 void Journal::scan(int64_t ms, const smart::Ranking& rk, const smart::Segmented& sg,
-                   const std::set<std::string>& with_bot) {
+                   const std::set<std::string>& with_bot,
+                   const std::map<std::string, smart::OiStat>& oi) {
     const std::string t = utc_time(ms);
     std::ostringstream l;
     for (const auto& kv : rk.rows) {
@@ -215,14 +237,24 @@ void Journal::scan(int64_t ms, const smart::Ranking& rk, const smart::Segmented&
           << num(f.atr_ratio, 4) << "," << num(f.box48_atr, 4) << "," << num(f.vol_lift, 4) << ","
           << num(f.pos12, 4) << "," << num(f.atr_pct, 4) << "," << num(f.max_up24, 4) << ","
           << num(f.max_dn24, 4) << "," << num(f.close, 10) << ","
-          << (with_bot.count(kv.first) ? "是" : "") << "\n";
+          << (with_bot.count(kv.first) ? "是" : "") << ","
+          << num(f.taker1, 4) << "," << num(f.taker6, 4);
+        if (auto o = oi.find(kv.first); o != oi.end()) {
+            const auto& s2 = o->second;
+            l << "," << utc_time(s2.ms) << "," << num(s2.value, 10) << ","
+              << num(s2.chg1, 4) << "," << num(s2.chg4, 4) << "," << num(s2.chg24, 4);
+        } else {
+            l << ",,,,,";
+        }
+        l << "\n";
     }
     std::lock_guard<std::mutex> lk(mtx_);
     prune_locked(ms);
     append("scan-" + utc_date(ms) + ".csv",
            "时间UTC,品种,段,段内名次,做多分,做空分,蓄势分,强弱百分位,相对强弱,效率比24,"
            "箱体12/ATR,ATR14/ATR100,箱体48/ATR,量能抬升,箱体内位置,ATR%,7天最大单日涨%,"
-           "7天最大单日跌%,收盘价,已有bot",
+           "7天最大单日跌%,收盘价,已有bot,主动买入占比1h,主动买入占比6h,"
+           "持仓量时间UTC,持仓价值U,持仓量变化1h%,持仓量变化4h%,持仓量变化24h%",
            l.str());
 }
 

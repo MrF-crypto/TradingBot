@@ -8,6 +8,7 @@
 #include <mutex>
 #include <memory>
 #include <functional>
+#include <limits>
 
 namespace ccbot { class RateGate; }
 
@@ -93,6 +94,7 @@ public:
         // 按 tick 计数的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
         int64_t open_ms = 0;
         double  quote_volume = 0;   // 成交额（U）。0 = 接口没给
+        double  taker_buy_quote = 0;   // 主动买入成交额（U）。0 = 接口没给
     };
     // 统一的 K 线拉取+解析（fetch_indicators / fetch_trend 共用）
     std::vector<Bar> fetch_klines(const std::string& symbol,
@@ -116,10 +118,14 @@ public:
         double  box_atr   = 0;     // 通道宽度 ÷ 已收盘K线的 ATR，0=算不出
         double  vol_ratio = 0;     // 当前根已成交量 ÷ 通道窗口内均量，0=算不出或尚无成交
         double  vol_ratio_paced = 0;   // 同上，按这根已走时间折算（indicators::paced_ratio）
+        double  range_pace = 0;    // 当前根振幅 ÷（已收盘 ATR × √已走比例），0=算不出（indicators::paced_range）
         double  prev_close = 0;    // 最近一根已收盘K线的收盘价（假突破提前出场用）
         bool    er_ok = false;     // 通道窗口的效率比算得出来
         double  er    = 0;         // 带符号，正 = 净上涨
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
+        double  bar_open = 0;      // 当前（未收盘）K线的开盘价（④ 波动顺势的入场基准）
+        // 当前根主动买入成交额 ÷ 成交额（数据记录层，不参与决策）。NaN = 拿不到
+        double  taker_ratio = std::numeric_limits<double>::quiet_NaN();
     };
     TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,
                                  int donchian_period, int atr_period);
@@ -236,6 +242,14 @@ public:
     std::unordered_map<std::string, Ticker24h> fetch_all_24h(bool* ok);   // 权重 40
     // 全市场最新资金费率，单位 %（lastFundingRate × 100）。权重 10
     std::unordered_map<std::string, double> fetch_all_funding_pct(bool* ok);
+    // 持仓量历史（/futures/data/openInterestHist，逐品种，交易所只留最近 30 天）。
+    // 时间正序；拿不到返回空。数据记录层用，不参与决策
+    struct OiPoint {
+        int64_t ms = 0;
+        double  oi = 0;      // 持仓量（张/币）
+        double  value = 0;   // 持仓价值（U）
+    };
+    std::vector<OiPoint> fetch_oi_hist(const std::string& symbol, const std::string& period, int limit);
 
     // 历史资金费流水。income 带符号，负数=你付出去的。
     // 币安不带时间范围时只返回最近7天，所以补历史要按7天窗口分页（见 funding_ledger）
@@ -533,7 +547,13 @@ private:
     // 公开行情。critical = 行情轮询（标记价 / 备用成交价）：走专用句柄，
     // 限流闸门按订单优先级放行（只在被封禁时等）——权重逼近上限时，非订单请求要等到下一分钟，
     // 而行情一停移动止损就停
-    std::string http_get_public  (const std::string& path, bool critical = false);
+    // own_limit：端点有自己的独立限流（/futures/data/*，每 IP 每 5 分钟 1000 次）。
+    //   它的 429 只说明这一组超了，不能喂给全局闸门——否则一次记录层的超限会把
+    //   下单、止损一起冻住 30 秒以上。out_code 回传 HTTP 状态码
+    std::string http_get_public  (const std::string& path, bool critical = false,
+                                  bool own_limit = false, long* out_code = nullptr);
+    // /futures/data 被限流后的冷却截止（本机墙钟毫秒）。冷却期内不再请求，避免 429 升级成 418 封 IP
+    std::atomic<int64_t> data_api_cool_until_ms_ {0};
 };
 
 } // namespace ccbot

@@ -2,6 +2,7 @@
 #include "core/trend_engine.h"
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -32,6 +33,7 @@ struct Bar {
     int64_t open_ms = 0;
     double  open = 0, high = 0, low = 0, close = 0, volume = 0;
     double  quote_vol = 0;   // 成交额（U）；0 = 没有，用 volume × close 兜底
+    double  taker_quote = 0; // 主动买入成交额（U）；0 = 没有
 };
 
 // 方向模式
@@ -45,7 +47,10 @@ enum class DirMode { Breakout, Mixed };
 //   BareK ：埋伏点火（只做多）。每天 08:00（UTC 0 点）用 1h 结构建埋伏池，每小时刷新；
 //           每根 5m 收盘后判定池里的币有没有「点火」，点火就建 bot 开仓，平仓后删 bot。
 //           见 BareConfig
-enum class Strategy { Turtle, BareK };
+//   VolFollow：波动顺势。每根所选周期的K线收盘后重扫全市场，波动率大或波动斜率大的进名单
+//           （满足一个就行），每个币一个常驻 bot：看正在走的这根顺势开、方向反了亏损就反手。
+//           见 VolConfig
+enum class Strategy { Turtle, BareK, VolFollow };
 
 // 名单 / 分段代码，也写进 TrendBot::smart_list 供界面显示
 inline constexpr char kListLong  = 'L';   // 突破模式：做多名单
@@ -55,6 +60,52 @@ inline constexpr char kSegWeak   = 'D';   // 混合模式：弱势（仅空）
 inline constexpr char kSegMid    = 'M';   // 混合模式：中间（多空）
 inline constexpr char kSegHot    = 'H';   // 混合模式：过热（仅空）
 inline constexpr char kSegBare   = 'K';   // 裸K：点火开仓的 bot（随仓位落盘，重启后靠它认出来）
+inline constexpr char kSegVol    = 'V';   // 波动顺势的 bot（同上，重启后靠它认出来）
+
+// 波动顺势的参数（用户逐条确认过的规则）：
+//   ① 周期 5m / 15m / 30m / 1h 可选，入场、ATR、波动率、波动斜率都按这个周期算
+//   ② 选币：硬门槛（USDT 永续、只做币、成交额、上线天数、24h 涨跌、资金费率、拉黑）之后，
+//      波动率大（ATR14 ÷ 收盘价 ≥ atr_pct_min）或波动斜率大（近 6 根 ÷ 近 48 根平均真实波幅
+//      ≥ slope_min），两条各自可勾、满足一个就进；按斜率排、取前 pool_n 个。
+//      每根K线收盘后重扫；连续 2 轮不在名单、空仓才移出，持仓中的等走完
+//   ③ 入场：正在走的这根，实时价离开盘价超过死区就顺着做
+//   ④ 方向反了、亏损时立刻反手（三种触发可勾），护栏：死区 / 连续反手上限 + 冷却 / 同一根最多反手一次
+//   ⑤ 盈利出场用现有的（k×ATR 追踪、锁定 ATR、加速收紧、收益率追踪止盈、保本）；平仓后等下一根
+// 仓位 / 杠杆 / 硬止损外扩沿用海龟模板（三套共用）
+struct VolConfig {
+    std::string interval = "15m";
+    // ── 选币 ──
+    double min_quote_vol = 5e6;    // 24h 成交额（U）
+    int    min_age_days  = 14;
+    double max_abs_chg24 = 50;
+    bool   use_atr     = true;     // 波动率大
+    double atr_pct_min = 1.0;      //   所选周期 ATR14 ÷ 收盘价（%）≥
+    bool   use_slope   = true;     // 波动斜率大
+    double slope_min   = 1.5;      //   近 6 根 ÷ 近 48 根平均真实波幅 ≥
+    int    pool_n      = 30;       // 名单上限（按斜率排）
+    // ── 入场与反手（含义见 trend::Config 的 vf_* 一段）──
+    double dead_atr        = 0.3;
+    bool   rev_open        = true;
+    bool   rev_loss        = false;
+    double rev_loss_roi    = 10;
+    bool   rev_stop        = true;
+    int    max_reverses    = 3;     // 连续反手上限（0 = 不限）
+    int    cooldown_bars   = 3;     // 到上限后冷却几根
+    bool   one_rev_per_bar = true;
+    // ── 出场 ──
+    double atr_mult          = 3.0;
+    bool   lock_atr          = true;
+    bool   accel_exit        = true;
+    double max_init_loss_pct = 0;
+    bool   roi_trail         = false;
+    double roi_start         = 10;
+    double roi_back          = 5;
+    bool   breakeven         = false;
+    double breakeven_start   = 6;
+    int    max_positions     = 10;
+};
+inline constexpr int kVolShort = 6, kVolLong = 48;   // 波动斜率的两个窗口（根）
+inline constexpr int kVolBars  = kVolLong + 12;      // 选币要的已收盘根数（ATR 预热 + 48 根窗口）
 
 // 裸K（埋伏点火，只做多）的参数。规则来自用户回测过的方案，逐条确认过：
 //   ① 埋伏池（每天 UTC 0 点 = 北京 08:00 重建，程序任意时刻启动先建一次）：
@@ -79,6 +130,10 @@ struct BareConfig {
     double upper_wick_max = 0.35;  // 上影 ÷ 振幅
     double amp_atr_min    = 0.6;   // 振幅 ÷ 点火前 5m ATR
     double edge_tol_pct   = 0.4;   // 收盘不低于箱体上沿 −这么多 %
+    // 波动放大（默认关）：最近 6 根 5m（含点火那根）的平均真实波幅 ÷ 最近 48 根的 ≥ expand_min。
+    //   用户盘面观察：暴涨山寨币先 5m 放量上涨，紧接着波动率斜率变大
+    bool   expand         = false;
+    double expand_min     = 1.5;
     // ── 否决 ──
     int    veto_red_bars = 5;      // 点火前这么多根全是阴线（下跌中继的反抽）
     double veto_pos_max  = 0.3;    // 点火前收盘在箱体位置低于这个（箱内乱窜，不是贴顶突破）
@@ -98,6 +153,7 @@ struct Config {
     bool enabled   = false;
     Strategy strategy = Strategy::Turtle;
     BareConfig bare;
+    VolConfig  vol;
     bool dir_long  = true;
     bool dir_short = true;
     DirMode dir_mode = DirMode::Mixed;
@@ -177,6 +233,26 @@ inline constexpr int kAtrPeriod     = 14;
 // 不埋伏的币：黄金代币（交易所标的类型也是 COIN，只能按名字排）
 bool ambush_excluded_base(const std::string& base);
 
+// ── 波动顺势 ──────────────────────────────────────────────────────────────
+// bot 配置：所选周期、④ 波动顺势、多空、立即反手、每根K线最多开一次、硬止损强制开，
+// 仓位 / 杠杆 / 硬止损外扩沿用模板
+TrendConfig make_vol_bot_config(const Config& cfg, const std::string& symbol);
+// 一个币在所选周期上的波动读数（只用已收盘的K线）
+struct VolFeat {
+    bool   ok = false;
+    double close = 0;
+    double atr_pct = 0;   // ATR14 ÷ 收盘价（%）
+    double slope = 0;     // 近 6 根 ÷ 近 48 根平均真实波幅
+};
+// bars：已收盘、时间正序，至少 kVolLong + 1 根
+VolFeat compute_vol(const std::vector<Bar>& bars);
+// 满足勾选的任一条件。两条都没勾 = 谁都不进
+bool vol_qualifies(const VolFeat& f, const VolConfig& vc);
+// 合格的按斜率降序（同斜率按波动率、再按品种名），取前 pool_n 个
+std::vector<std::string> select_vol(const std::map<std::string, VolFeat>& feats, const VolConfig& vc);
+// 周期是不是波动顺势支持的（5m / 15m / 30m / 1h）
+bool vol_interval_ok(const std::string& iv);
+
 // ── 裸K 埋伏池 ────────────────────────────────────────────────────────────
 // 一个币的 1h 结构读数（只用已收盘的K线）
 struct AmbushFeat {
@@ -219,9 +295,13 @@ struct Ignition {
     std::string why;                 // 没过的第一条
     double vol_ratio = 0, body_pct = 0, close_pos = 0, upper_wick = 0;
     double amp_atr = 0, rise_atr = 0, atr = 0;
+    double expand = 0;               // 波动斜率：近 6 根 ÷ 近 48 根平均真实波幅（含点火那根），0 = 根数不够
     double low = 0, close = 0;
 };
-// bars：已收盘的 5m，至少 35 根（20 根算成交额中位数、14 根 ATR 预热）
+// 波动斜率的两个窗口（5m 根数，都含点火那根）
+inline constexpr int kExpandShort = 6, kExpandLong = 48;
+// bars：已收盘的 5m，至少 35 根（20 根算成交额中位数、14 根 ATR 预热）；
+// 开了波动放大要 kExpandLong + 1 根（第一根只给真实波幅提供前收盘）
 Ignition check_ignition(const std::vector<Bar>& bars, double box_hi, double box_lo,
                         const BareConfig& bc);
 
@@ -266,10 +346,31 @@ struct Features {
     double max_up24  = 0;       // 最近 7 天里任意连续 24 根的最大涨幅（%）——过热判定
     double max_dn24  = 0;       // 同窗口最大跌幅（%，正数）——暴跌判定
     double close     = 0;       // 最后一根已收盘K线的收盘价（数据记录层：事后算后续涨跌）
+    // 主动买入成交额 ÷ 成交额：最后 1 根 / 最后 6 根。数据记录层，不参与打分。NaN = 拿不到
+    double taker1    = std::numeric_limits<double>::quiet_NaN();
+    double taker6    = std::numeric_limits<double>::quiet_NaN();
 };
 // bars / btc：已收盘的 1h K线，时间正序，不含未收盘那根。至少 kMinBars 根
 inline constexpr int kMinBars = 170;
 Features compute_features(const std::vector<Bar>& bars, const std::vector<Bar>& btc);
+// ── 持仓量（OI）：只采集记录，不参与决策 ─────────────────────────────────
+struct OiPoint {
+    int64_t ms = 0;
+    double  oi = 0;      // 持仓量（张/币）
+    double  value = 0;   // 持仓价值（U）
+};
+// 变化率按持仓量（不按价值：价值会跟着价格动）。NaN = 那个时刻的点没拿到
+struct OiStat {
+    bool    ok = false;  // 至少有最新一个点
+    int64_t ms = 0;      // 最新一个点的时间
+    double  value = 0;   // 最新持仓价值（U）
+    double  chg1  = std::numeric_limits<double>::quiet_NaN();   // 1h 变化 %
+    double  chg4  = std::numeric_limits<double>::quiet_NaN();   // 4h
+    double  chg24 = std::numeric_limits<double>::quiet_NaN();   // 24h
+};
+// pts：1h 周期、时间正序。按时间戳找 1 / 4 / 24 小时前的点，缺了就是 NaN（不拿相邻的凑）
+OiStat oi_stat(const std::vector<OiPoint>& pts);
+
 // ATR% 区间（要K线，所以和 pre_gate 分开）。relax 时区间各放宽 20%
 std::string atr_gate(const Features& f, const Config& cfg, bool relax);
 

@@ -11,8 +11,10 @@ namespace ccbot::indicators {
 // ── OHLC 系列指标 ───────────────────────────────────────────────────────────
 // ATR/唐奇安要最高最低价，所以单独一个输入类型。
 // 刻意【不】复用 TradingClient::Bar：本文件的约定是不依赖网络层，调用方自己转一下。
+// open 放最后：ATR 只要高低收，老的 {high, low, close} 写法不受影响；
+// 唐奇安通道要实体，调用方必须填 open
 struct Ohlc {
-    double high = 0, low = 0, close = 0;
+    double high = 0, low = 0, close = 0, open = 0;
 };
 
 // 真实波幅：当根振幅、与上一根收盘的向上跳空、向下跳空，三者取最大。
@@ -48,11 +50,14 @@ inline double atr(const std::vector<Ohlc>& bars, int period) {
 
 struct DonchianResult {
     bool   ok = false;
-    double up = 0;   // period 根内的最高价
-    double dn = 0;   // period 根内的最低价
+    double up = 0;   // period 根内的最高实体顶 max(开, 收)
+    double dn = 0;   // period 根内的最低实体底 min(开, 收)
 };
 
 // 唐奇安通道：突破入场信号的来源。
+//
+// 5.10.1 起按【实体】算，不看影线：一根冲高回落的长上影会把上沿抬到针尖，
+// 价格早已站上平台却要等再冲过针尖才入场，好价格错过了。量比、箱体参数另有确认
 //
 // ⚠ exclude_last 默认 1，【不能改成 0】：当前这根K线的最高价本身就是通道上沿的
 //   一部分，把它算进去等于让"价格 >= 上沿"永远成立——信号恒真，等于没有信号。
@@ -66,11 +71,11 @@ inline DonchianResult donchian(const std::vector<Ohlc>& bars, int period,
     int end = (int)bars.size() - exclude_last;          // 不含 end
     if (end < period) return r;
 
-    r.up = bars[end - period].high;
-    r.dn = bars[end - period].low;
+    r.up = std::max(bars[end - period].open, bars[end - period].close);
+    r.dn = std::min(bars[end - period].open, bars[end - period].close);
     for (int i = end - period + 1; i < end; ++i) {
-        r.up = std::max(r.up, bars[i].high);
-        r.dn = std::min(r.dn, bars[i].low);
+        r.up = std::max({r.up, bars[i].open, bars[i].close});
+        r.dn = std::min({r.dn, bars[i].open, bars[i].close});
     }
     r.ok = true;
     return r;
@@ -97,6 +102,18 @@ inline double paced_ratio(double raw, double elapsed_frac, double floor = kVolPa
     if (!(f >= floor)) f = floor;   // NaN 也走这里
     if (f > 1) f = 1;
     return raw / f;
+}
+
+// 未收盘K线的振幅按已走时间折算：range ÷（atr × √已走比例）。振幅随时间的平方根增长，
+// 成交量才是线性的——半根走完，正常振幅约是整根 ATR 的 0.71 倍而不是一半。
+// 已走比例的下限、上限同 paced_ratio。range 或 atr ≤ 0（拿不到）返回 0
+inline double paced_range(double range, double atr, double elapsed_frac,
+                          double floor = kVolPaceFloor) {
+    if (!(range > 0) || !(atr > 0)) return 0;
+    double f = elapsed_frac;
+    if (!(f >= floor)) f = floor;
+    if (f > 1) f = 1;
+    return range / (atr * std::sqrt(f));
 }
 
 struct ErResult {

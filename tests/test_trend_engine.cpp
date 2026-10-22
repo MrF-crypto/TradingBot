@@ -451,21 +451,109 @@ int main() {
         cfg.rule.reverse = trend::ReverseMode::None;
         cfg.rule.breakout_vol_ratio = 2.5;
         auto id = eng.add_bot(cfg);   // 手动 bot 一建好就上膛
-        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 1.5, 3.0);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 1.5, 3.0, false, 0, 0, 0.7);
         cli->fill_price = 111.0;
         eng.tick("TESTUSDT", 111.0);
         auto b = eng.get_bots()[0];
         check(cli->calls.size() == 1 && b.st.pos == trend::Pos::Long, "放量破位：开");
         check(b.open_trigger == 0 && std::fabs(b.open_vol_ratio - 3.0) < 1e-9 &&
-                  std::fabs(b.open_box_atr - 1.5) < 1e-9,
-              "  开仓时记下量比 3.0、箱体 1.5；触发方式留空");
+                  std::fabs(b.open_box_atr - 1.5) < 1e-9 && std::fabs(b.open_taker - 0.7) < 1e-9,
+              "  开仓时记下量比 3.0、箱体 1.5、主动买入占比 0.7；触发方式留空");
         advance(10);
         cli->fill_price = 104.0;
         eng.tick("TESTUSDT", 104.0);
         check(trades.size() == 1 && trades[0].trigger == 0 &&
                   std::fabs(trades[0].entry_vol_ratio - 3.0) < 1e-9 &&
-                  std::fabs(trades[0].entry_box_atr - 1.5) < 1e-9,
-              "  平仓的成交记录带上这三项");
+                  std::fabs(trades[0].entry_box_atr - 1.5) < 1e-9 &&
+                  std::fabs(trades[0].entry_taker - 0.7) < 1e-9,
+              "  平仓的成交记录带上这四项");
+    }
+
+    // ── 海龟每根K线最多开一次：出场后价格还在通道外，同一根里不原地再开 ──
+    for (const bool once : {true, false}) {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse      = trend::ReverseMode::None;
+        cfg.rule.once_per_bar = once;
+        auto id = eng.add_bot(cfg);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        advance(10);
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);            // 止损出场（止损线 111 − 3×2 = 105）
+        const size_t after_close = cli->calls.size();
+        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, once ? "每根一次：先开一笔再止损出场" : "对照：同样开一笔再出场");
+        advance(10);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);            // 同一根里又站上通道
+        if (once) {
+            check(cli->calls.size() == after_close && eng.get_bots()[0].st.pos == trend::Pos::Flat,
+                  "  同一根里不再开");
+            eng.update_signal(id, 2.0, 2.0, true, 110, 90, 2);   // 下一根
+            advance(10);
+            eng.tick("TESTUSDT", 111.0);
+            check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  下一根价格仍在通道外：照常再进");
+        } else {
+            check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  不勾：同一根里原地再开（原来的行为）");
+        }
+    }
+
+    // ── 换参数重建 bot：把"这一根开过了"带过去（智能模式盘中重扫会重建刚平仓的 bot）──
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse      = trend::ReverseMode::None;
+        cfg.rule.once_per_bar = true;
+        auto id = eng.add_bot(cfg);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        advance(10);
+        cli->fill_price = 104.0;
+        eng.tick("TESTUSDT", 104.0);
+        auto cfg2 = cfg;
+        cfg2.rule.atr_mult = 2.5;
+        const auto id2 = eng.replace_bot(id, cfg2);
+        check(!id2.empty() && eng.get_bots()[0].st.last_entry_bar_ms == 1,
+              "重建后的 bot 带着开仓所在K线");
+        eng.update_signal(id2, 2.0, 2.0, true, 110, 90, 1);
+        const size_t n = cli->calls.size();
+        advance(10);
+        cli->fill_price = 111.0;
+        eng.tick("TESTUSDT", 111.0);
+        check(cli->calls.size() == n && eng.get_bots()[0].st.pos == trend::Pos::Flat,
+              "  同一根里重建后也不再开");
+        eng.update_signal(id2, 2.0, 2.0, true, 110, 90, 2);
+        advance(10);
+        eng.tick("TESTUSDT", 111.0);
+        check(eng.get_bots()[0].st.pos == trend::Pos::Long, "  下一根照常开");
+    }
+
+    // ── 追高过滤 + 初始止损上限走通引擎：被拦记一条过滤事件；开仓后止损线和硬止损按上限 ──
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
+        auto cfg = mk_cfg();
+        cfg.rule.reverse           = trend::ReverseMode::None;
+        cfg.rule.max_chase_atr     = 1.5;
+        cfg.rule.max_init_loss_pct = 3;
+        auto id = eng.add_bot(cfg);
+        eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1);
+        cli->fill_price = 114.0;
+        eng.tick("TESTUSDT", 114.0);            // 离上沿 2 ATR
+        check(cli->calls.empty() && eng.get_bots()[0].st.pos == trend::Pos::Flat, "离上沿 2 ATR：不追");
+        check(eng.get_bots()[0].last_decision.find("不追") != std::string::npos, "  状态写明不追");
+        advance(10);
+        cli->fill_price = 112.0;
+        eng.tick("TESTUSDT", 112.0);            // 回到 1 ATR
+        const auto b = eng.get_bots()[0];
+        check(b.st.pos == trend::Pos::Long, "  回到 1 ATR 以内：开");
+        // 3×ATR = 106；上限 3% = 108.64，取近的
+        check(std::fabs(b.st.stop - 112.0 * 0.97) < 1e-9 && std::fabs(b.open_stop - 112.0 * 0.97) < 1e-9,
+              "  初始止损 = 开仓价 −3%（比 3×ATR 近）");
     }
 
     // ── 假突破的判定时机：整点交接（快照还停在上一根）不误平；最后 1/4 根开仓留到下一根 ──
@@ -1150,6 +1238,8 @@ int main() {
         cfg.use_disaster_stop = true;
         cfg.rule.reverse = trend::ReverseMode::None;   // 只看出场，不看反手
         auto id = eng.add_bot(cfg);
+        std::vector<TrendTrade> trades;
+        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
         feed(eng, id, 2.0, 110, 90);
         cli->fill_price = 110.0;
         eng.tick("TESTUSDT", 110.0);                   // 开多，止损线 104
@@ -1169,6 +1259,9 @@ int main() {
               "⚠ bot 必须【继续运行】—— 这是计划内的止损出场，和本地止损线触发"
               "没有任何区别，唯一差别是谁先动手。停掉等于让用户去点「继续」");
         check(b.trade_count == 1, "  必须记成一笔交易，不能把这次出场漏掉账");
+        // 2026-10-16 实盘：MMTUSDT / RSRUSDT 硬止损先触发，计数记了，trades.csv 里却没有
+        check(trades.size() == 1 && trades[0].reason.find("交易所硬止损") != std::string::npos,
+              "  成交回调也要发出（成交记录 / trades.csv 靠它）");
         // 触发价 = 104 × (1 − 0.2%) = 103.792；用它当成交价的近似
         check(b.realized_pnl < 0, "  多头在 103.792 出场是亏的，盈亏要记进去");
         check(cli->ds_count("cancel") == 0,
@@ -2542,6 +2635,69 @@ int main() {
         check(cli->call_at(n1).reduce_only,      "  第一笔是 reduceOnly 平仓");
         check(!cli->call_at(n1 + 1).reduce_only, "  第二笔是反向开仓");
         check(eng.get_bots()[0].st.pos == trend::Pos::Short, "  已反手为空头");
+    }
+
+    // ── ④ 波动顺势：快照带本根开盘价、顺势开、亏损反手走订单路径、K线交接时不拿旧开盘价 ──
+    {
+        const int64_t M15 = 900000;
+        const int64_t bar = 2'000'000LL * M15;   // 某根 15m 的开盘时间
+        auto cli = std::make_shared<FakeClient>();
+        auto wall = std::chrono::system_clock::time_point(std::chrono::milliseconds(bar + 60000));
+        EngineHost h = inline_host();
+        h.now_wall = [&wall] { return wall; };
+        TrendEngine eng(cli, h);
+        std::vector<TrendTrade> trades;
+        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
+        auto cfg = mk_cfg();
+        cfg.interval = "15m";
+        cfg.rule.strategy = trend::Strategy::VolFollow;
+        cfg.rule.once_per_bar = true;
+        cfg.rule.max_consecutive_reverses = 3;
+        auto id = eng.add_bot(cfg, true);
+        // ATR 2、本根开盘 100（死区 0.3 ATR = 0.6）
+        eng.update_signal(id, 2.0, 2.0, true, 0, 0, bar, 0, 0, false, 0, 0,
+                          std::numeric_limits<double>::quiet_NaN(), 0, 100.0);
+        eng.tick("TESTUSDT", 100.4);
+        check(cli->calls.empty(), "波动顺势：没过死区不开");
+        cli->fill_price = 100.8;
+        eng.tick("TESTUSDT", 100.8);
+        auto b = eng.get_bots()[0];
+        check(cli->calls.size() == 1 && cli->call_at(0).side == "BUY" && b.st.pos == trend::Pos::Long &&
+                  std::fabs(b.st.entry_edge - 100.0) < 1e-9 && std::fabs(b.st.stop - 94.8) < 1e-9,
+              "  过了死区开多：记下开仓那根的开盘价 100，止损 3×ATR");
+        // 跌回开盘价 − 死区以下、亏损：平多 + 反手开空，两笔
+        cli->fill_price = 99.3;
+        eng.tick("TESTUSDT", 99.3);
+        b = eng.get_bots()[0];
+        check(cli->calls.size() == 3 && cli->call_at(1).reduce_only && cli->call_at(2).side == "SELL" &&
+                  b.st.pos == trend::Pos::Short && b.st.consec_reverses == 1 && b.st.last_reverse_bar_ms == bar,
+              "  方向反了：平多 + 反手开空（连续反手 1）");
+        check(trades.size() == 1 && trades[0].reversed && trades[0].reason.find("方向反了") != std::string::npos &&
+                  trades[0].strategy == trend::Strategy::VolFollow,
+              "  成交记录：方向反了、已反手、策略记成波动顺势");
+        // 同一根里空单又反了：只平不反手
+        cli->fill_price = 100.7;
+        eng.tick("TESTUSDT", 100.7);
+        b = eng.get_bots()[0];
+        check(cli->calls.size() == 4 && b.st.pos == trend::Pos::Flat &&
+                  trades.back().reason.find("本根已反手") != std::string::npos,
+              "  同一根第二次：只平不反手");
+        eng.tick("TESTUSDT", 102);
+        check(cli->calls.size() == 4, "  平仓后这根里不再开");
+
+        // 下一根开始了、快照还没拉到：不拿上一根的开盘价开仓
+        wall += std::chrono::milliseconds(M15);
+        b = eng.get_bots()[0];
+        check(TrendEngine::vf_bar_stale(b, bar + M15 + 60000), "  K线交接：快照停在上一根 = stale（应用层据此补拉）");
+        eng.tick("TESTUSDT", 102);
+        check(cli->calls.size() == 4, "  快照还停在上一根：不开");
+        eng.update_signal(id, 2.0, 2.0, true, 0, 0, bar + M15, 0, 0, false, 0, 0,
+                          std::numeric_limits<double>::quiet_NaN(), 0, 101.0);
+        cli->fill_price = 102;
+        eng.tick("TESTUSDT", 102);
+        check(cli->calls.size() == 5 && eng.get_bots()[0].st.pos == trend::Pos::Long &&
+                  std::fabs(eng.get_bots()[0].st.entry_edge - 101.0) < 1e-9,
+              "  新快照到了：按新的一根开（开仓那根开盘 101）");
     }
 
     if (g_fail == 0) {

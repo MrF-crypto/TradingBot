@@ -367,6 +367,58 @@ int main() {
         }
     }
     {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"once_per_bar\":true},"
+                         "{\"symbol\":\"ETHUSDT\",\"strategy\":\"turtle\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err) && hc.trend_bots.size() == 2 &&
+                  hc.trend_bots[0].rule.once_per_bar && !hc.trend_bots[1].rule.once_per_bar,
+              "海龟也认 once_per_bar（手动 bot 不写 = 关）: " + err);
+    }
+    {
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"max_chase_atr\":1.5,"
+                         "\"max_init_loss_pct\":6},"
+                         "{\"symbol\":\"ETHUSDT\",\"strategy\":\"turtle\"}]}");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err) && hc.trend_bots.size() == 2 &&
+                  hc.trend_bots[0].rule.max_chase_atr == 1.5 &&
+                  hc.trend_bots[0].rule.max_init_loss_pct == 6 &&
+                  hc.trend_bots[1].rule.max_chase_atr == 0 && hc.trend_bots[1].rule.max_init_loss_pct == 0,
+              "海龟认追高与初始止损上限（不写 = 关）: " + err);
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"max_init_loss_pct\":-1}]}");
+        HeadlessConfig hc2;
+        check(!load_headless_config(path, hc2, err), "  上限为负拒绝");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"breakeven\":true,"
+                         "\"breakeven_start\":6,\"roi_trail\":true,\"roi_trail_start\":10}]}");
+        HeadlessConfig hc3;
+        check(load_headless_config(path, hc3, err) && hc3.trend_bots[0].rule.breakeven &&
+                  hc3.trend_bots[0].rule.breakeven_start == 6,
+              "海龟认保本止损: " + err);
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"breakeven\":true,"
+                         "\"breakeven_start\":12,\"roi_trail\":true,\"roi_trail_start\":10}]}");
+        HeadlessConfig hc4;
+        check(!load_headless_config(path, hc4, err) && err.find("低于追踪止盈启动线") != std::string::npos,
+              "  触发线高于追踪止盈启动线：参数错误");
+
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"expand_long\":true,"
+                         "\"expand_long_min\":3},"
+                         "{\"symbol\":\"ETHUSDT\",\"strategy\":\"turtle\"}]}");
+        HeadlessConfig hc5;
+        check(load_headless_config(path, hc5, err) && hc5.trend_bots[0].rule.expand_long &&
+                  hc5.trend_bots[0].rule.expand_long_min == 3 && !hc5.trend_bots[1].rule.expand_long,
+              "海龟认多单波动放大（不写 = 关）: " + err);
+        write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
+                         "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"expand_long_min\":0}]}");
+        HeadlessConfig hc6;
+        check(!load_headless_config(path, hc6, err), "  门槛 0 拒绝");
+    }
+    {
         // 盘中即时 + 立即反手 + 无护栏 = 一根K线内来回开平，纯烧手续费
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","

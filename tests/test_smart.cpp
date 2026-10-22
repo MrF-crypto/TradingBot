@@ -115,6 +115,34 @@ static void test_features() {
     check(f.atr_ratio > 0, "  波动率压缩比可算");
     check(f.vol_lift > 3.5, "  最近 6 根放量约 4 倍（相对 168 根均量）");
     check(f.pos12 >= 0 && f.pos12 <= 1, "  箱体内位置在 0~1");
+    check(std::isnan(f.taker1) && std::isnan(f.taker6), "  没有主动买入数据：主动买入占比是 NaN（不是 0）");
+    {
+        auto bt = b;
+        for (auto& x : bt) { x.quote_vol = 1000; x.taker_quote = 500; }
+        bt.back().taker_quote = 800;
+        const auto ft = compute_features(bt, {});
+        check(near(ft.taker1, 0.8) && near(ft.taker6, (500.0 * 5 + 800) / 6000.0),
+              "  主动买入占比：最后 1 根 0.8、最后 6 根按成交额加总");
+        bt[bt.size() - 3].taker_quote = 0;
+        const auto fm = compute_features(bt, {});
+        check(near(fm.taker1, 0.8) && std::isnan(fm.taker6), "  6 根里缺一根：6h 那个算拿不到");
+    }
+
+    // ── 持仓量变化 ──
+    {
+        const int64_t h = 3600000LL, t = 100 * h;
+        std::vector<OiPoint> pts;
+        for (int i = 24; i >= 0; --i) pts.push_back({t - i * h, 1000.0 + (24 - i) * 10, 5e6});
+        auto s = oi_stat(pts);   // 最新 1240，1h 前 1230，4h 前 1200，24h 前 1000
+        check(s.ok && s.ms == t && near(s.value, 5e6) && near(s.chg1, (1240.0 / 1230 - 1) * 100) &&
+                  near(s.chg4, (1240.0 / 1200 - 1) * 100) && near(s.chg24, 24.0),
+              "持仓量：1/4/24h 变化按持仓量算");
+        pts.erase(pts.begin() + 20);   // 拿掉 4h 前那一点
+        s = oi_stat(pts);
+        check(s.ok && std::isnan(s.chg4) && !std::isnan(s.chg1) && !std::isnan(s.chg24),
+              "  4h 前那点缺了：4h 变化是 NaN，不拿相邻的凑");
+        check(!oi_stat({}).ok, "  一个点都没有：不 ok");
+    }
 
     // 一路上涨 vs BTC 不动：相对强弱为正、效率比为正
     std::vector<double> up, flat;
@@ -541,6 +569,66 @@ static void test_config_json() {
     check(config_from_json("{\"template\":{\"lock_atr\":true}}", old, &e2) && old.tmpl.rule.vol_paced &&
               old.tmpl.rule.fail_exit && !old.tmpl.rule.fail_exit_short,
           "  老配置没有这些键：按默认（空单不判）");
+
+    check(dt.rule.once_per_bar && make_bot_config(c, "ABCUSDT").rule.once_per_bar,
+          "每根K线最多开一次：模板默认开，自动 bot 跟着开");
+    Config ob;
+    ob.tmpl.rule.once_per_bar = false;
+    Config ob2;
+    check(config_from_json(config_to_json(ob), ob2, &e2) && !ob2.tmpl.rule.once_per_bar,
+          "  关掉后随模板往返");
+    check(old.tmpl.rule.once_per_bar, "  老配置没有这项：按开");
+
+    check(near(dt.rule.max_chase_atr, 1.5) && dt.rule.max_init_loss_pct == 0 &&
+              near(make_bot_config(c, "ABCUSDT").rule.max_chase_atr, 1.5),
+          "追高默认 1.5 ATR、初始止损上限默认关，自动 bot 跟着模板");
+    check(make_bare_bot_config(c, "ABCUSDT").rule.max_chase_atr == 0 &&
+              make_bare_bot_config(c, "ABCUSDT").rule.max_init_loss_pct == 0,
+          "  智能裸K 不跟这两项（入场是点火、止损是点火K线低点）");
+    Config ch;
+    ch.tmpl.rule.max_chase_atr = 0;
+    ch.tmpl.rule.max_init_loss_pct = 6;
+    Config ch2;
+    check(config_from_json(config_to_json(ch), ch2, &e2) && ch2.tmpl.rule.max_chase_atr == 0 &&
+              near(ch2.tmpl.rule.max_init_loss_pct, 6),
+          "  两项随模板往返（含关掉追高）");
+    check(near(old.tmpl.rule.max_chase_atr, 1.5) && old.tmpl.rule.max_init_loss_pct == 0,
+          "  老配置没有这两项：追高 1.5、上限关");
+    Config bad1;
+    check(!config_from_json("{\"template\":{\"max_chase_atr\":-1}}", bad1, &e2), "  追高为负拒绝");
+    check(!config_from_json("{\"template\":{\"max_init_loss_pct\":100}}", bad1, &e2), "  上限 100% 拒绝");
+
+    check(!dt.rule.breakeven && near(dt.rule.breakeven_start, 6) && !old.tmpl.rule.breakeven,
+          "保本止损默认关、触发线 6；老配置没有这项按关");
+    check(!make_bare_bot_config(c, "ABCUSDT").rule.breakeven, "  智能裸K 不用保本");
+    Config be;
+    be.tmpl.rule.breakeven = true;
+    be.tmpl.rule.breakeven_start = 7;
+    be.tmpl.rule.roi_trail = true;
+    be.tmpl.rule.roi_trail_start = 10;
+    Config be2;
+    check(config_from_json(config_to_json(be), be2, &e2) && be2.tmpl.rule.breakeven &&
+              near(be2.tmpl.rule.breakeven_start, 7),
+          "  随模板往返");
+    be.tmpl.rule.breakeven_start = 10;
+    check(!config_from_json(config_to_json(be), be2, &e2) &&
+              e2.find("低于追踪止盈启动线") != std::string::npos,
+          "  等于追踪止盈启动线：参数错误，拒绝保存");
+    be.tmpl.rule.roi_trail = false;
+    check(config_from_json(config_to_json(be), be2, &e2), "  追踪止盈关着：单独开保本可以");
+
+    check(!dt.rule.expand_long && near(dt.rule.expand_long_min, 2.5) && !old.tmpl.rule.expand_long,
+          "多单波动放大默认关、门槛 2.5；老配置没有这项按关");
+    Config ex;
+    ex.tmpl.rule.expand_long = true;
+    ex.tmpl.rule.expand_long_min = 3;
+    Config ex2;
+    check(config_from_json(config_to_json(ex), ex2, &e2) && ex2.tmpl.rule.expand_long &&
+              near(ex2.tmpl.rule.expand_long_min, 3) &&
+              make_bot_config(ex2, "ABCUSDT").rule.expand_long &&
+              !make_bare_bot_config(ex2, "ABCUSDT").rule.expand_long,
+          "  随模板往返，自动海龟 bot 跟着、智能裸K 不跟");
+    check(!config_from_json("{\"template\":{\"expand_long_min\":0}}", bad1, &e2), "  门槛 0 拒绝");
 }
 
 // ── 智能裸K（埋伏点火）：结构特征、κ、打分、移出、点火判定、bot 配置、配置往返 ──────────
@@ -550,11 +638,12 @@ static Bar bar(int64_t t, double o, double h, double l, double c, double qv = 10
     return b;
 }
 
-// 1h：200 根在 100 附近窄幅横盘（箱体 99.5~100.5，ATR 约 1），最后一根收 last_close
-static std::vector<Bar> amb_bars(double last_close = 100.2, double wick = 0.3) {
+// 1h：200 根在 100 附近窄幅横盘（实体箱体 99.5~100.5，ATR 约 1），最后一根收 last_close。
+// wick 只撑大 ATR，不改箱体（箱体按实体）
+static std::vector<Bar> amb_bars(double last_close = 100.2, double wick = 0) {
     std::vector<Bar> v;
     for (int i = 0; i < 200; ++i) {
-        double o = (i % 2) ? 99.8 : 100.2, c = (i % 2) ? 100.2 : 99.8;
+        double o = (i % 2) ? 99.5 : 100.5, c = (i % 2) ? 100.5 : 99.5;
         if (i == 199) c = last_close;
         v.push_back(bar(i * 3600000LL, o, std::max(o, c) + wick, std::min(o, c) - wick, c,
                         c > o ? 2000 : 1000));
@@ -654,6 +743,25 @@ static void test_bare() {
     check(!g.ok && has(g.why, "箱体上沿"), "离箱体上沿太远（收盘没贴到上沿）：不点火");
     check(!check_ignition(std::vector<Bar>(5), hi, lo, bc).ok, "K线不够：不判");
 
+    // ── 波动放大（默认关）──
+    // 背景每根真实波幅 0.6；点火那根 101.5 − 前收 99.9 = 1.6
+    //   近 6 根 (5×0.6 + 1.6)/6 = 0.7667，近 48 根 (47×0.6 + 1.6)/48 = 0.6208 ⇒ 1.235
+    g = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), hi, lo, bc);
+    check(!bc.expand && g.ok && near(g.expand, 0.7667 / 0.62083, 1e-3), "波动斜率照算，默认关不拦");
+    {
+        BareConfig be = bc;
+        be.expand = true;
+        be.expand_min = 1.5;
+        auto ge = check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), hi, lo, be);
+        check(!ge.ok && !ge.vetoed && has(ge.why, "波动斜率"), "  开了、1.23 < 1.5：不点火");
+        be.expand_min = 1.2;
+        check(check_ignition(ign_bars(100.2, 101.5, 100.1, 101.4, 5000), hi, lo, be).ok, "  门槛 1.2：点火");
+        auto few = ign_bars(100.2, 101.5, 100.1, 101.4, 5000);
+        few.erase(few.begin(), few.begin() + 20);   // 剩 40 根：够点火判定，不够 48 根窗口
+        auto gf = check_ignition(few, hi, lo, be);
+        check(!gf.ok && gf.expand == 0 && has(gf.why, "算不出"), "  根数不够算斜率：开着就不点火");
+    }
+
     // ── bot 配置 ──
     Config c;
     c.tmpl.budget_usdt = 250;
@@ -676,24 +784,100 @@ static void test_bare() {
     b.strategy = Strategy::BareK;
     b.bare.pool_n = 30; b.bare.vol_ratio = 4; b.bare.atr_pct_max = 1.5; b.bare.veto_red_bars = 4;
     b.bare.min_quote_vol = 5e6; b.bare.edge_tol_pct = 0.2; b.bare.accel_exit = false;
+    b.bare.expand = true; b.bare.expand_min = 1.8;
     Config r;
     std::string err;
     check(config_from_json(config_to_json(b), r, &err) && r.strategy == Strategy::BareK &&
               r.bare.pool_n == 30 && near(r.bare.vol_ratio, 4) && near(r.bare.atr_pct_max, 1.5) &&
               r.bare.veto_red_bars == 4 && near(r.bare.min_quote_vol, 5e6) &&
-              near(r.bare.edge_tol_pct, 0.2) && !r.bare.accel_exit && r.bare.lock_atr,
+              near(r.bare.edge_tol_pct, 0.2) && !r.bare.accel_exit && r.bare.lock_atr &&
+              r.bare.expand && near(r.bare.expand_min, 1.8),
           "裸K 配置往返");
     Config d;
     check(config_from_json("{\"strategy\":\"bare\",\"bare\":{}}", d, &err) &&
               d.bare.pool_n == 40 && near(d.bare.vol_ratio, 3.0) && d.bare.max_positions == 10 &&
-              near(d.bare.atr_pct_max, 2.0) && near(d.bare.pos_min, 0.55),
-          "  没写的键取默认（池 40 / 量比 3x / ATR% ≤ 2 / 位置 ≥ 0.55）");
+              near(d.bare.atr_pct_max, 2.0) && near(d.bare.pos_min, 0.55) &&
+              !d.bare.expand && near(d.bare.expand_min, 1.5),
+          "  没写的键取默认（池 40 / 量比 3x / ATR% ≤ 2 / 位置 ≥ 0.55 / 波动放大关）");
+    check(!config_from_json("{\"bare\":{\"expand_min\":0}}", d, &err), "  波动斜率门槛 0 拒绝");
     check(!config_from_json("{\"strategy\":\"grid\"}", d, &err) && has(err, "strategy"), "  未知策略整份拒绝");
     check(!config_from_json("{\"bare\":{\"close_pos_min\":1.5}}", d, &err), "  收盘位置超出 0~1 拒绝");
     check(!config_from_json("{\"bare\":{\"atr_mult\":0}}", d, &err), "  追踪止损 0 ATR 拒绝");
 }
 
+// ── 波动顺势：波动读数、选币（满足一个就进、按斜率排）、bot 配置、配置往返 ──────────
+static void test_vol() {
+    // 60 根：前 54 根真实波幅 1（99.5~100.5，收 100），最后 6 根真实波幅 3（98.5~101.5）
+    std::vector<Bar> v;
+    for (int i = 0; i < 60; ++i) {
+        const bool wide = i >= 54;
+        v.push_back(bar(i * 900000LL, 100, wide ? 101.5 : 100.5, wide ? 98.5 : 99.5, 100));
+    }
+    const auto f = compute_vol(v);
+    // 近 6 根均值 3；近 48 根 (42×1 + 6×3)/48 = 1.25 ⇒ 2.4
+    check(f.ok && near(f.slope, 2.4, 1e-9) && f.atr_pct > 1 && f.atr_pct < 3,
+          "波动斜率 = 近 6 根 ÷ 近 48 根平均真实波幅");
+    check(!compute_vol(std::vector<Bar>(v.begin(), v.begin() + 40)).ok, "  不够 49 根：算不出");
+
+    VolConfig vc;
+    VolFeat a; a.ok = true; a.slope = 2.0; a.atr_pct = 0.5;   // 只有斜率大
+    VolFeat b; b.ok = true; b.slope = 1.0; b.atr_pct = 2.0;   // 只有波动率大
+    VolFeat n; n.ok = true; n.slope = 1.0; n.atr_pct = 0.5;   // 都不够
+    check(vol_qualifies(a, vc) && vol_qualifies(b, vc) && !vol_qualifies(n, vc), "满足一个就进");
+    VolConfig only_slope = vc; only_slope.use_atr = false;
+    check(vol_qualifies(a, only_slope) && !vol_qualifies(b, only_slope), "  只勾斜率：波动率大的不进");
+    VolConfig none = vc; none.use_atr = none.use_slope = false;
+    check(!vol_qualifies(a, none), "  两条都没勾：谁都不进");
+    std::map<std::string, VolFeat> m{{"AAAUSDT", b}, {"BBBUSDT", a}, {"CCCUSDT", n}};
+    VolFeat a2 = a; a2.slope = 3.0;
+    m["DDDUSDT"] = a2;
+    auto picked = select_vol(m, vc);
+    check(picked.size() == 3 && picked[0] == "DDDUSDT" && picked[1] == "BBBUSDT" && picked[2] == "AAAUSDT",
+          "按斜率降序，不合格的不进");
+    vc.pool_n = 2;
+    check(select_vol(m, vc).size() == 2, "  取前 pool_n 个");
+    vc.pool_n = 30;
+
+    Config c;
+    c.tmpl.budget_usdt = 300;
+    c.tmpl.leverage = 4;
+    c.vol.interval = "5m";
+    c.vol.dead_atr = 0.5;
+    c.vol.rev_loss = true;
+    c.vol.max_reverses = 2;
+    const auto t = make_vol_bot_config(c, "XYZUSDT");
+    check(t.symbol == "XYZUSDT" && t.interval == "5m" && t.rule.strategy == trend::Strategy::VolFollow &&
+              t.rule.direction == trend::Direction::Both && t.rule.reverse == trend::ReverseMode::Immediate &&
+              t.rule.once_per_bar && t.use_disaster_stop && near(t.budget_usdt, 300) && t.leverage == 4,
+          "波动顺势 bot：所选周期、多空、立即反手、每根一次、硬止损、仓位杠杆沿用模板");
+    check(near(t.rule.vf_dead_atr, 0.5) && t.rule.vf_rev_loss && t.rule.max_consecutive_reverses == 2 &&
+              t.rule.squeeze_box_atr == 0 && t.rule.breakout_vol_ratio == 0 && !t.rule.fail_exit,
+          "  反手参数跟设置，海龟的入场过滤全关");
+
+    Config w;
+    w.strategy = Strategy::VolFollow;
+    w.vol.interval = "30m"; w.vol.slope_min = 1.8; w.vol.use_atr = false; w.vol.rev_stop = false;
+    w.vol.cooldown_bars = 5; w.vol.max_positions = 7; w.vol.roi_trail = true;
+    Config r;
+    std::string err;
+    check(config_from_json(config_to_json(w), r, &err) && r.strategy == Strategy::VolFollow &&
+              r.vol.interval == "30m" && near(r.vol.slope_min, 1.8) && !r.vol.use_atr && !r.vol.rev_stop &&
+              r.vol.cooldown_bars == 5 && r.vol.max_positions == 7 && r.vol.roi_trail,
+          "波动顺势配置往返: " + err);
+    Config d;
+    check(config_from_json("{\"strategy\":\"vol\"}", d, &err) && d.vol.interval == "15m" &&
+              d.vol.use_atr && d.vol.use_slope && d.vol.rev_open && !d.vol.rev_loss && d.vol.rev_stop &&
+              d.vol.one_rev_per_bar && d.vol.max_reverses == 3,
+          "  没写的键取默认（15m / 两条都勾 / (a)(c) 反手 / 同根一次 / 上限 3）");
+    check(!config_from_json("{\"vol\":{\"interval\":\"4h\"}}", d, &err) && has(err, "5m"), "  周期 4h 拒绝");
+    check(!config_from_json("{\"strategy\":\"vol\",\"vol\":{\"use_atr\":false,\"use_slope\":false}}", d, &err),
+          "  两个条件都没勾拒绝");
+    check(!config_from_json("{\"vol\":{\"breakeven\":true,\"breakeven_start\":12,\"roi_trail\":true,"
+                            "\"roi_start\":10}}", d, &err), "  保本线高于追踪止盈启动线拒绝");
+}
+
 int main() {
+    test_vol();
     test_bare();
     test_gates();
     test_features();

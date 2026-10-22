@@ -32,10 +32,12 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
 // 空仓的自动 bot 直接丢弃。
 // bare_tmpl：智能裸K 的 bot（落盘的名单代码是 smart::kSegBare）改用它——
 // 套海龟模板的话 k 值、仅多、追踪止盈都不对（裸K 有自己的一套出场参数）
+// vol_tmpl：波动顺势的 bot（名单代码 smart::kSegVol）同理，套海龟模板就变成了海龟
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
                                    const TrendConfig* auto_tmpl = nullptr,
-                                   const TrendConfig* bare_tmpl = nullptr);
+                                   const TrendConfig* bare_tmpl = nullptr,
+                                   const TrendConfig* vol_tmpl = nullptr);
 
 // 读 headless 的成交 CSV（ccbot_trades.csv）。只用来补算当日已实现（启动时
 // 状态文件里没有今天的数）。时间列是本地时间 "YYYY-MM-DD HH:MM:SS"，按本地时区

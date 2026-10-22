@@ -59,37 +59,48 @@ int main() {
         CHECK(near(atr(fixed, 0), 0.0), "ATR: period=0 应返回0");
     }
 
-    // ── 唐奇安通道 ────────────────────────────────────────────────────────────
+    // ── 唐奇安通道（按实体：max/min(开, 收)，不看影线）──────────────────────
     {
+        // 高 110 低 90，实体 98~102
         std::vector<Ohlc> bars;
-        for (int i = 0; i < 25; ++i) bars.push_back(Ohlc{110, 90, 100});
+        for (int i = 0; i < 25; ++i) bars.push_back(Ohlc{110, 90, 102, 98});
 
         auto d = donchian(bars, 20);
         CHECK(d.ok, "唐奇安: 25根算20周期应成立");
-        CHECK(near(d.up, 110.0) && near(d.dn, 90.0), "唐奇安: 恒定区间上下沿");
+        CHECK(near(d.up, 102.0) && near(d.dn, 98.0), "唐奇安: 上下沿取实体，不取影线");
 
         // 关键回归：当前这根K线【不能】进通道，否则信号恒真
-        std::vector<Ohlc> brk(25, Ohlc{110, 90, 100});
-        brk.push_back(Ohlc{200, 100, 200});          // 最后一根暴力突破
+        std::vector<Ohlc> brk(25, Ohlc{110, 90, 102, 98});
+        brk.push_back(Ohlc{200, 100, 200, 100});     // 最后一根暴力突破
         auto d2 = donchian(brk, 20);                  // exclude_last=1
-        CHECK(near(d2.up, 110.0), "唐奇安: 必须排除当前K线，上沿应仍是110");
-        CHECK(brk.back().high > d2.up, "唐奇安: 排除后当前K线才可能构成突破");
+        CHECK(near(d2.up, 102.0), "唐奇安: 必须排除当前K线，上沿应仍是102");
+        CHECK(brk.back().close > d2.up, "唐奇安: 排除后当前K线才可能构成突破");
         // 若误把当前K线算进去，上沿会变成200，price>=up 恒成立
         auto d3 = donchian(brk, 20, 0);
         CHECK(near(d3.up, 200.0), "唐奇安: exclude_last=0 时上沿被自己撑到200（故不可用）");
 
         // 数据不足
-        std::vector<Ohlc> few(20, Ohlc{110, 90, 100});
+        std::vector<Ohlc> few(20, Ohlc{110, 90, 102, 98});
         CHECK(!donchian(few, 20).ok, "唐奇安: 需要 period+exclude_last 根");
         CHECK(donchian(few, 19).ok, "唐奇安: 19周期+1排除=20根，刚好够");
 
-        // 真实高低点定位
+        // 阴线阳线都算：实体顶 = max(开, 收)，实体底 = min(开, 收)
         std::vector<Ohlc> mix;
-        for (int i = 0; i < 20; ++i) mix.push_back(Ohlc{100.0 + i, 50.0 - i, 75});
-        mix.push_back(Ohlc{0, 0, 0});                 // 被排除的当前根
+        for (int i = 0; i < 20; ++i) {
+            const double a = 100.0 + i, b = 50.0 - i;
+            mix.push_back(i % 2 ? Ohlc{a + 5, b - 5, a, b} : Ohlc{a + 5, b - 5, b, a});
+        }
+        mix.push_back(Ohlc{0, 0, 0, 0});              // 被排除的当前根
         auto d4 = donchian(mix, 20);
-        CHECK(near(d4.up, 119.0), "唐奇安: 上沿取区间内真实最高");
-        CHECK(near(d4.dn, 31.0),  "唐奇安: 下沿取区间内真实最低");
+        CHECK(near(d4.up, 119.0), "唐奇安: 上沿取区间内最高实体顶");
+        CHECK(near(d4.dn, 31.0),  "唐奇安: 下沿取区间内最低实体底");
+
+        // 单根长上影 / 长下影不撑开通道
+        std::vector<Ohlc> wick(21, Ohlc{101, 99, 100.5, 99.5});
+        wick[5]  = Ohlc{130, 99, 100.5, 99.5};        // 插针到 130
+        wick[12] = Ohlc{101, 70, 100.5, 99.5};        // 插针到 70
+        auto d5 = donchian(wick, 20);
+        CHECK(near(d5.up, 100.5) && near(d5.dn, 99.5), "唐奇安: 长影线不算通道边");
     }
 
     // ── 量比 ──────────────────────────────────────────────────────────────
@@ -109,6 +120,14 @@ int main() {
         CHECK(near(paced_ratio(1.8, 1.3), 1.8), "折算: 超过 1（时钟偏差）按 1 算");
         CHECK(paced_ratio(0, 0.5) == 0, "折算: 拿不到（0）仍是 0");
         CHECK(near(paced_ratio(0.2, std::nan("")), 0.8), "折算: 已走比例算不出（NaN）按下限算");
+    }
+    // ── 振幅按已走时间折算（√）────────────────────────────────────────────────
+    {
+        CHECK(near(paced_range(2.0, 2.0, 1.0), 1.0), "振幅: 整根走完、振幅 = 1 ATR ⇒ 1");
+        CHECK(near(paced_range(1.0, 2.0, 0.25), 1.0), "振幅: 走了 1/4、振幅 0.5 ATR ⇒ 0.5 ÷ √0.25 = 1");
+        CHECK(near(paced_range(1.0, 2.0, 0.01), 1.0), "振幅: 才走 1% ⇒ 按 1/4 算");
+        CHECK(near(paced_range(3.0, 2.0, 2.0), 1.5), "振幅: 超过 1 按 1 算");
+        CHECK(paced_range(0, 2.0, 0.5) == 0 && paced_range(1.0, 0, 0.5) == 0, "振幅: 拿不到 ⇒ 0");
     }
 
     // ── 效率比 ────────────────────────────────────────────────────────────

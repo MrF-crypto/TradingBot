@@ -1369,8 +1369,327 @@ static void test_roi_trail() {
     }
 }
 
+// 追高过滤与初始止损上限（实盘 SIRENUSDT：止盈刚出场就在离上沿 1.9~2.4 ATR 处买回、被打回来）
+static void test_chase_and_init_cap() {
+    // 通道 [90,110]、ATR 2：上沿外 1.5 ATR = 113
+    Config c;
+    c.max_chase_atr = 1.5;
+    {
+        State st;
+        CHECK(near(chase_atr(mk(113), true), 1.5), "离上沿按 ATR 计：113 ⇒ 1.5");
+        CHECK(step(st, c, mk(112.9)).action == Action::OpenLong, "1.45 ATR ⇒ 开");
+        CHECK(step(st, c, mk(113)).action == Action::OpenLong, "恰好 1.5 ATR ⇒ 放行（≤）");
+        const auto v = step(st, c, mk(114));
+        CHECK(v.action == Action::Hold && v.filtered && v.filtered_long, "2 ATR ⇒ 拦，标记 filtered");
+        CHECK(std::string(v.reason).find("不追") != std::string::npos, "  原因写明不追");
+        CHECK(step(st, c, mk(112)).action == Action::OpenLong, "同一根里价格回到 1 ATR ⇒ 开");
+        CHECK(step(st, c, mk(87.5)).action == Action::OpenShort, "做空：离下沿 1.25 ATR ⇒ 开");
+        CHECK(step(st, c, mk(85)).action == Action::Hold, "做空：离下沿 2.5 ATR ⇒ 拦");
+    }
+    {
+        Config off; State st;
+        CHECK(step(st, off, mk(120)).action == Action::OpenLong, "默认关：离多远都开（老配置行为不变）");
+    }
+    {
+        // 箱体不过的照旧报箱体（一根之内定值，比追高更根本）；箱体过了、追高又不过的报追高
+        Config g = c;
+        g.squeeze_box_atr = 4.0;
+        g.breakout_vol_ratio = 1.5;
+        State st;
+        Inputs in = sq_in(114, 5.0, 3.0);
+        CHECK(std::string(step(st, g, in).reason).find("箱体") != std::string::npos, "箱体不过 ⇒ 报箱体");
+        in = sq_in(114, 3.0, 1.0);
+        CHECK(std::string(step(st, g, in).reason).find("不追") != std::string::npos,
+              "箱体过、追高不过、量也不够 ⇒ 报追高（量会攒够，追高要等价格回来）");
+        CHECK(step(st, g, sq_in(112, 3.0, 2.0)).action == Action::OpenLong, "三项都过 ⇒ 开");
+    }
+    {
+        // 裸K / PSAR 不认追高
+        Config b; b.strategy = Strategy::BareK; b.max_chase_atr = 0.1;
+        CHECK(chase_block(mk(130), b, true) == nullptr, "裸K 不认追高过滤");
+    }
+
+    // ── 初始止损上限 ──
+    {
+        Config g;   // k=3
+        Inputs in = mk(100, 3.0);   // 3×ATR = 9 ⇒ 91
+        CHECK(near(initial_stop(Pos::Long, 100, g, in), 91), "默认关：3×ATR");
+        g.max_init_loss_pct = 5;
+        CHECK(near(initial_stop(Pos::Long, 100, g, in), 95), "上限 5%：91 截到 95");
+        CHECK(near(initial_stop(Pos::Short, 100, g, in), 105), "  做空：109 截到 105");
+        Inputs small = mk(100, 1.0);   // 3×ATR = 3 ⇒ 97，比上限近
+        CHECK(near(initial_stop(Pos::Long, 100, g, small), 97), "k×ATR 更近时用 k×ATR");
+        CHECK(near(initial_stop(Pos::Long, 100, g, mk(100, 0)), 100),
+              "ATR 缺失照旧（止损线 = 成交价，引擎判无效不开），不拿上限顶替");
+
+        // 开仓后照常棘轮：候选线（峰值 − 3ATR）比截过的线低时不往回拉
+        State st;
+        on_filled(st, Pos::Long, 100, initial_stop(Pos::Long, 100, g, in), g, false);
+        CHECK(step(st, g, mk(101, 3.0)).action == Action::Hold && near(st.stop, 95),
+              "开仓后 101：候选 92 < 95，止损线不退");
+        CHECK(step(st, g, mk(94.9, 3.0)).action == Action::Close, "跌破 95 ⇒ 止损出场");
+    }
+}
+
+// 保本止损：最高收益率到过触发线后，止损抬到开仓价 + 手续费
+static void test_breakeven() {
+    // 2 倍杠杆、开多 @100、止损 94（3×ATR2）。收益率 = (价 − 100) ÷ 价 × 200
+    //   103 ⇒ 5.83%（没到 6）；103.2 ⇒ 6.20%（到了）
+    auto lv = [](double price, double lev = 2) { Inputs in = mk(price, 2.0); in.leverage = lev; return in; };
+    const double line = 100 * (1 + kBreakevenFeePct / 100);
+    Config c;
+    c.breakeven = true;
+    c.breakeven_start = 6;
+    {
+        State st;
+        on_filled(st, Pos::Long, 100, 94, c, false);
+        step(st, c, lv(103));
+        CHECK(near(st.stop, 97), "收益率 5.8% 没到 6：止损照常是 峰值 − 3ATR = 97");
+        step(st, c, lv(103.2));
+        CHECK(near(st.stop, line), "到 6.2%：止损抬到开仓价 + 手续费");
+        CHECK(step(st, c, lv(101)).action == Action::Hold && near(st.stop, line), "回落到 101：线不退");
+        const auto v = step(st, c, lv(100.05));
+        CHECK(v.action == Action::Close && std::string(v.reason) == "保本止损出场" && v.profitable_exit,
+              "跌到保本线 ⇒ 平，原因写保本止损");
+    }
+    {
+        // 追踪线超过保本线之后，打到的是追踪线，原因照旧
+        State st;
+        on_filled(st, Pos::Long, 100, 94, c, false);
+        step(st, c, lv(103.2));
+        step(st, c, lv(108));
+        CHECK(near(st.stop, 102), "涨到 108：追踪线 102 高于保本线，听追踪线");
+        const auto v = step(st, c, lv(101.9));
+        CHECK(v.action == Action::Close && std::string(v.reason) != "保本止损出场", "  打到追踪线：不算保本");
+    }
+    {
+        // 做空对称：开空 @100、止损 106；97 ⇒ 收益率 6.19%
+        State st;
+        on_filled(st, Pos::Short, 100, 106, c, false);
+        step(st, c, lv(97));
+        CHECK(near(st.stop, 100 * (1 - kBreakevenFeePct / 100)), "做空：止损压到开仓价 − 手续费");
+        CHECK(std::string(step(st, c, lv(99.95)).reason) == "保本止损出场", "  反弹到线 ⇒ 保本出场");
+    }
+    {
+        Config off; State st;
+        on_filled(st, Pos::Long, 100, 94, off, false);
+        step(st, off, lv(103.2));
+        CHECK(near(st.stop, 97.2), "没勾：照常 峰值 − 3ATR");
+        State s2;
+        on_filled(s2, Pos::Long, 100, 94, c, false);
+        step(s2, c, lv(103.2, 0));
+        CHECK(near(s2.stop, 97.2), "杠杆不知道（0）：不触发");
+        Config p = c; p.strategy = Strategy::BareK;
+        State s3;
+        on_filled(s3, Pos::Long, 100, 94, p, false);
+        CHECK(!breakeven_armed(s3, p, lv(110)), "只认海龟");
+    }
+
+    // 配置校验：和追踪止盈都开时，触发线必须严格低于启动线
+    {
+        Config g;
+        CHECK(breakeven_config_error(g) == nullptr, "关着：不校验");
+        g.breakeven = true;
+        g.roi_trail = true;
+        g.roi_trail_start = 10;
+        g.breakeven_start = 6;
+        CHECK(breakeven_config_error(g) == nullptr, "6 < 10：合法");
+        g.breakeven_start = 10;
+        CHECK(breakeven_config_error(g) != nullptr, "等于启动线：参数错误");
+        g.breakeven_start = 12;
+        CHECK(breakeven_config_error(g) != nullptr, "大于启动线：参数错误");
+        g.roi_trail = false;
+        CHECK(breakeven_config_error(g) == nullptr, "追踪止盈关着：保本可以单独用，不比较");
+        g.breakeven_start = 0;
+        CHECK(breakeven_config_error(g) != nullptr, "触发线 0：拒绝");
+    }
+}
+
+// 多单要波动放大（只拦做多，读数缺失时拦，同根内放大了照样开）
+static void test_expand_long() {
+    Config c;
+    c.expand_long = true;
+    c.expand_long_min = 2.5;
+    auto ex = [](double price, double pace) { Inputs in = mk(price); in.range_pace = pace; return in; };
+    {
+        State st;
+        const auto v = step(st, c, ex(111, 2.0));
+        CHECK(v.action == Action::Hold && v.filtered && v.filtered_long, "多：波动 2.0 < 2.5 ⇒ 拦，标记 filtered");
+        CHECK(std::string(v.reason).find("波动") != std::string::npos, "  原因写明等波动放大");
+        CHECK(step(st, c, ex(111, 0)).action == Action::Hold, "多：读数缺失 ⇒ 拦（宁拦勿放）");
+        CHECK(step(st, c, ex(111, 2.5)).action == Action::OpenLong, "多：恰好 2.5 ⇒ 放行（≥）");
+    }
+    {
+        State st;
+        CHECK(step(st, c, ex(89, 0)).action == Action::OpenShort, "空单不受影响：读数缺失照样开空");
+    }
+    {
+        Config off; State st;
+        CHECK(!off.expand_long && step(st, off, ex(111, 0)).action == Action::OpenLong,
+              "默认关：老配置行为不变");
+    }
+    {
+        // 顺序：量比不过先报量比（引擎归类按同一顺序）
+        Config g = c;
+        g.breakout_vol_ratio = 1.5;
+        State st;
+        Inputs in = sq_in(111, 0, 1.0);
+        in.range_pace = 1.0;
+        CHECK(std::string(step(st, g, in).reason).find("放量") != std::string::npos, "量、波动都不够 ⇒ 先报量比");
+        in.vol_ratio = 2.0;
+        CHECK(std::string(step(st, g, in).reason).find("波动") != std::string::npos, "量够了、波动不够 ⇒ 报波动");
+        in.range_pace = 3.0;
+        CHECK(step(st, g, in).action == Action::OpenLong, "都够 ⇒ 开");
+    }
+    {
+        Config b; b.strategy = Strategy::BareK; b.expand_long = true;
+        CHECK(expand_block(mk(130), b, true) == nullptr, "裸K 不认这项");
+    }
+}
+
+// ④ 波动顺势：正在走的这根顺势开，方向反了、亏损时反手（三种触发 + 三道护栏）
+static void test_vol_follow() {
+    Config c;
+    c.strategy = Strategy::VolFollow;
+    c.reverse  = ReverseMode::Immediate;
+    c.once_per_bar = true;
+    c.max_consecutive_reverses = 3;
+    c.cooldown_bars = 2;
+    // 本根开盘 100、ATR 2、死区 0.3 ATR = 0.6
+    auto vin = [](double price, double open = 100, int64_t bar = 1, double atr = 2.0) {
+        Inputs in;
+        in.price = price; in.atr = atr; in.bar_open = open; in.bar_open_ms = bar; in.leverage = 2;
+        return in;
+    };
+    {
+        State st;
+        CHECK(step(st, c, vin(100.5)).action == Action::Hold, "开盘价 + 0.5 < 死区 0.6：不开");
+        CHECK(step(st, c, vin(100.7)).action == Action::OpenLong, "过了死区：顺着做多");
+        CHECK(step(st, c, vin(99.3)).action == Action::OpenShort, "开盘价 − 死区以下：做空");
+        CHECK(step(st, c, vin(110, 0)).action == Action::Hold, "本根开盘价不知道（快照停在上一根）：不开");
+        CHECK(step(st, c, vin(110, 100, 1, 0)).action == Action::Hold, "ATR 缺失：不开");
+    }
+    auto open_long = [&](State& st, double fill = 100.7, int64_t bar = 1) {
+        on_filled(st, Pos::Long, fill, initial_stop(Pos::Long, fill, c, vin(fill)), c, false, bar, 2.0,
+                  /*开仓那根开盘*/ 100);
+    };
+    {
+        // (a) 回到开仓那根开盘价另一边（越过死区）且在亏损：反手做空
+        State st;
+        open_long(st);
+        CHECK(near(st.stop, 94.7), "初始止损 = 3×ATR Chandelier");
+        CHECK(step(st, c, vin(99.6)).action == Action::Hold, "回到开盘价下方但没越过死区：拿着");
+        const auto v = step(st, c, vin(99.3));
+        CHECK(v.action == Action::CloseReverseShort && std::string(v.reason).find("方向反了") != std::string::npos,
+              "越过死区、亏损：反手做空");
+        CHECK(!v.profitable_exit, "  反手是亏损出场");
+        // 跨到下一根，新开盘价 98：判据仍用开仓那根的 100，不换
+        State st2;
+        open_long(st2);
+        CHECK(step(st2, c, vin(99.9, 98.0, 2)).action == Action::Hold,
+              "到了下一根（开盘 98）：99.9 没跌破开仓那根的 100 − 死区，不反手");
+    }
+    {
+        // 不在亏损：(a) 不成立（开仓价低于开盘价的特殊情况，价格在开仓价上方）
+        State st;
+        on_filled(st, Pos::Long, 98.0, 92.0, c, false, 1, 2.0, 100);
+        CHECK(step(st, c, vin(99.0)).action == Action::Hold, "价格在开盘价 − 死区以下但仍盈利：不反手");
+    }
+    {
+        // (b) 收益率跌到 −X%（2 倍杠杆：价格跌 2.5% ≈ 收益率 −5%）
+        Config g = c;
+        g.vf_rev_open = false;
+        g.vf_rev_loss = true;
+        g.vf_rev_loss_roi = 5;
+        State st;
+        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        CHECK(step(st, g, vin(99.0)).action == Action::Hold, "收益率 −3.4%：不到 −5%");
+        CHECK(step(st, g, vin(98.0)).action == Action::CloseReverseShort, "收益率 −5.5%：反手");
+    }
+    {
+        // (c) 打到止损线：勾了反手，没勾只平
+        Config g = c;
+        g.vf_rev_open = false;
+        State st;
+        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        CHECK(step(st, g, vin(94.6)).action == Action::CloseReverseShort, "打到止损线、亏损：反手");
+        g.vf_rev_stop = false;
+        State st2;
+        on_filled(st2, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        const auto v = step(st2, g, vin(94.6));
+        CHECK(v.action == Action::Close && std::string(v.reason).find("不反手") != std::string::npos,
+              "没勾打到止损线反手：只平");
+    }
+    {
+        // 盈利出场不反手
+        State st;
+        open_long(st);
+        step(st, c, vin(110));   // 极值 110 ⇒ 止损线 104
+        const auto v = step(st, c, vin(103.9));
+        CHECK(v.action == Action::Close && v.profitable_exit, "盈利打到追踪线：平，不反手");
+    }
+    {
+        // 护栏：同一根最多反手一次
+        State st;
+        open_long(st);
+        CHECK(step(st, c, vin(99.3)).action == Action::CloseReverseShort, "第一次反手");
+        on_filled(st, Pos::Short, 99.3, 105.3, c, true, 1, 2.0, 100);
+        CHECK(st.last_reverse_bar_ms == 1 && st.consec_reverses == 1, "  反手开仓记下这一根、连续反手 1");
+        const auto v = step(st, c, vin(100.7));   // 空单：回到开盘价 + 死区以上、亏损
+        CHECK(v.action == Action::Close && std::string(v.reason).find("本根已反手") != std::string::npos,
+              "同一根第二次：只平不反手");
+        // 下一根就可以再反
+        State st2 = st;
+        CHECK(step(st2, c, vin(100.7, 100, 2)).action == Action::CloseReverseLong, "下一根：照常反手");
+        // 平仓后同一根不再开（等下一根）
+        State st3;
+        st3.last_entry_bar_ms = 1;
+        CHECK(step(st3, c, vin(102)).action == Action::Hold, "平仓后这根里不再开");
+        CHECK(step(st3, c, vin(102, 100, 2)).action == Action::OpenLong, "  下一根照常开");
+    }
+    {
+        // 护栏：连续反手上限 ⇒ 只平、转冷却
+        Config g = c;
+        g.vf_one_rev_per_bar = false;
+        State st;
+        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        st.consec_reverses = 3;
+        const auto v = step(st, g, vin(99.3));
+        CHECK(v.action == Action::Close && std::string(v.reason).find("上限") != std::string::npos &&
+                  st.cooldown_left == 2 && st.consec_reverses == 0,
+              "连续反手 3 次后：只平，冷却 2 根");
+    }
+    {
+        // 反向不允许 / 不反手模式
+        Config g = c;
+        g.direction = Direction::LongOnly;
+        State st;
+        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        CHECK(step(st, g, vin(99.3)).action == Action::Close, "仅多：只平");
+        Config n = c;
+        n.reverse = ReverseMode::None;
+        State st2;
+        on_filled(st2, Pos::Long, 100.7, 94.7, n, false, 1, 2.0, 100);
+        CHECK(step(st2, n, vin(99.3)).action == Action::Close, "不反手模式：只平");
+    }
+    {
+        // 保本、锁定 ATR 照样认（和海龟同一套出场）
+        Config g = c;
+        g.breakeven = true;
+        g.breakeven_start = 6;   // 收益率 6%（2 倍杠杆 ≈ 价格 +3%）
+        State st;
+        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
+        step(st, g, vin(104.0));
+        CHECK(st.stop >= 100.7, "保本：收益率到过 6% 后止损抬到开仓价以上");
+    }
+}
+
 int main() {
     test_turtle();
+    test_chase_and_init_cap();
+    test_expand_long();
+    test_vol_follow();
+    test_breakeven();
     test_exit_opt();
     test_fail_exit();
     test_roi_trail();

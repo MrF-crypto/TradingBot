@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -56,13 +57,13 @@ int main() {
     t.entry_dist_atr = 0.8; t.interval = "1h";
     t.mfe_usd = 30; t.mae_usd = -8; t.mfe_pct = 15; t.mae_pct = -4;
     t.mfe_atr = 7.5; t.mae_atr = -2; t.mfe_r = 2.5; t.mae_r = -0.6667;
-    t.trigger = 'I'; t.entry_vol_ratio = 3.1; t.entry_box_atr = 1.5;
+    t.trigger = 'I'; t.entry_vol_ratio = 3.1; t.entry_box_atr = 1.5; t.entry_taker = 0.62;
     j.trade(t);
     TrendTrade t2 = t;
     t2.symbol = "BBBUSDT"; t2.entry_dist_atr = std::numeric_limits<double>::quiet_NaN();
     t2.mfe_atr = t2.mae_atr = t2.mfe_r = t2.mae_r = std::numeric_limits<double>::quiet_NaN();
     t2.trigger = 0;
-    t2.entry_vol_ratio = t2.entry_box_atr = std::numeric_limits<double>::quiet_NaN();
+    t2.entry_vol_ratio = t2.entry_box_atr = t2.entry_taker = std::numeric_limits<double>::quiet_NaN();
     t2.reason = "原因里有,英文逗号";
     j.trade(t2);
     auto tl = lines_of(dir / "trades.csv");
@@ -78,11 +79,12 @@ int main() {
         check(has(tl[2], "\"原因里有,英文逗号\""), "  原因含逗号：加引号，不串列");
         check(has(tl[2], "19.79,,30,"), "  入场离边沿拿不到（NaN）：留空，不写 nan");
         check(has(tl[0], "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,"
-                         "浮盈亏最低ATR,浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,原因"),
-              "  浮盈亏最高/最低四种单位、触发方式、入场量比与箱体的表头");
-        check(has(tl[1], ",0.8,30,-8,15,-4,7.5,-2,2.5,-0.6667,点火,3.1,1.5,"),
-              "  浮盈亏最高/最低：美元、%、ATR、R；触发方式「点火」、量比、箱体");
-        check(has(tl[2], ",30,-8,15,-4,,,,,,,,\""), "  ATR / R / 触发 / 量比 / 箱体没有：留空");
+                         "浮盈亏最低ATR,浮盈亏最高R,浮盈亏最低R,触发方式,入场量比,入场箱体ATR,"
+                         "入场主动买入占比,原因"),
+              "  浮盈亏最高/最低四种单位、触发方式、入场量比、箱体、主动买入占比的表头");
+        check(has(tl[1], ",0.8,30,-8,15,-4,7.5,-2,2.5,-0.6667,点火,3.1,1.5,0.62,"),
+              "  浮盈亏最高/最低：美元、%、ATR、R；触发方式「点火」、量比、箱体、主动买入占比");
+        check(has(tl[2], ",30,-8,15,-4,,,,,,,,,\""), "  ATR / R / 触发 / 量比 / 箱体 / 主动买入没有：留空");
     }
 
     // ── 过滤 / 过期清理 ──
@@ -135,13 +137,46 @@ int main() {
     sg.seg["EEEUSDT"] = smart::kSegStrong;
     sg.seg["FFFUSDT"] = smart::kSegMid;
     sg.strong = {"EEEUSDT"};
-    j.scan(t0, rk, sg, {"EEEUSDT"});
+    rk.rows["EEEUSDT"].f.taker1 = 0.55; rk.rows["EEEUSDT"].f.taker6 = 0.48;
+    std::map<std::string, smart::OiStat> oi;
+    {
+        smart::OiStat o;
+        o.ok = true; o.ms = t0 - 3600000LL; o.value = 12345678; o.chg1 = 1.5; o.chg4 = -2.25;
+        oi["EEEUSDT"] = o;   // 24h 那一点没拿到：chg24 是 NaN
+    }
+    // 老版本留下的今天的文件（表头少几列）：改名留着，另起一份
+    std::ofstream(dir / "scan-20261010.csv", std::ios::binary) << "\xEF\xBB\xBF" "时间UTC,品种\nold,row\n";
+    j.scan(t0, rk, sg, {"EEEUSDT"}, oi);
     auto sl = lines_of(dir / "scan-20261010.csv");
     check(sl.size() == 3, "scan 快照：全部合格币各一行（不只是进名单的）");
     if (sl.size() == 3) {
         check(has(sl[1], "EEEUSDT,强势,1,") && has(sl[1], "0.01234") && has(sl[1], ",是"),
               "  所在段、段内名次、收盘价、已有 bot");
         check(has(sl[2], "FFFUSDT,中间,,"), "  分了段但没进名单：名次留空");
+        check(has(sl[0], ",已有bot,主动买入占比1h,主动买入占比6h,持仓量时间UTC,持仓价值U,"
+                         "持仓量变化1h%,持仓量变化4h%,持仓量变化24h%"),
+              "  主动买入占比与持仓量的表头");
+        check(has(sl[1], ",是,0.55,0.48,2026-10-10 07:00:00,12345678,1.5,-2.25,") &&
+              sl[1].back() == ',',
+              "  主动买入占比 1h/6h、持仓量时间/价值/变化；24h 那点没拿到留空");
+        check(has(sl[2], ",,,,,,,") , "  主动买入与持仓量都没拿到：留空");
+    }
+    {
+        int old = 0;
+        for (const auto& e : fs::directory_iterator(dir)) {
+            const auto n = e.path().filename().string();
+            if (n.rfind("scan-20261010-old-", 0) == 0) {
+                ++old;
+                const auto ol = lines_of(e.path());
+                check(ol.size() == 2 && ol[1] == "old,row", "  老文件原样留着");
+            }
+        }
+        check(old == 1, "表头对不上的老文件改名为 scan-日期-old-时间.csv");
+    }
+    {
+        // 同一次运行里再写：表头已核对过，直接追加
+        j.scan(t0 + 3600000LL, rk, sg, {}, oi);
+        check(lines_of(dir / "scan-20261010.csv").size() == 5, "  之后照常追加，不再改名");
     }
 
     fs::remove_all(dir);

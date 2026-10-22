@@ -127,6 +127,8 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "donchian_period", "atr_period", "atr_mult",
         "squeeze_box_atr", "breakout_vol_ratio", "trend_er_min",
         "lock_atr", "accel_exit", "vol_paced", "fail_exit", "fail_exit_short",
+        "max_chase_atr", "max_init_loss_pct", "breakeven", "breakeven_start",
+        "expand_long", "expand_long_min",
         // ② 抛物线SAR
         "af_start", "af_step", "af_max",
         // ③ 纯裸K
@@ -319,6 +321,29 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 c.rule.vol_paced  = get_bool(so, "vol_paced", c.rule.vol_paced);
                 c.rule.fail_exit  = get_bool(so, "fail_exit", c.rule.fail_exit);
                 c.rule.fail_exit_short = get_bool(so, "fail_exit_short", c.rule.fail_exit_short);
+                c.rule.once_per_bar    = get_bool(so, "once_per_bar", c.rule.once_per_bar);
+                c.rule.max_chase_atr     = get_num(so, "max_chase_atr", c.rule.max_chase_atr);
+                c.rule.max_init_loss_pct = get_num(so, "max_init_loss_pct", c.rule.max_init_loss_pct);
+                if (!(c.rule.max_chase_atr >= 0)) {
+                    err = c.symbol + " 海龟: max_chase_atr 不能为负（0 = 关）";
+                    return false;
+                }
+                if (!(c.rule.max_init_loss_pct >= 0 && c.rule.max_init_loss_pct < 100)) {
+                    err = c.symbol + " 海龟: max_init_loss_pct 要在 0~100 之间（0 = 关）";
+                    return false;
+                }
+                c.rule.expand_long     = get_bool(so, "expand_long", c.rule.expand_long);
+                c.rule.expand_long_min = get_num(so, "expand_long_min", c.rule.expand_long_min);
+                if (!(c.rule.expand_long_min > 0)) {
+                    err = c.symbol + " 海龟: expand_long_min 必须大于 0";
+                    return false;
+                }
+                c.rule.breakeven       = get_bool(so, "breakeven", c.rule.breakeven);
+                c.rule.breakeven_start = get_num(so, "breakeven_start", c.rule.breakeven_start);
+                if (const char* e = trend::breakeven_config_error(c.rule)) {
+                    err = c.symbol + " 海龟: " + e + "（breakeven_start / roi_trail_start）";
+                    return false;
+                }
                 if (c.rule.trend_er_min > 0 && !(c.rule.squeeze_box_atr > 0))
                     out.warnings.push_back(c.symbol + " 海龟：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {

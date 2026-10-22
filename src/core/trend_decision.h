@@ -31,7 +31,15 @@ enum class Strategy {
     Turtle,        // ① 唐奇安突破 + Chandelier ATR
     ParabolicSar,  // ② Wilder 抛物线 SAR
     BareK,         // ③ 纯裸K
+    // ④ 波动顺势（只给智能模式用，手动表单不提供）：看正在走的这根K线，实时价离开盘价
+    //   超过死区就顺着做（阳做多、阴做空）；方向反了、处在亏损时立刻反手。止损与盈利出场
+    //   和海龟同一套（k×ATR Chandelier、锁定 ATR、加速收紧、收益率追踪止盈、保本）。
+    //   见 Config 里 vf_* 一段
+    VolFollow,
 };
+// 止损线按 k×ATR Chandelier 算的策略（海龟、波动顺势）：锁定 ATR / 加速收紧 / 保本 /
+// 初始止损上限都认
+inline bool atr_stop_strategy(Strategy s) { return s == Strategy::Turtle || s == Strategy::VolFollow; }
 
 // ③ 纯裸K 的两种入场模式
 enum class BareEntry {
@@ -112,6 +120,29 @@ struct Config {
     bool   fail_exit  = false;
     bool   fail_exit_short = false;
 
+    // 追高过滤（0 = 关）：价格离被突破的通道边沿超过这么多倍 ATR 就不开，回到以内再开。
+    //   实盘 SIRENUSDT：止盈刚出场就在高位买回的两笔离上沿 1.9~2.4 ATR，各亏 0.4R / 0.8R；
+    //   首次突破的几笔都在 1.3 ATR 以内。ATR 与止损同一个（开仓时的 ATR）
+    double max_chase_atr = 0;
+    // 多单要波动放大（默认关，只管做多，空单不受影响）：这根K线开盘到现在的振幅（最高 − 最低）
+    //   ÷（已收盘K线的 ATR × √已走比例）≥ expand_long_min 才开多。用户盘面观察：暴涨的山寨币
+    //   先是 5m 放量上涨，紧接着波动率斜率变大。振幅随时间的平方根增长（不像成交量线性攒），
+    //   所以按 √已走比例折算；已走比例的下限同量比（1/4 根），开盘头几分钟不被放大。
+    //   和量比一样在一根之内会从不过变成过：被拦就是等，波动起来了这根里还会开
+    bool   expand_long     = false;
+    double expand_long_min = 2.5;
+    // 初始止损上限（0 = 关），占开仓价的 %：止损取 k×ATR 与这条线中离开仓价近的那条。
+    //   ATR 大的时候 3×ATR 能到 10%~15%，暴涨后再进场被打回来就是一笔大亏。
+    //   只管开仓那一刻，之后照常棘轮（Chandelier 候选线比它低时不会把它拉回去）
+    double max_init_loss_pct = 0;
+    // 保本止损（默认关，只认海龟）：持仓期最高收益率（与追踪止盈同口径，带杠杆）到过 breakeven_start，
+    //   止损线抬到开仓价 + 来回手续费（kBreakevenFeePct），打到时真不亏。棘轮，只上不下。
+    //   管的是"涨了一点、没到追踪止盈启动线、又跌回来打满止损"——所以和追踪止盈都开时，
+    //   触发线必须严格低于启动线（配置校验拦），不然追踪止盈总是先平，保本永远轮不到。
+    //   交易所硬止损开仓时就固定了，不跟着挪：保本靠本地止损线执行
+    bool   breakeven       = false;
+    double breakeven_start = 6;
+
     // ── 收益率追踪止盈（三个策略共用，默认关）────────────────────────────────
     // 收益率 = 浮动盈亏 ÷ 保证金，和主表「收益率」那一列同一个算法（带杠杆，保证金按现价算）：
     //   做多 (现价 − 开仓价) ÷ 现价 × 杠杆 × 100，做空反过来。
@@ -134,9 +165,11 @@ struct Config {
 
     // ── ③ 纯裸K ─────────────────────────────────────────────────────────────
     BareEntry bare_entry = BareEntry::BreakPrevBar;
-    // 每根K线最多开一次。默认【关】。
-    // 开着的话，同一根K线里被止损出场后不再重新入场，等下一根——这是 Immediate
-    // 模式唯一的抖动护栏
+    // 每根K线最多开一次（裸K 与海龟共用；PSAR 不认）。默认【关】。
+    // 开着的话，同一根K线里出场后（止盈、止损、假突破都算）不再重新入场，等下一根。
+    //   裸K：Immediate 模式唯一的抖动护栏
+    //   海龟：平仓后价格还在通道外，下一个 tick 就又满足突破——实盘追踪止盈 4 秒后
+    //        原地再开、亏回去。智能模板默认开。只拦开新仓，不拦反手的开仓腿
     bool   once_per_bar = false;
     // 止损用 bar 0 之【前】 swing_bars 根的最低价（做多）/ 最高价（做空）。
     //
@@ -169,6 +202,25 @@ struct Config {
     //            新K线开盘时价格在开盘价上下抖正是这个模式来回翻转的根源
     double signal_body_atr = 0;
 
+    // ── ④ 波动顺势 ──────────────────────────────────────────────────────────
+    // 入场：实时价 > 本根开盘价 + vf_dead_atr × ATR ⇒ 做多；< 开盘价 − 死区 ⇒ 做空。
+    //   死区挡开盘价附近的来回抖（这个模式配立即反手，不挡就是一根里来回开平）
+    // 方向反了、处在亏损（做多现价 < 开仓价）时反手，三种触发可分别勾，任一成立即反手：
+    //   vf_rev_open：价格回到【开仓那根】开盘价的另一边（也要越过死区）。开仓那根的开盘价
+    //                开仓后就固定（存在 State::entry_edge），跨到下一根不换——换的话稍一回落
+    //                到新开盘价下方就会被判成反了，翻得非常频繁
+    //   vf_rev_loss：收益率（带杠杆，同追踪止盈）跌到 −vf_rev_loss_roi
+    //   vf_rev_stop：打到 k×ATR 止损线。不勾的话止损线照样平仓，只是不反手
+    // 护栏：死区、连续反手上限（max_consecutive_reverses，到了转冷却 cooldown_bars 根）、
+    //   同一根K线最多反手一次（vf_one_rev_per_bar，第二次只平不反手）。
+    // 盈利出场不反手；平仓后等下一根再开（once_per_bar，智能模式强制开）
+    double vf_dead_atr        = 0.3;
+    bool   vf_rev_open        = true;
+    bool   vf_rev_loss        = false;
+    double vf_rev_loss_roi    = 10;
+    bool   vf_rev_stop        = true;
+    bool   vf_one_rev_per_bar = true;
+
     // ── 反手（共享）─────────────────────────────────────────────────────────
     ReverseMode reverse = ReverseMode::None;
 
@@ -198,7 +250,8 @@ struct State {
     double psar_ep_mark = 0;
     int    consec_reverses = 0;
     int    cooldown_left   = 0;   // 剩余冷却K线数
-    // ③ 专用：最后一次开仓所在K线的开盘时间。once_per_bar 靠它判"这根开过了"
+    // ③ ①：最后一次开仓所在K线的开盘时间。once_per_bar 靠它判"这根开过了"。
+    //   海龟记的是按墙钟纠正过的那根（整点交接时快照可能还停在上一根）
     int64_t last_entry_bar_ms = 0;
     // ① 专用：开仓时的 ATR。锁定 ATR 与加速收紧都以它为基准。要落盘——丢了的话
     //    两项优化在重启后静默退回普通 Chandelier（为 0 时就是这样兜底的）
@@ -206,11 +259,15 @@ struct State {
     // ① 专用：开仓时被突破的通道边沿（做多 = 上沿，做空 = 下沿），0 = 不知道。
     //    fail_exit 判"收盘跌回通道内"用它——不能用当前的通道，开仓后通道跟着突破那几根抬高，
     //    价格只是没再创新高就会被误判成跌回。要落盘
+    //    ④ 波动顺势借它存【开仓那根K线的开盘价】（方向反了的判据），同样随仓位落盘
     double entry_edge = 0;
     // ① 专用：假突破从【哪一根K线的收盘】开始判（那根的开盘时间），0 = 没设（老仓位）则按开仓那根。
     //    开仓那根已经走到最后 1/4 才开仓的，留到下一根：开仓后离收盘只剩几分钟，
     //    价格稍一回落就收回边沿以内，等于没给它走出去的机会（实盘 19 笔这样被平）。要落盘
     int64_t fail_bar_ms = 0;
+    // ④ 专用：最近一次反手开仓所在K线的开盘时间（同一根最多反手一次）。不落盘：
+    //    重启后最多多反一次，不值得进持久化格式
+    int64_t last_reverse_bar_ms = 0;
 };
 
 struct Inputs {
@@ -225,6 +282,8 @@ struct Inputs {
     //   vol_ratio：当前根已成交量 ÷ 通道窗口内各根的平均量
     double box_atr   = 0;
     double vol_ratio = 0;
+    //   range_pace：当前根振幅 ÷（已收盘 ATR × √已走比例），多单波动放大过滤用（indicators::paced_range）
+    double range_pace = 0;
     //   er：通道窗口的效率比，带符号（正 = 净上涨）。0 是合法值，所以另带 er_ok
     bool   er_ok = false;
     double er    = 0;
@@ -286,6 +345,8 @@ inline bool data_ready(const Inputs& in, const Config& cfg) {
                    : (in.prev_close > 0 && in.prev_high > 0 && in.prev_low > 0);
     case Strategy::ParabolicSar:
         return in.bar_ok && in.psar_prev_high > 0 && in.psar_prev_low > 0;
+    case Strategy::VolFollow:   // 止损要 ATR，入场要本根开盘价
+        return in.atr > 0 && in.bar_open > 0;
     case Strategy::Turtle:
     default:
         return in.atr > 0 && in.dc_ok;
@@ -296,9 +357,9 @@ inline bool data_ready(const Inputs& in, const Config& cfg) {
 inline bool break_up  (const Inputs& in) { return in.dc_ok && in.price >= in.dc_up; }
 inline bool break_down(const Inputs& in) { return in.dc_ok && in.price <= in.dc_dn; }
 
-// 同一根K线是否已经开过仓（③ 的 once_per_bar 护栏）
+// 同一根K线是否已经开过仓（③ 与 ① 的 once_per_bar 护栏）
 inline bool bar_already_used(const State& st, const Config& cfg, const Inputs& in) {
-    return cfg.strategy == Strategy::BareK && cfg.once_per_bar &&
+    return cfg.strategy != Strategy::ParabolicSar && cfg.once_per_bar &&
            in.bar_open_ms != 0 && st.last_entry_bar_ms == in.bar_open_ms;
 }
 
@@ -337,9 +398,19 @@ inline bool chop_break_short(const Inputs& in, const Config& cfg) {
     return in.new_bar && in.prev_close > 0 && in.range_lo > 0 && in.prev_close < in.range_lo;
 }
 
+// ④ 波动顺势的死区（价格单位）。拿不到 ATR 返回 <0
+inline double vf_band(const Inputs& in, const Config& cfg) {
+    if (!(in.atr > 0)) return -1;
+    return cfg.vf_dead_atr > 0 ? cfg.vf_dead_atr * in.atr : 0;
+}
+
 // 入场信号（策略无关的统一入口）。
 inline bool entry_long(const Inputs& in, const Config& cfg) {
     switch (cfg.strategy) {
+    case Strategy::VolFollow: {
+        const double band = vf_band(in, cfg);
+        return band >= 0 && in.bar_open > 0 && in.price > in.bar_open + band;
+    }
     case Strategy::BareK:
         if (!in.bar_ok) return false;
         if (cfg.bare_entry == BareEntry::Immediate) {
@@ -361,6 +432,10 @@ inline bool entry_long(const Inputs& in, const Config& cfg) {
 }
 inline bool entry_short(const Inputs& in, const Config& cfg) {
     switch (cfg.strategy) {
+    case Strategy::VolFollow: {
+        const double band = vf_band(in, cfg);
+        return band >= 0 && in.bar_open > 0 && in.price < in.bar_open - band;
+    }
     case Strategy::BareK:
         if (!in.bar_ok) return false;
         if (cfg.bare_entry == BareEntry::Immediate) {
@@ -409,6 +484,26 @@ inline const char* squeeze_block(const Inputs& in, const Config& cfg, bool is_lo
     }
     if (!squeeze_vol_pass(in, cfg)) return "突破，等放量";
     return nullptr;
+}
+
+// ① 追高过滤：价格离被突破的边沿多少倍 ATR（按方向取正）。拿不到读数返回 0
+inline double chase_atr(const Inputs& in, bool is_long) {
+    if (!(in.atr > 0) || !in.dc_ok) return 0;
+    return (is_long ? in.price - in.dc_up : in.dc_dn - in.price) / in.atr;
+}
+inline const char* chase_block(const Inputs& in, const Config& cfg, bool is_long) {
+    if (!(cfg.strategy == Strategy::Turtle && cfg.max_chase_atr > 0)) return nullptr;
+    return chase_atr(in, is_long) > cfg.max_chase_atr ? "突破，但离通道边沿太远（不追）" : nullptr;
+}
+
+// ① 多单波动放大过滤（只拦做多）。读数拿不到（0）时拦，同横盘过滤
+inline bool expand_filter_on(const Config& cfg) {
+    return cfg.strategy == Strategy::Turtle && cfg.expand_long;
+}
+inline const char* expand_block(const Inputs& in, const Config& cfg, bool is_long) {
+    if (!is_long || !expand_filter_on(cfg)) return nullptr;
+    if (in.range_pace > 0 && in.range_pace >= cfg.expand_long_min) return nullptr;
+    return "突破，等波动放大";
 }
 
 // ③ 裸K「等收盘突破」的信号根量比过滤。信号只在收盘那一拍成立，被拦就是这次不做
@@ -461,6 +556,28 @@ inline bool roi_trail_hit(const State& st, const Config& cfg, const Inputs& in) 
     return now <= peak - cfg.roi_trail_back;
 }
 
+// 保本止损：线 = 开仓价 ± 来回手续费（吃单 0.05% × 2），打到时扣完手续费不亏
+inline constexpr double kBreakevenFeePct = 0.1;
+inline double breakeven_line(const State& st) {
+    const double f = kBreakevenFeePct / 100.0;
+    return st.pos == Pos::Long ? st.entry_price * (1 + f) : st.entry_price * (1 - f);
+}
+// 是否已经抬到保本：最高收益率按持仓极值价算（同 roi_trail_hit）
+inline bool breakeven_armed(const State& st, const Config& cfg, const Inputs& in) {
+    if (!cfg.breakeven || !atr_stop_strategy(cfg.strategy) || st.pos == Pos::Flat ||
+        !(st.peak > 0) || !(cfg.breakeven_start > 0))
+        return false;
+    return roi_pct(st.pos, st.entry_price, st.peak, in.leverage) >= cfg.breakeven_start;
+}
+// 配置校验（智能模板 / 手动表单 / headless 共用）。返回 nullptr = 合法
+inline const char* breakeven_config_error(const Config& cfg) {
+    if (!cfg.breakeven) return nullptr;
+    if (!(cfg.breakeven_start > 0)) return "保本止损的触发收益率必须大于 0";
+    if (cfg.roi_trail && !(cfg.breakeven_start < cfg.roi_trail_start))
+        return "参数错误：保本触发线应低于追踪止盈启动线";
+    return nullptr;
+}
+
 // 假突破判定（fail_exit）：开始判的那根K线（fail_bar_ms，没设就是开仓那根）已经收完，
 // 且最近收盘的那根收回到开仓时的通道边沿以内。整个持仓期都在判，不只看开仓那一根
 inline bool fail_breakout(const State& st, const Config& cfg, const Inputs& in) {
@@ -473,8 +590,13 @@ inline bool fail_breakout(const State& st, const Config& cfg, const Inputs& in) 
 }
 
 // 开仓前的过滤，按策略分派。返回 nullptr = 放行
+// 海龟的顺序：箱体（一根之内定值）→ 追高 → 量比 → 波动放大（引擎按同样顺序归类记录）
 inline const char* entry_block(const Inputs& in, const Config& cfg, bool is_long) {
+    if (squeeze_filter_on(cfg) && !squeeze_box_pass(in, cfg, is_long))
+        return squeeze_block(in, cfg, is_long);
+    if (const char* w = chase_block(in, cfg, is_long)) return w;
     if (const char* w = squeeze_block(in, cfg, is_long)) return w;
+    if (const char* w = expand_block(in, cfg, is_long)) return w;
     if (const char* w = bare_vol_block(in, cfg)) return w;
     return bare_body_block(in, cfg, is_long);
 }
@@ -549,6 +671,58 @@ inline double stop_candidate(Pos p, const State& st, const Config& cfg,
     }
 }
 
+// ④ 方向反了没有（不含止损线那一条，那条在 step 的触线分支里）。只在亏损时成立。
+// 返回 nullptr = 没反
+inline const char* vf_reverse_trigger(const State& st, const Config& cfg, const Inputs& in) {
+    if (cfg.strategy != Strategy::VolFollow || st.pos == Pos::Flat) return nullptr;
+    const bool is_long = (st.pos == Pos::Long);
+    const bool loss = is_long ? in.price < st.entry_price : in.price > st.entry_price;
+    if (!loss) return nullptr;
+    if (cfg.vf_rev_open && st.entry_edge > 0) {
+        const double band = vf_band(in, cfg);   // 拿不到 ATR 时不判（宁可等止损线）
+        if (band >= 0 && (is_long ? in.price < st.entry_edge - band : in.price > st.entry_edge + band))
+            return "方向反了：回到开仓那根开盘价另一边，反手";
+    }
+    if (cfg.vf_rev_loss && cfg.vf_rev_loss_roi > 0 && in.leverage > 0 &&
+        roi_pct(st.pos, st.entry_price, in.price, in.leverage) <= -cfg.vf_rev_loss_roi)
+        return "方向反了：亏损到触发线，反手";
+    return nullptr;
+}
+
+// ④ 反手，先过护栏：方向不允许 / 连续反手到上限 / 本根已反手过 / 拿不到 ATR（新仓定不了止损线）
+// 都只平不反手。why = 反手成功时的原因
+inline Verdict vf_flip(State& st, const Config& cfg, const Inputs& in, Verdict v, bool is_long,
+                       const char* why) {
+    v.profitable_exit = false;
+    v.action = Action::Close;
+    if (cfg.reverse == ReverseMode::None) {
+        v.reason = "方向反了，平仓（不反手）";
+        return v;
+    }
+    if (!allows(cfg, is_long ? Pos::Short : Pos::Long)) {
+        v.reason = "方向反了，反向不允许，只平";
+        return v;
+    }
+    if (cfg.max_consecutive_reverses > 0 && st.consec_reverses >= cfg.max_consecutive_reverses) {
+        v.reason = "方向反了，连续反手已达上限，转冷却";
+        st.cooldown_left = cfg.cooldown_bars;
+        st.consec_reverses = 0;
+        return v;
+    }
+    if (cfg.vf_one_rev_per_bar && st.last_reverse_bar_ms != 0 && in.bar_open_ms != 0 &&
+        st.last_reverse_bar_ms == in.bar_open_ms) {
+        v.reason = "方向反了，本根已反手过一次，只平不反手";
+        return v;
+    }
+    if (!(in.atr > 0)) {
+        v.reason = "方向反了，ATR 缺失，只平不反手";
+        return v;
+    }
+    v.action = is_long ? Action::CloseReverseShort : Action::CloseReverseLong;
+    v.reason = why;
+    return v;
+}
+
 // 推进一个 tick：更新极值与棘轮止损线，然后给出动作。
 // st 会被就地修改（极值/止损/AF/冷却计数），仓位状态的变更由【调用方】在订单
 // 真正成交后写入——决策函数不假定下单一定成功。
@@ -599,6 +773,12 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             st.stop = is_long ? std::max(st.stop, cand)    // 棘轮：只上不下
                               : std::min(st.stop, cand);
         }
+        // 保本：和 Chandelier 候选线一样走棘轮，谁更有利听谁的
+        const bool be = breakeven_armed(st, cfg, in);
+        if (be) {
+            const double line = breakeven_line(st);
+            st.stop = is_long ? std::max(st.stop, line) : std::min(st.stop, line);
+        }
         v.stop = st.stop;
 
         // 假突破：开仓那根之后有K线收盘跌回开仓时的通道边沿以内，不等止损线，直接走。
@@ -621,6 +801,10 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             return v;
         }
 
+        // ④ 波动顺势：方向反了、处在亏损 ⇒ 不等止损线，反手
+        if (const char* why = vf_reverse_trigger(st, cfg, in))
+            return vf_flip(st, cfg, in, v, is_long, why);
+
         const bool hit = is_long ? (in.price <= st.stop) : (in.price >= st.stop);
         if (!hit) {
             v.reason = "持仓中";
@@ -633,6 +817,14 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         v.profitable_exit = is_long ? (exit_px >= st.entry_price)
                                     : (exit_px <= st.entry_price);
 
+        // 打到的就是保本线（追踪线还没超过它）：单独写明，复盘时分得清
+        if (be && st.stop == breakeven_line(st)) {
+            v.action = Action::Close;
+            v.reason = "保本止损出场";
+            st.consec_reverses = 0;
+            return v;
+        }
+
         // 盈利出场 → 趋势跑完了，但【力竭不等于反转】，不反手，等新信号。
         // ⚠ PSAR 是例外：它的定义就是"触及即翻转"，盈利触及同样翻转
         if (v.profitable_exit && cfg.strategy != Strategy::ParabolicSar) {
@@ -640,6 +832,16 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             v.reason = "追踪止盈出场，等待新信号";
             st.consec_reverses = 0;
             return v;
+        }
+
+        // ④ 亏损打到止损线：勾了"打到止损线反手"就反手（同样过护栏），没勾只平
+        if (cfg.strategy == Strategy::VolFollow) {
+            if (!cfg.vf_rev_stop) {
+                v.action = Action::Close;
+                v.reason = "止损出场（不反手）";
+                return v;
+            }
+            return vf_flip(st, cfg, in, v, is_long, "止损线被打，反手");
         }
 
         if (cfg.reverse == ReverseMode::None) {
@@ -724,8 +926,12 @@ inline double initial_stop(Pos p, double fill_price, const Config& cfg,
         return s > 0 ? s : 0;
     }
     case Strategy::Turtle:
-    default:
-        return chandelier(p, fill_price, in.atr, cfg.atr_mult);
+    default: {
+        const double s = chandelier(p, fill_price, in.atr, cfg.atr_mult);
+        if (!(cfg.max_init_loss_pct > 0) || !(in.atr > 0)) return s;
+        const double cap = fill_price * cfg.max_init_loss_pct / 100.0;
+        return p == Pos::Long ? std::max(s, fill_price - cap) : std::min(s, fill_price + cap);
+    }
     }
 }
 
@@ -744,6 +950,7 @@ inline void on_filled(State& st, Pos p, double fill_price, double stop_price,
     st.af = (cfg.strategy == Strategy::ParabolicSar) ? cfg.af_start : 0.0;
     st.psar_ep_mark = fill_price;   // 建仓那一刻的 EP 就是成交价
     if (bar_open_ms != 0) st.last_entry_bar_ms = bar_open_ms;
+    if (from_reverse && bar_open_ms != 0) st.last_reverse_bar_ms = bar_open_ms;
 }
 
 inline void on_closed(State& st) {
@@ -775,6 +982,7 @@ inline const char* strategy_name(Strategy s) {
     switch (s) {
     case Strategy::ParabolicSar: return "抛物线SAR";
     case Strategy::BareK:        return "纯裸K";
+    case Strategy::VolFollow:    return "波动顺势";
     case Strategy::Turtle:
     default:                     return "海龟";
     }
