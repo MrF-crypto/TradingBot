@@ -1,6 +1,6 @@
 # 云端构建 macOS 版（Apple Silicon + Intel 双架构）：手动触发 或 推送 v* 标签时自动跑。
 # 产物：tradingbot-<版本>-macos-arm64.zip / -x64.zip（各含 GUI + headless 两个可执行文件），
-# 标签构建会自动附加到对应的 GitHub Release。
+# 标签构建产物供下载检查，正式 Release 附件单独核验后发布。
 # 注意：产物未做 Apple 签名/公证，下载后需要:
 #   chmod +x TradingBot ccbot_headless && xattr -dr com.apple.quarantine .
 name: build-macos
@@ -13,8 +13,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 默认只读。挂载 Release 需要写权限，但只给那一步（见 job 级 permissions）——
-# 权限范围越窄，一旦某个 Action 被投毒能造成的破坏越小
+# 构建只读；正式 Release 由已核验的发布流程单独上传。
 permissions:
   contents: read
 
@@ -31,8 +30,6 @@ jobs:
             runner: macos-15-intel
             triplet: x64-osx
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: write          # 仅为最后一步的 Release 挂载
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -122,6 +119,20 @@ jobs:
 
       # 包名带版本号，与 Windows/Linux 两条对齐。此前 mac 包叫 tradingbot-macos-arm64.zip，
       # 下载到本地就分不清是哪一版了——Release 页面上三个包应该是同一套命名
+      - name: Include documentation and dependency licenses
+        shell: bash
+        run: |
+          set -e
+          cp LICENSE README.md config.example.json pkg/
+          cp -R docs pkg/
+          mkdir -p pkg/licenses
+          for notice in build/vcpkg_installed/${{ matrix.triplet }}/share/*/copyright; do
+            test -f "$notice" || continue
+            dep=$(basename "$(dirname "$notice")")
+            mkdir -p "pkg/licenses/$dep"
+            cp "$notice" "pkg/licenses/$dep/"
+          done
+
       - name: Zip
         run: |
           VER="${GITHUB_REF#refs/tags/}"
@@ -129,21 +140,10 @@ jobs:
           cd pkg && zip -r "../tradingbot-$VER-macos-${{ matrix.arch }}.zip" . && cd ..
           ls -la tradingbot-*.zip
 
-      # macOS 这条与 linux/windows 不同：下一步直接把包挂到 Release，
-      # 不经过 artifact 中转，所以这个上传【没有任何消费者】。
-      # 仍保留是为了能手工下载调试构建，但只在 tag 时上传——
-      # 每次推送都存一份的话会累积撞上 artifact 配额，
-      # 表现为构建与测试全绿、唯独上传步骤失败
+      # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-macos-${{ matrix.arch }}
           path: tradingbot-*-macos-${{ matrix.arch }}.zip
-
-      - name: Attach to release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
-        with:
-          files: tradingbot-*-macos-${{ matrix.arch }}.zip
-          fail_on_unmatched_files: true

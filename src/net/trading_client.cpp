@@ -75,6 +75,10 @@ static size_t curl_header(char* ptr, size_t sz, size_t n, void* ud) {
 //     经代理时体积越大越容易超时（实盘"交易规则拉取失败"）
 //   CONNECTTIMEOUT 5：连不上就早点放弃、早点重试，不把整个 10 秒都耗在握手上
 static void common_opts(CURL* c) {
+#if defined(_WIN32) && defined(CURLSSLOPT_NATIVE_CA)
+    // 便携包没有开发机的 CA 文件路径；Windows OpenSSL/Schannel 使用系统信任库。
+    curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#endif
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 5L);
@@ -808,6 +812,7 @@ static std::string make_client_order_id() {
 TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
                                                        const std::string& client_order_id) {
     OrderResult r;
+    r.client_order_id = client_order_id;
     auto resp = http_get(ep(Ep::Order),
                          "symbol=" + sym + "&origClientOrderId=" + client_order_id +
                          "&recvWindow=5000");
@@ -826,6 +831,7 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
         // （-1021时间戳超窗/-1003限流/-1022签名…）说明【查询本身】没成功，
         // 订单状态依然未知——绝不能让恢复路径误判为"确认未成交"然后放行重试
         r.uncertain = (r.error.find("[-2013]") == std::string::npos);
+        r.terminal = !r.uncertain;
         return r;
     }
 
@@ -834,6 +840,10 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     r.order_id     = std::to_string(oid);
     r.avg_price    = parse_dbl_str(doc, "avgPrice");
     r.executed_qty = parse_dbl_str(doc, "executedQty");
+    std::string_view status;
+    if (doc["status"].get(status) == simdjson::SUCCESS)
+        r.terminal = status == "FILLED" || status == "CANCELED" || status == "EXPIRED" ||
+                     status == "EXPIRED_IN_MATCH" || status == "REJECTED";
     r.ok = true;
     return r;
 }
@@ -923,6 +933,7 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
 
         // 每次尝试用独立的 clientOrderId（-1111 重试是真正的新订单）
         const std::string coid = make_client_order_id();
+        r.client_order_id = coid;
         std::string body = "symbol=" + sym + "&side=" + side
             + "&type=MARKET&quantity=" + fmt_qty(try_qty, try_step)
             + "&newClientOrderId=" + coid
@@ -956,7 +967,13 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
             for (int q = 0; q < 3; ++q) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(600));
                 auto qr = query_order(sym, coid);
-                if (qr.ok) return qr;                      // 找到了：实际已到达交易所，按真实成交返回
+                if (qr.ok) {
+                    if (!qr.terminal) {
+                        qr.ok = false; qr.uncertain = true;
+                        qr.error = "订单尚未终结，保留风险预留等待核对";
+                    }
+                    return qr;
+                }                      // 找到了：实际已到达交易所，按真实成交返回
                 if (!qr.uncertain) {                       // 明确回答"-2013订单不存在"：确认没下进去
                     r.error = "下单响应异常，已确认订单未到达交易所";
                     return r;
@@ -981,7 +998,13 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         r.order_id     = std::to_string(oid);
         r.avg_price    = parse_dbl_str(doc, "avgPrice");
         r.executed_qty = parse_dbl_str(doc, "executedQty");
-        r.ok = true;
+        std::string_view status;
+        if (doc["status"].get(status) == simdjson::SUCCESS)
+            r.terminal = status == "FILLED" || status == "CANCELED" || status == "EXPIRED" ||
+                         status == "EXPIRED_IN_MATCH" || status == "REJECTED";
+        r.ok = r.terminal;
+        r.uncertain = !r.terminal;
+        if (!r.terminal) r.error = "订单响应未确认终态，保留预留等待核对";
         return r;
     }
     return r;  // 返回最后一次 -1111 错误
@@ -1530,19 +1553,19 @@ static int interval_seconds(const std::string& iv) {
 // ── 趋势信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
 TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         const std::string& sym, const std::string& interval,
-        int donchian_period, int atr_period) {
+        int donchian_period, int atr_period, const following::Config& follow) {
     TrendSnapshot out;
     if (donchian_period <= 0 || atr_period <= 0) return out;
 
     // 通道要 period+1 根（+1 是被排除的当前根）；ATR 的 Wilder 平滑要预热，
     // 只喂 period+1 根拿到的是 seed 而不是稳定值，所以额外多给 3 倍周期
-    const int need = std::max(donchian_period + 1, atr_period * 4) + 5;
+    const int need = std::max({donchian_period + 1, atr_period * 4,
+                               follow.enabled ? follow.slow_period * 3 + follow.slope_bars : 0}) + 5;
     auto bars = fetch_klines(sym, interval, need);
     if (bars.empty()) return out;
 
     out.price       = bars.back().close;
     out.bar_open_ms = bars.back().open_ms;
-    out.bar_open    = bars.back().open;
 
     std::vector<indicators::Ohlc> oh;
     oh.reserve(bars.size());
@@ -1588,7 +1611,25 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         out.er    = e.er;
     }
 
-    out.ok = (out.atr > 0 && d.ok && out.price > 0);
+    if (follow.enabled) {
+        std::vector<double> volumes;
+        for (const auto& b : bars) volumes.push_back(b.volume);
+        out.following = following::compute(oh, volumes, follow, donchian_period, atr_period);
+        const auto& f = out.following;
+        out.atr = f.atr; out.dc_up = f.upper; out.dc_dn = f.lower; out.dc_ok = f.ready;
+        out.atr_pct = out.price > 0 ? f.atr / out.price * 100 : 0;
+        out.box_atr = f.box_atr; out.er_ok = f.er_ok; out.er = f.er;
+        if (follow.close_confirm) out.vol_ratio = out.vol_ratio_paced = f.volume_ratio;
+        // Reject stale/gapped/future candle snapshots even if HTTP succeeded.
+        const int64_t period_ms = static_cast<int64_t>(interval_seconds(interval)) * 1000;
+        const int64_t now = ts_ms();
+        if (period_ms <= 0 || out.bar_open_ms > now || now - out.bar_open_ms >= period_ms)
+            out.following.ready = out.dc_ok = false;
+        for (size_t i = 1; i < bars.size(); ++i)
+            if (bars[i].open_ms - bars[i - 1].open_ms != period_ms)
+                out.following.ready = out.dc_ok = false;
+    }
+    out.ok = (out.atr > 0 && out.dc_ok && out.price > 0);
     return out;
 }
 
@@ -1602,7 +1643,7 @@ TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
 
     // 需要：未收盘根(1) + 信号根(1) + 摆动窗口(N)，再多拿几根兜底。
     // 信号根量比、震荡态的箱体与效率比要 kSignalVolWindow 根，ATR 的 Wilder 平滑
-    // 要预热（同海龟：4 倍周期），几者取大。61 根以内请求权重仍是 1
+    // 要预热（同趋势跟踪：4 倍周期），几者取大。61 根以内请求权重仍是 1
     const int need = std::max({swing_bars, kSignalVolWindow, kBareAtrPeriod * 4}) + 2 + 3;
     auto bars = fetch_klines(sym, interval, need);
     if ((int)bars.size() < swing_bars + 2) return out;

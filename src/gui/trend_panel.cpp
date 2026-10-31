@@ -3,7 +3,7 @@
 // 单独一个翻译单元，不塞进 main_window.cpp——那个文件已经 3800+ 行，
 // 而且是本项目历史上几乎每一个 GUI bug 的出处。
 //
-// 表单是三个策略（海龟 / 趋势SAR / 纯裸K）共用一张：品种、周期、仓位、反手、
+// 表单是三个策略（趋势跟踪 / 趋势SAR / 纯裸K）共用一张：品种、周期、仓位、反手、
 // 进程外保护是共享的，只有【入场信号与止损算法】那一段随策略换页。
 // 换页而不是灰掉：三套参数不混搭，灰掉的控件仍在视野里会让人以为调了有用。
 //
@@ -126,7 +126,6 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
             case 'D': return "弱";
             case 'M': return "中";
             case 'H': return "过热";
-            case 'V': return "波动";
             default:  return "";
             }
         };
@@ -134,30 +133,20 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
             switch (c) {
             case 'L': return "做多名单";
             case 'S': return "做空名单";
-            case 'U': return "强势段（仅多）";
-            case 'D': return "弱势段（仅空）";
+            case 'U': return "强势候选";
+            case 'D': return "弱势候选";
             case 'M': return "中间段（多空）";
-            case 'H': return "过热段（仅空）";
-            case 'V': return "波动名单";
+            case 'H': return "异动候选";
             default:  return "名单";
             }
         };
         // "智能"已经显示在周期·模式列，这里只标段和名次。
         // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时不标
-        // 裸K 的 bot 没有名次：智能模式还在跑裸K 就不标，切走了（持仓等走完）标「待移出」
-        const bool bare_bot = (b.smart_list == smart::kSegBare);
-        const QString tag = bare_bot
-            ? ((smartCfg_.enabled && smartCfg_.strategy == smart::Strategy::BareK)
-                   ? QString() : QString("待移出"))
-            : b.smart_rank > 0
+        const QString tag = b.smart_rank > 0
             ? QString("%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
             : (b.smart_score > 0 ? QString("待移出") : QString());
         auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + (tag.isEmpty() ? "" : "  " + tag),
-                          (b.smart_rank > 0 || (bare_bot && tag.isEmpty())) ? kBlue : kGrey);
-        if (bare_bot)
-            sym_it->setToolTip("智能裸K 的 bot：埋伏池里的币点火时建的，开仓即管、平仓后自动删掉；"
-                               "币留在埋伏池，之后还能再点火");
-        else
+                          (b.smart_rank > 0) ? kBlue : kGrey);
         sym_it->setToolTip(QString("智能模式管理的 bot\n综合分 %1　%2\n"
                                    "空仓时掉出名单（连续 2 轮、满 24 小时）会被自动移除；"
                                    "持仓中绝不移除，等这笔走完")
@@ -187,28 +176,22 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     // 模式名单独占一格信息量太小，合成 "3m·裸K" / "4h·通道" 更划算
     const auto strat   = b.cfg.rule.strategy;
     const bool bar_mode = (strat == trend::Strategy::BareK);
-    // 智能模式管理的 bot 显示"智能"（它只建海龟，策略和参数在悬停提示里），
-    // 智能裸K 建的显示"智能裸K"；手动 bot 显示自己的策略名
-    const char* short_name = (b.is_auto && b.smart_list == smart::kSegBare) ? "·智能裸K"
-                           : (strat == trend::Strategy::VolFollow)    ? "·波动顺势"
-                           : b.is_auto                                ? "·智能"
-                           : (strat == trend::Strategy::Turtle)       ? "·海龟"
+    // 智能模式管理的 bot 显示"智能"（它只建趋势跟踪，策略和参数在悬停提示里），
+    const char* short_name = b.is_auto ? "·智能趋势跟踪"
+                           : (strat == trend::Strategy::TrendFollowing)       ? "·趋势跟踪"
                            : (strat == trend::Strategy::ParabolicSar) ? "·SAR"
                                                                       : "·裸K";
     auto* strat_it = mk(QString::fromStdString(b.cfg.interval) + short_name,
                         b.is_auto ? kAmber : kBlue);
     {
         QString tip = QString("%1%2　信号周期 %3\n")
-                          .arg(!b.is_auto ? ""
-                               : b.smart_list == smart::kSegBare
-                                   ? "智能裸K（埋伏点火开多，止损从点火K线低点起、按 1h ATR 追踪）· "
-                                   : "智能模式管理 · ")
+                          .arg(b.is_auto ? "智能模式管理 · " : "")
                           .arg(trend::strategy_name(strat))
                           .arg(QString::fromStdString(b.cfg.interval));
         if (b.cfg.rule.direction != trend::Direction::Both)
             tip += QString("方向：%1\n").arg(trend::direction_name(b.cfg.rule.direction));
         switch (strat) {
-        case trend::Strategy::Turtle:
+        case trend::Strategy::TrendFollowing:
             tip += QString("唐奇安突破入场 + Chandelier ATR 追踪止损\n"
                            "通道周期 %1 / ATR 周期 %2 / k=%3\n")
                        .arg(b.cfg.rule.donchian_period)
@@ -284,29 +267,6 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
                            .arg(b.cfg.rule.chop_er_max, 0, 'f', 2)
                            .arg(b.er_ok ? QString::number(std::fabs(b.er), 'f', 2) : QString("缺失"));
             break;
-        case trend::Strategy::VolFollow: {
-            const auto& r = b.cfg.rule;
-            QStringList rev;
-            if (r.vf_rev_open) rev << "回到开仓那根开盘价另一边";
-            if (r.vf_rev_loss) rev << QString("收益率跌到 −%1%").arg(r.vf_rev_loss_roi, 0, 'f', 1);
-            if (r.vf_rev_stop) rev << "打到止损线";
-            tip += QString("入场：正在走的这根，实时价离开盘价 > %1 ATR 就顺着做（当前开盘价 %2）\n"
-                           "方向反了、亏损时反手：%3\n"
-                           "护栏：连续反手 %4 次后冷却 %5 根%6\n"
-                           "止损 %7 × ATR 追踪%8%9；盈利出场不反手，等下一根\n")
-                       .arg(r.vf_dead_atr, 0, 'f', 2)
-                       .arg(b.bar_open, 0, 'g', 6)
-                       .arg(rev.isEmpty() ? QString("（都没勾，只平不反手）") : rev.join("、"))
-                       .arg(r.max_consecutive_reverses)
-                       .arg(r.cooldown_bars)
-                       .arg(r.vf_one_rev_per_bar ? "、同一根最多反手一次" : "")
-                       .arg(r.atr_mult, 0, 'f', 1)
-                       .arg(r.lock_atr ? "、锁定ATR" : "")
-                       .arg(r.accel_exit ? "、加速收紧" : "");
-            if (b.st.consec_reverses > 0)
-                tip += QString("已连续反手 %1 次\n").arg(b.st.consec_reverses);
-            break;
-        }
         }
         tip += (b.cfg.size_mode == TrendConfig::SizeMode::RiskBased)
                    ? QString("仓位：固定单笔风险，单笔愿亏 %1U（名义上限 %2U）\n")
@@ -687,7 +647,7 @@ struct TrendFormWidgets {
     QSpinBox*       maxAge   = nullptr;
     QLabel*         maxAgeHint = nullptr;
 
-    // ── ① 海龟 ──
+    // ── ① 趋势跟踪 ──
     QSpinBox*       dcPeriod  = nullptr;
     QSpinBox*       atrPeriod = nullptr;
     QDoubleSpinBox* k         = nullptr;
@@ -696,7 +656,7 @@ struct TrendFormWidgets {
     QDoubleSpinBox* erMin     = nullptr;   // 箱体过宽时的例外：效率比 ≥ x，0=关
     QCheckBox*      lockAtr   = nullptr;   // 出场优化：锁定 ATR
     QCheckBox*      accelExit = nullptr;   // 出场优化：盈利后加速收紧
-    QCheckBox*      turtleOnce = nullptr;  // 每根K线最多开一次（与裸K 页那个是同一个配置项）
+    QCheckBox*      trendOnce = nullptr;  // 每根K线最多开一次（与裸K 页那个是同一个配置项）
     QDoubleSpinBox* chaseAtr  = nullptr;   // 追高过滤：离通道边沿 ≤ x ATR，0=关
     QCheckBox*      expandLong = nullptr;  // 多单要波动放大
     QDoubleSpinBox* expandMin  = nullptr;  //   折算振幅门槛
@@ -726,10 +686,9 @@ struct TrendFormWidgets {
 // 声明顺序将来可能变，而分页顺序是界面语义
 static int strategy_page(trend::Strategy s) {
     switch (s) {
-        case trend::Strategy::Turtle:       return 0;
+        case trend::Strategy::TrendFollowing:       return 0;
         case trend::Strategy::ParabolicSar: return 1;
         case trend::Strategy::BareK:        return 2;
-        case trend::Strategy::VolFollow:    return 0;   // 手动表单不提供（打开前已拦）
     }
     return 0;
 }
@@ -763,12 +722,12 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
     // 策略排在整张表单最前面：它决定了下面哪一页参数有意义。三套参数【不混搭】，
     // 所以用分页而不是灰掉——灰掉的控件仍然在视野里，会让人以为"调了也有用"
     w->strategy = new QComboBox();
-    w->strategy->addItem("① 海龟（唐奇安突破 + ATR 止损）", (int)trend::Strategy::Turtle);
+    w->strategy->addItem("① 趋势跟踪（唐奇安突破 + ATR 止损）", (int)trend::Strategy::TrendFollowing);
     w->strategy->addItem("② 趋势 SAR（Wilder 抛物线）",     (int)trend::Strategy::ParabolicSar);
     w->strategy->addItem("③ 纯裸K（摆动极值止损）",          (int)trend::Strategy::BareK);
     w->strategy->setCurrentIndex(strategy_page(c.rule.strategy));
     w->strategy->setToolTip(
-        "① 海龟：价格创 N 根新高/新低入场，止损 = k×ATR 的棘轮线。\n"
+        "① 趋势跟踪：价格创 N 根新高/新低入场，止损 = k×ATR 的棘轮线。\n"
         "   慢、信号少、对参数最不敏感，是三个里最适合 4h 以上周期的。\n\n"
         "② 趋势 SAR：SAR 点既是止损也是反转点，趋势越强它加速贴近价格。\n"
         "   天然 stop-and-reverse（永远有仓位），震荡市会连续翻转——\n"
@@ -807,15 +766,15 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
         st->addWidget(page);
         return f;
     };
-    auto* p1 = mkPage(w->pages);   // 海龟
+    auto* p1 = mkPage(w->pages);   // 趋势跟踪
     auto* p2 = mkPage(w->pages);   // SAR
     auto* p3 = mkPage(w->pages);   // 裸K
 
-    // ── ① 海龟 ──
+    // ── ① 趋势跟踪 ──
     w->dcPeriod = new QSpinBox();
     w->dcPeriod->setRange(2, 200);
     w->dcPeriod->setValue(c.rule.donchian_period);
-    w->dcPeriod->setToolTip("唐奇安通道周期（海龟原版 20）。\n"
+    w->dcPeriod->setToolTip("唐奇安通道周期（趋势跟踪原版 20）。\n"
                             "上破 N 根最高 → 做多，下破 N 根最低 → 做空。\n"
                             "通道只由已收盘K线构成，当前这根去撞它。");
     p1->addRow("通道周期", w->dcPeriod);
@@ -823,7 +782,7 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
     w->atrPeriod = new QSpinBox();
     w->atrPeriod->setRange(2, 100);
     w->atrPeriod->setValue(c.rule.atr_period);
-    w->atrPeriod->setToolTip("ATR 周期（海龟原版 14/20）。只有本策略用 ATR。");
+    w->atrPeriod->setToolTip("ATR 周期（趋势跟踪原版 14/20）。只有本策略用 ATR。");
     p1->addRow("ATR 周期", w->atrPeriod);
 
     w->k = new QDoubleSpinBox();
@@ -891,12 +850,12 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
         "只是急涨见顶、急跌回落时少吐一些。状态列会显示当前 k。");
     p1->addRow(w->accelExit);
 
-    w->turtleOnce = new QCheckBox("每根K线最多开一次");
-    w->turtleOnce->setChecked(c.rule.once_per_bar);
-    w->turtleOnce->setToolTip(
+    w->trendOnce = new QCheckBox("每根K线最多开一次");
+    w->trendOnce->setChecked(c.rule.once_per_bar);
+    w->trendOnce->setToolTip(
         "同一根K线里出场后（止盈、止损、假突破都算）不再开，等下一根。\n"
         "不勾的话平仓后价格还在通道外，几秒后就会原地再开一笔。");
-    p1->addRow(w->turtleOnce);
+    p1->addRow(w->trendOnce);
 
     w->chaseAtr = new QDoubleSpinBox();
     w->chaseAtr->setRange(0.0, 10.0);
@@ -1134,11 +1093,11 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
         "固定名义：每笔都是同样的名义价值。\n"
         "固定单笔风险：名义 = 单次愿亏 ÷ 入场价到止损线的距离%，每笔止损亏的钱一样。\n\n"
         "⚠ 用的是【当前策略算出来的那条止损线】，不是某个固定的 ATR 倍数：\n"
-        "  海龟是 k×ATR，SAR 是首根 SAR 值，裸K 是最近 N 根的摆动极值。\n"
+        "  趋势跟踪是 k×ATR，SAR 是首根 SAR 值，裸K 是最近 N 根的摆动极值。\n"
         "  三个策略都适用，所以这一项放在共享区而不是某一页里。\n\n"
         "为什么需要它：同一份名义，在 4h 波动 1.6% 的 LTC 和 5.3% 的 COTI 上，"
         "单次止损亏的钱差 3.3 倍。固定名义 = 风险全压在高波动那几个品种上，"
-        "而「铺开品种分散风险」就此失效。这是海龟的「单位」概念。");
+        "而「铺开品种分散风险」就此失效。这是趋势跟踪的「单位」概念。");
     posForm->addRow("仓位算法", w->sizeMode);
 
     w->budget = new QDoubleSpinBox();
@@ -1322,7 +1281,7 @@ std::shared_ptr<TrendFormWidgets> MainWindow::buildTrendForm(QVBoxLayout* into,
             revW->setEnabled(true);
             revNote->setText(idx == 2
                 ? "③ 裸K 的「连续反手上限 / 冷却K线数」在上面策略页里，默认都是关的。"
-                : "① 海龟的信号密度本来就低，连续反手几乎不会发生，因此不提供上限与冷却。");
+                : "① 趋势跟踪的信号密度本来就低，连续反手几乎不会发生，因此不提供上限与冷却。");
         }
     };
     syncStrategy(w->strategy->currentIndex());
@@ -1371,10 +1330,10 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
     out.rule.direction = (trend::Direction)w->direction->currentData().toInt();
 
     // ⚠ 每个策略【只回读自己那一页】的参数，其余从 base 继承原样带走。
-    // 不这么做的话，切到 SAR 保存一次，海龟的通道周期就会被这一页上那个
+    // 不这么做的话，切到 SAR 保存一次，趋势跟踪的通道周期就会被这一页上那个
     // 从没显示给用户看过的默认值悄悄覆盖掉——而用户根本没碰过它
     switch (out.rule.strategy) {
-        case trend::Strategy::Turtle:
+        case trend::Strategy::TrendFollowing:
             out.rule.donchian_period = w->dcPeriod->value();
             out.rule.atr_period      = w->atrPeriod->value();
             out.rule.atr_mult        = w->k->value();
@@ -1383,7 +1342,7 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.trend_er_min       = w->erMin->value();
             out.rule.lock_atr           = w->lockAtr->isChecked();
             out.rule.accel_exit         = w->accelExit->isChecked();
-            out.rule.once_per_bar       = w->turtleOnce->isChecked();
+            out.rule.once_per_bar       = w->trendOnce->isChecked();
             out.rule.max_chase_atr      = w->chaseAtr->value();
             out.rule.expand_long        = w->expandLong->isChecked();
             out.rule.expand_long_min    = w->expandMin->value();
@@ -1405,8 +1364,6 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             out.rule.chop_er_max     = w->chopEr->value();
             out.rule.max_consecutive_reverses = w->maxRev->value();
             out.rule.cooldown_bars            = w->cooldown->value();
-            break;
-        case trend::Strategy::VolFollow:   // 手动表单不提供（打开前已拦），参数保持 base 的
             break;
     }
 
@@ -1433,7 +1390,7 @@ bool MainWindow::collectTrendForm(const std::shared_ptr<TrendFormWidgets>& w, Tr
             "等于把抛物线 SAR 退化成一条固定比例的追踪止损。");
         return false;
     }
-    if (out.rule.strategy == trend::Strategy::Turtle) {
+    if (out.rule.strategy == trend::Strategy::TrendFollowing) {
         if (const char* e = trend::breakeven_config_error(out.rule)) {
             QMessageBox::warning(this, "参数错误",
                 QString::fromUtf8(e) +
@@ -1513,8 +1470,8 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
 
     QString params;
     switch (c.rule.strategy) {
-        case trend::Strategy::Turtle:
-            params = QString("海龟 唐奇安%1 ATR%2 k=%3")
+        case trend::Strategy::TrendFollowing:
+            params = QString("趋势跟踪 唐奇安%1 ATR%2 k=%3")
                          .arg(c.rule.donchian_period).arg(c.rule.atr_period)
                          .arg(c.rule.atr_mult, 0, 'f', 1);
             if (c.rule.squeeze_box_atr > 0)
@@ -1555,10 +1512,6 @@ bool MainWindow::applyTrendConfig(TrendConfig c, const TrendBot* existing) {
             if (c.rule.chop_er_max > 0)
                 params += QString(" 震荡效率比<%1").arg(c.rule.chop_er_max, 0, 'f', 2);
             break;
-        case trend::Strategy::VolFollow:
-            params = QString("波动顺势 死区%1ATR k=%2")
-                         .arg(c.rule.vf_dead_atr, 0, 'f', 2).arg(c.rule.atr_mult, 0, 'f', 1);
-            break;
     }
     if (c.rule.direction != trend::Direction::Both)
         params += QString(" %1").arg(trend::direction_name(c.rule.direction));
@@ -1582,6 +1535,7 @@ std::string MainWindow::trend_cfg_path() const {
 }
 
 void MainWindow::save_trend_bots() {
+    if (trendStateBlocked_) return;  // 不覆盖包含旧策略持仓的状态文件。
     if (!trend_engine_) return;
     QJsonArray arr;
     for (const auto& b : trend_engine_->get_bots()) {
@@ -1626,13 +1580,6 @@ void MainWindow::save_trend_bots() {
         o["bare_vol_ratio"]  = b.cfg.rule.bare_vol_ratio;
         o["signal_body_atr"] = b.cfg.rule.signal_body_atr;
         o["chop_er_max"]     = b.cfg.rule.chop_er_max;
-        // ④ 波动顺势
-        o["vf_dead_atr"]        = b.cfg.rule.vf_dead_atr;
-        o["vf_rev_open"]        = b.cfg.rule.vf_rev_open;
-        o["vf_rev_loss"]        = b.cfg.rule.vf_rev_loss;
-        o["vf_rev_loss_roi"]    = b.cfg.rule.vf_rev_loss_roi;
-        o["vf_rev_stop"]        = b.cfg.rule.vf_rev_stop;
-        o["vf_one_rev_per_bar"] = b.cfg.rule.vf_one_rev_per_bar;
         o["signal_max_age_sec"] = b.cfg.signal_max_age_sec;
         o["use_disaster_stop"]  = b.cfg.use_disaster_stop;
         o["disaster_stop_buffer_pct"] = b.cfg.disaster_stop_buffer_pct;
@@ -1641,6 +1588,11 @@ void MainWindow::save_trend_bots() {
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
         o["disaster_stop_price"] = b.disaster_stop_price;
         o["state"]           = (int)b.state;
+        o["open_uncertain"] = b.open_uncertain || (b.pending && b.st.pos == trend::Pos::Flat);
+        o["uncertain_client_id"] = QString::fromStdString(b.uncertain_client_id);
+        o["reserved_risk"] = b.reserved_risk;
+        o["reserved_margin"] = b.reserved_margin;
+        o["reserved_dir"] = (int)b.reserved_dir;
         o["auto"]            = b.is_auto;   // 智能模式管理的 bot
         // ── 运行时状态 ──
         // Qt 的 QJsonValue(double) 是全精度往返，不像 ostringstream 会截到 6 位。
@@ -1652,7 +1604,7 @@ void MainWindow::save_trend_bots() {
         // ② SAR 专用：AF 丢了的话重启后 SAR 会从 0.02 重新加速，止损线瞬间
         // 从"贴着价格"退回到远处——等于白白让出已经锁住的利润
         o["af"]              = b.st.af;
-        // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
+        // ① 趋势跟踪锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
         o["entry_atr"]       = b.st.entry_atr;
         // 开仓时被突破的通道边沿。丢了的话"收盘跌回通道内就走"在重启后失效
         o["entry_edge"]      = b.st.entry_edge;
@@ -1666,11 +1618,9 @@ void MainWindow::save_trend_bots() {
         // 浮盈亏最低（持仓期最差价）与 R 的分母。丢了的话重启前那段浮亏就没了
         o["trough"]          = b.trough;
         o["open_stop"]       = b.open_stop;
-        // 开仓时的量比 / 箱体 / 触发方式（记录层）；名单代码——智能裸K 的 bot 重启后靠它认出来
         if (std::isfinite(b.open_vol_ratio)) o["open_vol_ratio"] = b.open_vol_ratio;
         if (std::isfinite(b.open_box_atr))   o["open_box_atr"]   = b.open_box_atr;
         if (std::isfinite(b.open_taker))     o["open_taker"]     = b.open_taker;
-        o["open_trigger"]    = (int)b.open_trigger;
         o["smart_list"]      = (int)b.smart_list;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
@@ -1693,17 +1643,44 @@ void MainWindow::save_trend_bots() {
 }
 
 void MainWindow::load_and_restore_trend() {
+    trendStateBlocked_ = false;
     if (!trend_engine_) return;
     QFile f(QString::fromStdString(trend_cfg_path()));
     if (!f.open(QIODevice::ReadOnly)) return;
     const auto doc = QJsonDocument::fromJson(f.readAll());
     if (!doc.isArray()) return;
 
+    trendStateBlocked_ = false;
+    for (const auto& value : doc.array()) {
+        const auto o = value.toObject();
+        if (o.contains("open_uncertain") && !o["open_uncertain"].isBool()) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "状态文件损坏",
+                "开仓委托状态字段损坏，已停止恢复并保留原状态文件。请先核对委托与持仓。");
+            return;
+        }
+        const bool removed = o["strategy"].toInt(0) == 3 ||
+            (o["auto"].toBool(false) && app::removed_smart_strategy((char)o["smart_list"].toInt(0)));
+        if (removed && (o["pos"].toInt(0) != (int)trend::Pos::Flat || o["qty"].toDouble(0) > 0)) {
+            trendStateBlocked_ = true;
+            log(QString("%1：状态文件仍有已移除智能策略的持仓，请使用旧版管理至平仓后再升级")
+                .arg(o["symbol"].toString()), "WARN");
+        }
+    }
+    if (trendStateBlocked_) {
+        QMessageBox::critical(this, "无法恢复旧策略持仓",
+            "状态文件仍包含已移除策略的持仓，请使用旧版管理至平仓后再升级。原状态文件保持不变。");
+        return;
+    }
+
     int n = 0;
     int migrated = 0;   // 用到了旧键的条目数，>0 时结束前落盘一次固化迁移结果
     for (const auto& v : doc.array()) {
         if (!v.isObject()) continue;
         const auto o = v.toObject();
+        if (o["strategy"].toInt(0) == 3 ||
+            (o["auto"].toBool(false) && app::removed_smart_strategy((char)o["smart_list"].toInt(0))))
+            continue;  // 已移除策略的空仓条目无需恢复。
         auto sym = o["symbol"].toString();
         if (sym.isEmpty()) continue;
 
@@ -1747,12 +1724,6 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.rule.bare_vol_ratio  = std::max(0.0, o["bare_vol_ratio"].toDouble(0));
         b.cfg.rule.signal_body_atr = std::max(0.0, o["signal_body_atr"].toDouble(0));
         b.cfg.rule.chop_er_max     = std::clamp(o["chop_er_max"].toDouble(0), 0.0, 1.0);
-        b.cfg.rule.vf_dead_atr        = std::max(0.0, o["vf_dead_atr"].toDouble(0.3));
-        b.cfg.rule.vf_rev_open        = o["vf_rev_open"].toBool(true);
-        b.cfg.rule.vf_rev_loss        = o["vf_rev_loss"].toBool(false);
-        b.cfg.rule.vf_rev_loss_roi    = o["vf_rev_loss_roi"].toDouble(10);
-        b.cfg.rule.vf_rev_stop        = o["vf_rev_stop"].toBool(true);
-        b.cfg.rule.vf_one_rev_per_bar = o["vf_one_rev_per_bar"].toBool(true);
         // 自动 bot 的老存档没有这项 ⇒ 按开（智能模板的默认）。不然持仓中的要等走完、
         // 再过一轮扫描才换上，这段时间里同一根还能再开。手动 bot 照旧按关
         b.cfg.rule.once_per_bar    = o["once_per_bar"].toBool(o["auto"].toBool(false));
@@ -1779,8 +1750,8 @@ void MainWindow::load_and_restore_trend() {
         }
 
         // ── 迁移：v5.0.x 的 sar_mode(0=唐奇安,1=裸K) → strategy ────────────
-        // 旧存档里没有 strategy 键。默认值不能拍脑袋填 Turtle：旧的 mode=1
-        // 是裸K，静默当成海龟会把一个 3 根摆动止损的高频配置变成 3×ATR 的
+        // 旧存档里没有 strategy 键。默认值不能拍脑袋填 TrendFollowing：旧的 mode=1
+        // 是裸K，静默当成趋势跟踪会把一个 3 根摆动止损的高频配置变成 3×ATR 的
         // 慢速配置，而仓位大小照旧——风险敞口直接变几倍
         if (o.contains("strategy")) {
             const int s = o["strategy"].toInt(0);
@@ -1788,9 +1759,7 @@ void MainWindow::load_and_restore_trend() {
                                       ? trend::Strategy::ParabolicSar
                                   : (s == (int)trend::Strategy::BareK)
                                       ? trend::Strategy::BareK
-                                  : (s == (int)trend::Strategy::VolFollow)
-                                      ? trend::Strategy::VolFollow
-                                      : trend::Strategy::Turtle;
+                                      : trend::Strategy::TrendFollowing;
         } else if (o["sar_mode"].toInt(0) == 1) {
             b.cfg.rule.strategy   = trend::Strategy::BareK;
             // 旧裸K的入场规则是"刚收盘那根是阳线就做多"，v5.1 已删除。
@@ -1802,7 +1771,7 @@ void MainWindow::load_and_restore_trend() {
                     .arg(sym), "WARN");
             ++migrated;
         } else {
-            b.cfg.rule.strategy = trend::Strategy::Turtle;
+            b.cfg.rule.strategy = trend::Strategy::TrendFollowing;
         }
 
         // ── 迁移：两个 bool → ReverseMode ──────────────────────────────────
@@ -1835,6 +1804,12 @@ void MainWindow::load_and_restore_trend() {
         b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (TrendBot::State)o["state"].toInt(0);
         b.is_auto = o["auto"].toBool(false);
+        b.open_uncertain = o["open_uncertain"].toBool(false);
+        b.uncertain_client_id = o["uncertain_client_id"].toString().toStdString();
+        b.reserved_risk = o["reserved_risk"].toDouble(0);
+        b.reserved_margin = o["reserved_margin"].toDouble(0);
+        b.reserved_dir = (trend::Pos)o["reserved_dir"].toInt(0);
+        if (b.is_auto) b.cfg.rule.following = smartCfg_.tmpl.rule.following;
 
         const int pos = o["pos"].toInt((int)trend::Pos::Flat);
         b.st.pos = (pos == (int)trend::Pos::Long)  ? trend::Pos::Long
@@ -1864,7 +1839,6 @@ void MainWindow::load_and_restore_trend() {
                                                           : std::numeric_limits<double>::quiet_NaN();
         b.open_taker         = o.contains("open_taker") ? o["open_taker"].toDouble(0)
                                                         : std::numeric_limits<double>::quiet_NaN();
-        b.open_trigger       = (char)o["open_trigger"].toInt(0);
         b.smart_list         = (char)o["smart_list"].toInt(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);

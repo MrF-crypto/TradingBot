@@ -35,17 +35,21 @@ std::string fmt(double v, int prec) {
 TrendConfig Config::default_template() {
     TrendConfig t;
     t.interval    = "1h";
+    t.rule.following.enabled = true;
+    t.size_mode = TrendConfig::SizeMode::RiskBased;
+    t.risk_usdt = 1;
+    t.signal_max_age_sec = 120;
     t.budget_usdt = 100;
     t.leverage    = 3;
-    t.rule.strategy        = trend::Strategy::Turtle;
+    t.rule.strategy        = trend::Strategy::TrendFollowing;
     t.rule.donchian_period = 12;
     t.rule.atr_period      = 14;
     t.rule.atr_mult        = 3.0;
-    t.rule.squeeze_box_atr    = 4.0;
+    t.rule.squeeze_box_atr    = 0; // EMA state filters ranges; allow wide trending channels.
     t.rule.trend_er_min       = 0.4;
     t.rule.breakout_vol_ratio = 1.5;
     t.rule.lock_atr   = true;
-    t.rule.accel_exit = true;
+    t.rule.accel_exit = false;
     t.rule.vol_paced  = true;   // 量比按已走时间折算：不然多数突破被拦到后半小时才开，追得太远
     t.rule.fail_exit  = true;   // 多单收盘跌回通道内就走，不等止损亏满 1R
     t.rule.fail_exit_short = false;   // 空单反弹回通道多半又接着跌，默认不判（见 trend_decision.h）
@@ -64,19 +68,9 @@ trend::Direction bot_direction(const Config& cfg) {
 }
 
 trend::Direction seg_direction(char seg, const Config& cfg, bool* allowed) {
-    bool ok = true;
-    trend::Direction d = trend::Direction::Both;
-    switch (seg) {
-    case kSegStrong: ok = cfg.dir_long;  d = trend::Direction::LongOnly;  break;
-    case kSegWeak:
-    case kSegHot:    ok = cfg.dir_short; d = trend::Direction::ShortOnly; break;
-    default:         // 中间段：多空，与勾选取交集
-        ok = cfg.dir_long || cfg.dir_short;
-        d  = bot_direction(cfg);
-        break;
-    }
-    if (allowed) *allowed = ok;
-    return d;
+    (void)seg; // Lists rank candidates; only the coin's absolute trend permits entry.
+    if (allowed) *allowed = cfg.dir_long || cfg.dir_short;
+    return bot_direction(cfg);
 }
 
 TrendConfig make_bot_config(const Config& cfg, const std::string& symbol) {
@@ -86,331 +80,31 @@ TrendConfig make_bot_config(const Config& cfg, const std::string& symbol) {
 TrendConfig make_bot_config(const Config& cfg, const std::string& symbol, trend::Direction dir,
                             char seg) {
     TrendConfig c = cfg.tmpl;
-    if (seg == kSegHot)  c.rule.breakout_vol_ratio = 0;
-    if (seg == kSegWeak) c.rule.breakout_vol_ratio = cfg.weak_vol_ratio;
+    (void)seg; // Heat and relative strength never override direction or volume rules.
     c.symbol = symbol;
-    // 智能模式只建海龟。下面三项不随模板：
+    // 智能模式只建趋势跟踪。下面三项不随模板：
     //   · 方向跟勾选走（两个都勾 = 多空，向上突破做多、向下突破做空）
     //   · 不反手：自动 bot 在没看过的币上交易，亏损止损后立刻反向开一笔是在放大
     //     不确定性。多空模式下反方向真突破了，照样会按正常信号开
     //   · 硬止损强制开：程序崩溃时这些仓位不能没有交易所侧的底
-    c.rule.strategy  = trend::Strategy::Turtle;
+    c.rule.strategy  = trend::Strategy::TrendFollowing;
     c.rule.direction = dir;
     c.rule.reverse   = trend::ReverseMode::None;
     c.use_disaster_stop = true;
     return c;
 }
 
-TrendConfig make_bare_bot_config(const Config& cfg, const std::string& symbol) {
-    const auto& bc = cfg.bare;
-    TrendConfig c = cfg.tmpl;   // 仓位模式、名义、风险、杠杆、硬止损外扩
-    c.symbol   = symbol;
-    c.interval = kBareInterval;
-    auto& r = c.rule;
-    r.strategy        = trend::Strategy::Turtle;
-    r.donchian_period = kAmbushBoxBars;
-    r.atr_period      = kAtrPeriod;
-    r.atr_mult        = bc.atr_mult;
-    // 入场不归 bot 管（点火判定直接下单），这些过滤一律关掉
-    r.breakout_vol_ratio = 0;
-    r.squeeze_box_atr    = 0;
-    r.trend_er_min       = 0;
-    r.max_chase_atr      = 0;
-    r.expand_long        = false;   // 裸K 有自己的点火波动条件（BareConfig::expand）
-    r.max_init_loss_pct  = 0;   // 止损是点火K线低点，不按海龟模板截
-    r.breakeven          = false;   // 出场用裸K 自己的追踪止盈
-    r.lock_atr        = bc.lock_atr;
-    r.accel_exit      = bc.accel_exit;
-    // 这两项是海龟自己突破入场的；裸K 的止损从点火K线低点起，不按"跌回通道"走
-    r.vol_paced       = false;
-    r.fail_exit       = false;
-    r.fail_exit_short = false;
-    // 追踪止盈用裸K 自己的设置，不跟海龟模板
-    r.roi_trail       = bc.roi_trail;
-    r.roi_trail_start = bc.roi_start;
-    r.roi_trail_back  = bc.roi_back;
-    r.direction       = trend::Direction::LongOnly;
-    r.reverse         = trend::ReverseMode::None;
-    c.use_disaster_stop = true;
-    return c;
-}
-
-bool ambush_excluded_base(const std::string& base) {
+bool excluded_asset_base(const std::string& base) {
     static const std::set<std::string> kGold = {"PAXG", "XAUT"};
     return kGold.count(base) > 0;
 }
 
-// ── 波动顺势 ──────────────────────────────────────────────────────────────
-
-TrendConfig make_vol_bot_config(const Config& cfg, const std::string& symbol) {
-    const auto& vc = cfg.vol;
-    TrendConfig c = cfg.tmpl;   // 仓位模式、名义、风险、杠杆、硬止损外扩
-    c.symbol   = symbol;
-    c.interval = vc.interval;
-    auto& r = c.rule;
-    r.strategy        = trend::Strategy::VolFollow;
-    r.donchian_period = 12;     // 不用通道，快照接口要一个正数
-    r.atr_period      = kAtrPeriod;
-    r.atr_mult        = vc.atr_mult;
-    // 海龟的入场过滤与假突破出场都不认（④ 不走通道突破）
-    r.breakout_vol_ratio = 0;
-    r.squeeze_box_atr    = 0;
-    r.trend_er_min       = 0;
-    r.max_chase_atr      = 0;
-    r.expand_long        = false;
-    r.vol_paced          = false;
-    r.fail_exit          = false;
-    r.fail_exit_short    = false;
-    r.max_init_loss_pct  = vc.max_init_loss_pct;
-    r.lock_atr           = vc.lock_atr;
-    r.accel_exit         = vc.accel_exit;
-    r.roi_trail          = vc.roi_trail;
-    r.roi_trail_start    = vc.roi_start;
-    r.roi_trail_back     = vc.roi_back;
-    r.breakeven          = vc.breakeven;
-    r.breakeven_start    = vc.breakeven_start;
-    r.vf_dead_atr        = vc.dead_atr;
-    r.vf_rev_open        = vc.rev_open;
-    r.vf_rev_loss        = vc.rev_loss;
-    r.vf_rev_loss_roi    = vc.rev_loss_roi;
-    r.vf_rev_stop        = vc.rev_stop;
-    r.vf_one_rev_per_bar = vc.one_rev_per_bar;
-    r.max_consecutive_reverses = vc.max_reverses;
-    r.cooldown_bars      = vc.cooldown_bars;
-    r.once_per_bar       = true;   // 平仓后等下一根（反手的开仓腿不受它拦）
-    r.direction          = trend::Direction::Both;
-    r.reverse            = trend::ReverseMode::Immediate;
-    c.use_disaster_stop  = true;
-    return c;
-}
-
-VolFeat compute_vol(const std::vector<Bar>& bars) {
-    VolFeat f;
-    const int n = (int)bars.size();
-    if (n < kVolLong + 1) return f;
-    std::vector<indicators::Ohlc> oh;
-    oh.reserve(bars.size());
-    for (const auto& b : bars) oh.push_back({b.high, b.low, b.close, b.open});
-    const double atr = indicators::atr(oh, kAtrPeriod);
-    f.close = bars.back().close;
-    if (!(atr > 0) || !(f.close > 0)) return f;
-    f.atr_pct = atr / f.close * 100.0;
-    double s_short = 0, s_long = 0;
-    for (int i = n - kVolLong; i < n; ++i) {
-        const auto& b = bars[i];
-        const double pc = bars[i - 1].close;
-        const double tr = std::max(b.high - b.low, std::max(std::fabs(b.high - pc), std::fabs(b.low - pc)));
-        s_long += tr;
-        if (i >= n - kVolShort) s_short += tr;
-    }
-    if (!(s_long > 0)) return f;
-    f.slope = (s_short / kVolShort) / (s_long / kVolLong);
-    f.ok = true;
-    return f;
-}
-
-bool vol_qualifies(const VolFeat& f, const VolConfig& vc) {
-    if (!f.ok) return false;
-    return (vc.use_atr && f.atr_pct >= vc.atr_pct_min) || (vc.use_slope && f.slope >= vc.slope_min);
-}
-
-std::vector<std::string> select_vol(const std::map<std::string, VolFeat>& feats, const VolConfig& vc) {
-    std::vector<std::pair<std::string, const VolFeat*>> v;
-    for (const auto& kv : feats)
-        if (vol_qualifies(kv.second, vc)) v.push_back({kv.first, &kv.second});
-    std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
-        if (a.second->slope != b.second->slope) return a.second->slope > b.second->slope;
-        if (a.second->atr_pct != b.second->atr_pct) return a.second->atr_pct > b.second->atr_pct;
-        return a.first < b.first;
-    });
-    std::vector<std::string> out;
-    for (const auto& p : v) {
-        if ((int)out.size() >= vc.pool_n) break;
-        out.push_back(p.first);
-    }
-    return out;
-}
-
-bool vol_interval_ok(const std::string& iv) {
-    return iv == "5m" || iv == "15m" || iv == "30m" || iv == "1h";
-}
-
-namespace {
-double clamp01(double v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
-double qv_of(const Bar& b) { return b.quote_vol > 0 ? b.quote_vol : b.volume * b.close; }
-std::vector<indicators::Ohlc> ohlc_of(const std::vector<Bar>& v, size_t n) {
-    std::vector<indicators::Ohlc> o;
-    o.reserve(n);
-    for (size_t i = 0; i < n && i < v.size(); ++i) o.push_back({v[i].high, v[i].low, v[i].close, v[i].open});
-    return o;
-}
-} // namespace
-
-AmbushFeat compute_ambush(const std::vector<Bar>& bars) {
-    AmbushFeat f;
-    const int n = (int)bars.size();
-    if (n < kAmbushBoxBars + 30) { f.why = "1h K线不足"; return f; }
-    const auto oh = ohlc_of(bars, bars.size());
-    f.close = bars.back().close;
-    f.atr   = indicators::atr(oh, kAtrPeriod);
-    const double atr100 = indicators::atr(oh, 100);
-    if (!(f.atr > 0) || !(f.close > 0)) { f.why = "ATR 算不出"; return f; }
-    f.atr_pct   = f.atr / f.close * 100.0;
-    f.atr_ratio = atr100 > 0 ? f.atr / atr100 : 0;
-
-    // 箱体按实体（同唐奇安通道）：长影线不算箱体边
-    double hi = 0, lo = 0, up_qv = 0, all_qv = 0;
-    double lo_a = 0, lo_b = 0;   // 箱体前 6 根 / 后 6 根的最低实体底
-    for (int i = n - kAmbushBoxBars; i < n; ++i) {
-        const auto& b = bars[i];
-        const double top = std::max(b.open, b.close), bot = std::min(b.open, b.close);
-        if (i == n - kAmbushBoxBars) { hi = top; lo = bot; }
-        hi = std::max(hi, top);
-        lo = std::min(lo, bot);
-        const bool first_half = (i < n - kAmbushBoxBars / 2);
-        double& half_lo = first_half ? lo_a : lo_b;
-        if (half_lo == 0 || bot < half_lo) half_lo = bot;
-        const double q = qv_of(b);
-        all_qv += q;
-        if (b.close > b.open) up_qv += q;
-    }
-    if (!(hi > lo) || !(lo > 0)) { f.why = "箱体无效"; return f; }
-    f.box_hi  = hi;
-    f.box_lo  = lo;
-    f.box_pct = (hi - lo) / lo * 100.0;
-    f.kappa   = f.box_pct / f.atr_pct / std::sqrt((double)kAmbushBoxBars);
-    f.pos     = (f.close - lo) / (hi - lo);
-    f.higher_low   = lo_b > lo_a;
-    f.up_vol_share = all_qv > 0 ? up_qv / all_qv : 0;
-    f.ok = true;
-    return f;
-}
-
-std::string ambush_gate(const AmbushFeat& f, const BareConfig& bc) {
-    if (!f.ok) return f.why.empty() ? std::string("数据不全") : f.why;
-    if (f.atr_pct > bc.atr_pct_max)
-        return "1h ATR% " + fmt(f.atr_pct, 2) + " > " + fmt(bc.atr_pct_max, 1);
-    if (f.pos < bc.pos_min)
-        return "箱体内位置 " + fmt(f.pos, 2) + " < " + fmt(bc.pos_min, 2);
-    return {};
-}
 
 double kappa_score(double k) {
     if (k >= 0.8 && k <= 1.2) return 1;
     if (k > 0.5 && k < 0.8)   return (k - 0.5) / 0.3;
     if (k > 1.2 && k < 1.5)   return (1.5 - k) / 0.3;
     return 0;
-}
-
-double ambush_score(const AmbushFeat& f, const BareConfig& bc) {
-    if (!f.ok) return 0;
-    const double sk = kappa_score(f.kappa);
-    const double sp = bc.pos_min < 1 ? clamp01((f.pos - bc.pos_min) / (1 - bc.pos_min)) : 0;
-    double sa = 1;   // ATR% ≤ 1% 满分，到上限线性降到 0
-    if (f.atr_pct > 1) sa = bc.atr_pct_max > 1 ? clamp01((bc.atr_pct_max - f.atr_pct) / (bc.atr_pct_max - 1)) : 0;
-    const double sw = (f.higher_low ? 0.5 : 0) + (f.up_vol_share >= 0.55 ? 0.5 : 0);
-    const double sr = (f.atr_ratio > 0 && f.atr_ratio <= 0.85) ? 1
-                    : (f.atr_ratio > 0 && f.atr_ratio <= 1.3)  ? 0.5 : 0;
-    return 100.0 * (0.40 * sk + 0.25 * sp + 0.20 * sa + 0.10 * sw + 0.05 * sr);
-}
-
-std::vector<Ambush> select_ambush(const std::map<std::string, AmbushFeat>& feats,
-                                  const BareConfig& bc) {
-    std::vector<Ambush> v;
-    for (const auto& [sym, f] : feats) {
-        if (!ambush_gate(f, bc).empty()) continue;
-        v.push_back({sym, f, ambush_score(f, bc)});
-    }
-    std::stable_sort(v.begin(), v.end(), [](const Ambush& a, const Ambush& b) {
-        if (a.score != b.score) return a.score > b.score;
-        return a.symbol < b.symbol;
-    });
-    if ((int)v.size() > bc.pool_n) v.resize((size_t)std::max(0, bc.pool_n));
-    return v;
-}
-
-std::string ambush_drop(const AmbushFeat& now, double prev_box_lo, double add_close,
-                        const BareConfig& bc) {
-    if (!now.ok) return {};   // 没算出来 ≠ 不合格：这一轮不动它
-    if (prev_box_lo > 0 && now.close < prev_box_lo)
-        return "跌破箱体下沿 " + fmt(prev_box_lo, 6);
-    if (now.atr_pct > bc.atr_pct_max)
-        return "1h ATR% " + fmt(now.atr_pct, 2) + " 超过 " + fmt(bc.atr_pct_max, 1);
-    if (add_close > 0 && now.close > add_close * (1 + bc.rise_out_pct / 100.0))
-        return "进池后已涨 " + fmt((now.close / add_close - 1) * 100.0, 1) + "%";
-    return {};
-}
-
-Ignition check_ignition(const std::vector<Bar>& bars, double box_hi, double box_lo,
-                        const BareConfig& bc) {
-    Ignition g;
-    const int n = (int)bars.size();
-    if (n < 35 || !(box_hi > box_lo)) { g.why = "数据不足"; return g; }
-    const Bar& c = bars.back();
-    g.close = c.close;
-    g.low   = c.low;
-
-    std::vector<double> q;
-    for (int i = n - 21; i < n - 1; ++i) q.push_back(qv_of(bars[i]));
-    std::sort(q.begin(), q.end());
-    const double med = (q[9] + q[10]) / 2;
-    g.vol_ratio = med > 0 ? qv_of(c) / med : 0;
-
-    const double range = c.high - c.low;
-    g.atr = indicators::atr(ohlc_of(bars, (size_t)n - 1), kAtrPeriod);   // 点火【之前】的 ATR
-    if (!(range > 0) || !(c.open > 0) || !(g.atr > 0)) { g.why = "这根K线无效"; return g; }
-    g.body_pct   = (c.close - c.open) / c.open * 100.0;
-    g.close_pos  = (c.close - c.low) / range;
-    g.upper_wick = (c.high - std::max(c.open, c.close)) / range;
-    g.amp_atr    = range / g.atr;
-    g.rise_atr   = (c.close - c.open) / g.atr;
-    if (n >= kExpandLong + 1) {
-        double s_short = 0, s_long = 0;
-        for (int i = n - kExpandLong; i < n; ++i) {
-            const auto& b = bars[i];
-            const double pc = bars[i - 1].close;
-            const double tr = std::max(b.high - b.low, std::max(std::fabs(b.high - pc), std::fabs(b.low - pc)));
-            s_long += tr;
-            if (i >= n - kExpandShort) s_short += tr;
-        }
-        if (s_long > 0) g.expand = (s_short / kExpandShort) / (s_long / kExpandLong);
-    }
-
-    // 否决（任一成立就不做）
-    bool all_red = bc.veto_red_bars > 0 && n - 1 >= bc.veto_red_bars;
-    for (int i = n - 1 - bc.veto_red_bars; all_red && i < n - 1; ++i)
-        if (!(bars[i].close < bars[i].open)) all_red = false;
-    const double prev_pos = (bars[n - 2].close - box_lo) / (box_hi - box_lo);
-    if (all_red) {
-        g.vetoed = true;
-        g.why = "点火前 " + std::to_string(bc.veto_red_bars) + " 根连阴（下跌中继反抽）";
-    } else if (prev_pos < bc.veto_pos_max) {
-        g.vetoed = true;
-        g.why = "点火前在箱体下部（位置 " + fmt(prev_pos, 2) + "）";
-    } else if (g.rise_atr < bc.rise_atr_min) {
-        g.vetoed = true;
-        g.why = "涨幅/ATR " + fmt(g.rise_atr, 2) + " < " + fmt(bc.rise_atr_min, 1);
-    }
-    if (g.vetoed) return g;
-
-    if (g.vol_ratio < bc.vol_ratio)
-        g.why = "量比 " + fmt(g.vol_ratio, 2) + "x < " + fmt(bc.vol_ratio, 1) + "x";
-    else if (g.body_pct < bc.body_pct_min)
-        g.why = "实体 " + fmt(g.body_pct, 2) + "% < " + fmt(bc.body_pct_min, 2) + "%";
-    else if (g.close_pos < bc.close_pos_min)
-        g.why = "收盘位置 " + fmt(g.close_pos, 2) + " < " + fmt(bc.close_pos_min, 2);
-    else if (g.upper_wick > bc.upper_wick_max)
-        g.why = "上影 " + fmt(g.upper_wick, 2) + " > " + fmt(bc.upper_wick_max, 2);
-    else if (g.amp_atr < bc.amp_atr_min)
-        g.why = "振幅/ATR " + fmt(g.amp_atr, 2) + " < " + fmt(bc.amp_atr_min, 2);
-    else if (c.close < box_hi * (1 - bc.edge_tol_pct / 100.0))
-        g.why = "收盘离箱体上沿 " + fmt((c.close / box_hi - 1) * 100.0, 2) + "%";
-    else if (bc.expand && !(g.expand >= bc.expand_min))
-        g.why = g.expand > 0 ? "波动斜率 " + fmt(g.expand, 2) + " < " + fmt(bc.expand_min, 2)
-                             : std::string("波动斜率算不出（5m 根数不够）");
-    else
-        g.ok = true;
-    return g;
 }
 
 // ── 硬门槛 ──────────────────────────────────────────────────────────────────
@@ -447,7 +141,7 @@ std::string pre_gate(const SymbolMeta& m, const Ticker24* t, const double* fundi
             return "24h 成交额 " + fmt(t->quote_vol / 1e6, 1) + "M 不足";
         // 下面两条只拦【新加入】：已在池里的币突然暴涨 60%，空仓时淘汰交给排名，
         // 而不是在这里一刀切掉
-        if (!relax && std::fabs(t->chg_pct) > cfg.max_abs_chg24)
+        if (!relax && cfg.max_abs_chg24 > 0 && std::fabs(t->chg_pct) > cfg.max_abs_chg24)
             return "24h 涨跌 " + fmt(t->chg_pct, 1) + "% 过大";
     }
     if (funding_pct && !relax && std::fabs(*funding_pct) > cfg.max_abs_funding)
@@ -510,7 +204,7 @@ Features compute_features(const std::vector<Bar>& bars, const std::vector<Bar>& 
     f.close     = close;
     f.atr_pct   = atr14 / close * 100.0;
     f.box12_atr = (hi12 - lo12) / atr14;
-    // κ 与埋伏池同一个口径：箱体高度按下沿算百分比，再除以 ATR% 和 √12
+    // κ 箱体高度按下沿算百分比，再除以 ATR% 和 √12
     if (lo12 > 0) f.kappa12 = ((hi12 - lo12) / lo12 * 100.0) / f.atr_pct / std::sqrt(12.0);
     f.box48_atr = (hi48 - lo48) / atr14;
     f.atr_ratio = atr14 / atr100;
@@ -634,7 +328,7 @@ Ranking rank(const std::map<std::string, Features>& eligible, const Config& cfg,
 
     // 方向无关的指标两边共用；有方向的指标做空时取反（越弱、越靠近下沿越好）。
     // 12 根箱体不再按"越窄越好"排百分位：回测里 κ < 0.5（箱体极窄）是假突破最多的一档，
-    // 0.8~1.2 最好——按 κ 区间打分（0~100），和埋伏池同一套
+    // 0.8~1.2 最好——按 κ 区间打分（0~100）
     std::vector<double> p_b12(n);
     for (int i = 0; i < n; ++i) p_b12[i] = 100.0 * kappa_score(fs[i]->kappa12);
     const auto p_ar = percentiles(ar, false);
@@ -681,11 +375,12 @@ Ranking rank(const std::map<std::string, Features>& eligible, const Config& cfg,
 
 namespace {
 // 段内排序用的分：强势按做多分、弱势按做空分、中间按蓄势分（要抓的是横盘爆拉）、
-// 过热按做空分（名额紧张时的取舍用；过热段名单本身按暴涨幅度排）
+// 异动组按多空较高分；历史大涨本身不代表未来下跌。
 double seg_score(char seg, const Scored& s) {
     switch (seg) {
     case kSegStrong: return s.long_score;
     case kSegMid:    return s.squeeze_score;
+    case kSegHot:    return std::max(s.long_score, s.short_score);
     default:         return s.short_score;
     }
 }
@@ -786,7 +481,7 @@ Segmented segment(const Ranking& r, const Config& cfg, std::map<std::string, Seg
     by(out.strong, [](const Scored& s) { return s.long_score; });
     by(out.weak,   [](const Scored& s) { return s.short_score; });
     by(out.mid,    [](const Scored& s) { return s.squeeze_score; });
-    // 过热段按暴涨幅度：涨得越猛，回落的空间通常越大
+    // 异动组按历史异动幅度安排观察优先级，不推断后续方向。
     by(out.hot,    [](const Scored& s) { return s.f.max_up24; });
     return out;
 }
@@ -1027,62 +722,7 @@ std::string config_to_json(const Config& c) {
     auto b = [](bool v) { return v ? "true" : "false"; };
     o << "{"
       << "\"enabled\":" << b(c.enabled) << ","
-      << "\"strategy\":\"" << (c.strategy == Strategy::BareK     ? "bare"
-                              : c.strategy == Strategy::VolFollow ? "vol" : "turtle") << "\","
-      << "\"vol\":{"
-      << "\"interval\":\"" << c.vol.interval << "\","
-      << "\"min_quote_vol\":" << c.vol.min_quote_vol << ","
-      << "\"min_age_days\":" << c.vol.min_age_days << ","
-      << "\"max_abs_chg24\":" << c.vol.max_abs_chg24 << ","
-      << "\"use_atr\":" << b(c.vol.use_atr) << ","
-      << "\"atr_pct_min\":" << c.vol.atr_pct_min << ","
-      << "\"use_slope\":" << b(c.vol.use_slope) << ","
-      << "\"slope_min\":" << c.vol.slope_min << ","
-      << "\"pool_n\":" << c.vol.pool_n << ","
-      << "\"dead_atr\":" << c.vol.dead_atr << ","
-      << "\"rev_open\":" << b(c.vol.rev_open) << ","
-      << "\"rev_loss\":" << b(c.vol.rev_loss) << ","
-      << "\"rev_loss_roi\":" << c.vol.rev_loss_roi << ","
-      << "\"rev_stop\":" << b(c.vol.rev_stop) << ","
-      << "\"max_reverses\":" << c.vol.max_reverses << ","
-      << "\"cooldown_bars\":" << c.vol.cooldown_bars << ","
-      << "\"one_rev_per_bar\":" << b(c.vol.one_rev_per_bar) << ","
-      << "\"atr_mult\":" << c.vol.atr_mult << ","
-      << "\"lock_atr\":" << b(c.vol.lock_atr) << ","
-      << "\"accel_exit\":" << b(c.vol.accel_exit) << ","
-      << "\"max_init_loss_pct\":" << c.vol.max_init_loss_pct << ","
-      << "\"roi_trail\":" << b(c.vol.roi_trail) << ","
-      << "\"roi_start\":" << c.vol.roi_start << ","
-      << "\"roi_back\":" << c.vol.roi_back << ","
-      << "\"breakeven\":" << b(c.vol.breakeven) << ","
-      << "\"breakeven_start\":" << c.vol.breakeven_start << ","
-      << "\"max_positions\":" << c.vol.max_positions << "},"
-      << "\"bare\":{"
-      << "\"pool_n\":" << c.bare.pool_n << ","
-      << "\"min_quote_vol\":" << c.bare.min_quote_vol << ","
-      << "\"min_age_days\":" << c.bare.min_age_days << ","
-      << "\"max_abs_chg24\":" << c.bare.max_abs_chg24 << ","
-      << "\"atr_pct_max\":" << c.bare.atr_pct_max << ","
-      << "\"pos_min\":" << c.bare.pos_min << ","
-      << "\"rise_out_pct\":" << c.bare.rise_out_pct << ","
-      << "\"vol_ratio\":" << c.bare.vol_ratio << ","
-      << "\"body_pct_min\":" << c.bare.body_pct_min << ","
-      << "\"close_pos_min\":" << c.bare.close_pos_min << ","
-      << "\"upper_wick_max\":" << c.bare.upper_wick_max << ","
-      << "\"amp_atr_min\":" << c.bare.amp_atr_min << ","
-      << "\"edge_tol_pct\":" << c.bare.edge_tol_pct << ","
-      << "\"expand\":" << b(c.bare.expand) << ","
-      << "\"expand_min\":" << c.bare.expand_min << ","
-      << "\"veto_red_bars\":" << c.bare.veto_red_bars << ","
-      << "\"veto_pos_max\":" << c.bare.veto_pos_max << ","
-      << "\"rise_atr_min\":" << c.bare.rise_atr_min << ","
-      << "\"atr_mult\":" << c.bare.atr_mult << ","
-      << "\"lock_atr\":" << b(c.bare.lock_atr) << ","
-      << "\"accel_exit\":" << b(c.bare.accel_exit) << ","
-      << "\"roi_trail\":" << b(c.bare.roi_trail) << ","
-      << "\"roi_start\":" << c.bare.roi_start << ","
-      << "\"roi_back\":" << c.bare.roi_back << ","
-      << "\"max_positions\":" << c.bare.max_positions << "},"
+      << "\"strategy\":\"trend_following\","
       << "\"dir_long\":" << b(c.dir_long) << ","
       << "\"dir_short\":" << b(c.dir_short) << ","
       << "\"dir_mode\":\"" << (c.dir_mode == DirMode::Mixed ? "mixed" : "breakout") << "\","
@@ -1095,7 +735,6 @@ std::string config_to_json(const Config& c) {
       << "\"turn_er\":" << c.turn_er << ","
       << "\"hot_pct\":" << c.hot_pct << ","
       << "\"crash_pct\":" << c.crash_pct << ","
-      << "\"weak_vol_ratio\":" << c.weak_vol_ratio << ","
       << "\"min_quote_vol\":" << c.min_quote_vol << ","
       << "\"min_age_days\":" << c.min_age_days << ","
       << "\"atr_pct_min\":" << c.atr_pct_min << ","
@@ -1119,8 +758,27 @@ std::string config_to_json(const Config& c) {
       << "\"prio_reserve\":" << c.prio_reserve << ","
       << "\"prio_min_score\":" << c.prio_min_score << ","
       << "\"pause_new\":" << b(c.pause_new) << ",";
+    o << "\"max_total_risk_usdt\":" << c.max_total_risk_usdt << ",";
+    o << "\"max_direction_risk_usdt\":" << c.max_direction_risk_usdt << ",";
+    o << "\"risk_cost_bps\":" << c.risk_cost_bps << ",";
+    o << "\"event_poll_sec\":" << c.event_poll_sec << ",";
+    o << "\"event_cooldown_sec\":" << c.event_cooldown_sec << ",";
+    o << "\"event_move_atr\":" << c.event_move_atr << ",";
+    o << "\"event_min_move_pct\":" << c.event_min_move_pct << ",";
     const auto& t = c.tmpl;
-    o << "\"template\":{"
+    o << "\"template\":{";
+    o << "\"tf_enabled\":" << b(t.rule.following.enabled) << ",";
+    o << "\"tf_close_confirm\":" << b(t.rule.following.close_confirm) << ",";
+    o << "\"tf_reversal_exit\":" << b(t.rule.following.reversal_exit) << ",";
+    o << "\"tf_fast_period\":" << t.rule.following.fast_period << ",";
+    o << "\"tf_slow_period\":" << t.rule.following.slow_period << ",";
+    o << "\"tf_slope_bars\":" << t.rule.following.slope_bars << ",";
+    o << "\"tf_min_slope_atr\":" << t.rule.following.min_slope_atr << ",";
+    o << "\"tf_min_separation_atr\":" << t.rule.following.min_separation_atr << ",";
+    o << "\"tf_breakout_buffer_atr\":" << t.rule.following.breakout_buffer_atr << ",";
+    o << "\"tf_min_close_location\":" << t.rule.following.min_close_location << ",";
+    o << "\"tf_short_vol_ratio\":" << t.rule.following.short_vol_ratio << ",";
+    o << ""
       << "\"interval\":\"" << t.interval << "\","
       << "\"budget_usdt\":" << t.budget_usdt << ","
       << "\"leverage\":" << t.leverage << ","
@@ -1187,80 +845,14 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     Config c = cfg;
     get_bool(o, "enabled", c.enabled);
     {
-        std::string_view sv;
-        if (o["strategy"].get(sv) == simdjson::SUCCESS) {
-            if (sv == "turtle")    c.strategy = Strategy::Turtle;
-            else if (sv == "bare") c.strategy = Strategy::BareK;
-            else if (sv == "vol")  c.strategy = Strategy::VolFollow;
-            else {
-                if (err) *err = "智能模式：strategy 只能是 turtle / bare / vol";
+        simdjson::dom::element value;
+        if (o["strategy"].get(value) == simdjson::SUCCESS) {
+            std::string_view strategy;
+            if (value.get(strategy) != simdjson::SUCCESS ||
+                (strategy != "trend_following" && strategy != "turtle")) {
+                if (err) *err = "智能模式仅支持趋势跟踪（strategy: trend_following）；旧裸K埋伏与波动顺势已移除";
                 return false;
             }
-        }
-    }
-    {
-        simdjson::dom::object vo;
-        if (o["vol"].get_object().get(vo) == simdjson::SUCCESS) {
-            auto& vc = c.vol;
-            std::string_view iv;
-            if (vo["interval"].get(iv) == simdjson::SUCCESS) vc.interval = std::string(iv);
-            get_num(vo, "min_quote_vol", vc.min_quote_vol);
-            get_int(vo, "min_age_days", vc.min_age_days);
-            get_num(vo, "max_abs_chg24", vc.max_abs_chg24);
-            get_bool(vo, "use_atr", vc.use_atr);
-            get_num(vo, "atr_pct_min", vc.atr_pct_min);
-            get_bool(vo, "use_slope", vc.use_slope);
-            get_num(vo, "slope_min", vc.slope_min);
-            get_int(vo, "pool_n", vc.pool_n);
-            get_num(vo, "dead_atr", vc.dead_atr);
-            get_bool(vo, "rev_open", vc.rev_open);
-            get_bool(vo, "rev_loss", vc.rev_loss);
-            get_num(vo, "rev_loss_roi", vc.rev_loss_roi);
-            get_bool(vo, "rev_stop", vc.rev_stop);
-            get_int(vo, "max_reverses", vc.max_reverses);
-            get_int(vo, "cooldown_bars", vc.cooldown_bars);
-            get_bool(vo, "one_rev_per_bar", vc.one_rev_per_bar);
-            get_num(vo, "atr_mult", vc.atr_mult);
-            get_bool(vo, "lock_atr", vc.lock_atr);
-            get_bool(vo, "accel_exit", vc.accel_exit);
-            get_num(vo, "max_init_loss_pct", vc.max_init_loss_pct);
-            get_bool(vo, "roi_trail", vc.roi_trail);
-            get_num(vo, "roi_start", vc.roi_start);
-            get_num(vo, "roi_back", vc.roi_back);
-            get_bool(vo, "breakeven", vc.breakeven);
-            get_num(vo, "breakeven_start", vc.breakeven_start);
-            get_int(vo, "max_positions", vc.max_positions);
-        }
-    }
-    {
-        simdjson::dom::object bo;
-        if (o["bare"].get_object().get(bo) == simdjson::SUCCESS) {
-            auto& bc = c.bare;
-            get_int(bo, "pool_n", bc.pool_n);
-            get_num(bo, "min_quote_vol", bc.min_quote_vol);
-            get_int(bo, "min_age_days", bc.min_age_days);
-            get_num(bo, "max_abs_chg24", bc.max_abs_chg24);
-            get_num(bo, "atr_pct_max", bc.atr_pct_max);
-            get_num(bo, "pos_min", bc.pos_min);
-            get_num(bo, "rise_out_pct", bc.rise_out_pct);
-            get_num(bo, "vol_ratio", bc.vol_ratio);
-            get_num(bo, "body_pct_min", bc.body_pct_min);
-            get_num(bo, "close_pos_min", bc.close_pos_min);
-            get_num(bo, "upper_wick_max", bc.upper_wick_max);
-            get_num(bo, "amp_atr_min", bc.amp_atr_min);
-            get_num(bo, "edge_tol_pct", bc.edge_tol_pct);
-            get_bool(bo, "expand", bc.expand);   // 旧文件没有 → 关
-            get_num(bo, "expand_min", bc.expand_min);
-            get_int(bo, "veto_red_bars", bc.veto_red_bars);
-            get_num(bo, "veto_pos_max", bc.veto_pos_max);
-            get_num(bo, "rise_atr_min", bc.rise_atr_min);
-            get_num(bo, "atr_mult", bc.atr_mult);
-            get_bool(bo, "lock_atr", bc.lock_atr);
-            get_bool(bo, "accel_exit", bc.accel_exit);
-            get_bool(bo, "roi_trail", bc.roi_trail);
-            get_num(bo, "roi_start", bc.roi_start);
-            get_num(bo, "roi_back", bc.roi_back);
-            get_int(bo, "max_positions", bc.max_positions);
         }
     }
     get_bool(o, "dir_long", c.dir_long);
@@ -1285,7 +877,6 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     get_num(o, "turn_er", c.turn_er);
     get_num(o, "hot_pct", c.hot_pct);
     get_num(o, "crash_pct", c.crash_pct);
-    get_num(o, "weak_vol_ratio", c.weak_vol_ratio);
     get_num(o, "min_quote_vol", c.min_quote_vol);
     get_int(o, "min_age_days", c.min_age_days);
     get_num(o, "atr_pct_min", c.atr_pct_min);
@@ -1315,10 +906,213 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     get_int(o, "prio_reserve", c.prio_reserve);
     get_num(o, "prio_min_score", c.prio_min_score);
     get_bool(o, "pause_new", c.pause_new);
+    {
+        simdjson::dom::element el;
+        if (o["max_total_risk_usdt"].get(el) == simdjson::SUCCESS) {
+            double value{};
+            if (el.get(value) != simdjson::SUCCESS) {
+                if (err) *err = "智能模式：max_total_risk_usdt 类型或范围不合法";
+                return false;
+            }
+            c.max_total_risk_usdt = value;
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["max_direction_risk_usdt"].get(el) == simdjson::SUCCESS) {
+            double value{};
+            if (el.get(value) != simdjson::SUCCESS) {
+                if (err) *err = "智能模式：max_direction_risk_usdt 类型或范围不合法";
+                return false;
+            }
+            c.max_direction_risk_usdt = value;
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["risk_cost_bps"].get(el) == simdjson::SUCCESS) {
+            double value{};
+            if (el.get(value) != simdjson::SUCCESS) {
+                if (err) *err = "智能模式：risk_cost_bps 类型或范围不合法";
+                return false;
+            }
+            c.risk_cost_bps = value;
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["event_move_atr"].get(el) == simdjson::SUCCESS) {
+            double value{};
+            if (el.get(value) != simdjson::SUCCESS) {
+                if (err) *err = "智能模式：event_move_atr 类型或范围不合法";
+                return false;
+            }
+            c.event_move_atr = value;
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["event_min_move_pct"].get(el) == simdjson::SUCCESS) {
+            double value{};
+            if (el.get(value) != simdjson::SUCCESS) {
+                if (err) *err = "智能模式：event_min_move_pct 类型或范围不合法";
+                return false;
+            }
+            c.event_min_move_pct = value;
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["event_poll_sec"].get(el) == simdjson::SUCCESS) {
+            int64_t value{};
+            if (el.get(value) != simdjson::SUCCESS || value < 0 || value > 3600) {
+                if (err) *err = "智能模式：event_poll_sec 类型或范围不合法";
+                return false;
+            }
+            c.event_poll_sec = static_cast<int>(value);
+        }
+    }
+    {
+        simdjson::dom::element el;
+        if (o["event_cooldown_sec"].get(el) == simdjson::SUCCESS) {
+            int64_t value{};
+            if (el.get(value) != simdjson::SUCCESS || value < 0 || value > 3600) {
+                if (err) *err = "智能模式：event_cooldown_sec 类型或范围不合法";
+                return false;
+            }
+            c.event_cooldown_sec = static_cast<int>(value);
+        }
+    }
+
 
     simdjson::dom::object t;
     if (o["template"].get_object().get(t) == simdjson::SUCCESS) {
         auto& tm = c.tmpl;
+        if (t["tf_short_vol_ratio"].error() == simdjson::NO_SUCH_FIELD)
+            get_num(o, "weak_vol_ratio", tm.rule.following.short_vol_ratio); // legacy input only
+
+        {
+            simdjson::dom::element el;
+            if (t["tf_enabled"].get(el) == simdjson::SUCCESS) {
+                bool value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_enabled 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.enabled = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_close_confirm"].get(el) == simdjson::SUCCESS) {
+                bool value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_close_confirm 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.close_confirm = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_reversal_exit"].get(el) == simdjson::SUCCESS) {
+                bool value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_reversal_exit 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.reversal_exit = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_fast_period"].get(el) == simdjson::SUCCESS) {
+                int64_t value{};
+                if (el.get(value) != simdjson::SUCCESS || value < 0 || value > 1000) {
+                    if (err) *err = "智能模式：tf_fast_period 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.fast_period = static_cast<int>(value);
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_slow_period"].get(el) == simdjson::SUCCESS) {
+                int64_t value{};
+                if (el.get(value) != simdjson::SUCCESS || value < 0 || value > 1000) {
+                    if (err) *err = "智能模式：tf_slow_period 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.slow_period = static_cast<int>(value);
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_slope_bars"].get(el) == simdjson::SUCCESS) {
+                int64_t value{};
+                if (el.get(value) != simdjson::SUCCESS || value < 0 || value > 1000) {
+                    if (err) *err = "智能模式：tf_slope_bars 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.slope_bars = static_cast<int>(value);
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_min_slope_atr"].get(el) == simdjson::SUCCESS) {
+                double value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_min_slope_atr 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.min_slope_atr = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_min_separation_atr"].get(el) == simdjson::SUCCESS) {
+                double value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_min_separation_atr 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.min_separation_atr = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_breakout_buffer_atr"].get(el) == simdjson::SUCCESS) {
+                double value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_breakout_buffer_atr 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.breakout_buffer_atr = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_min_close_location"].get(el) == simdjson::SUCCESS) {
+                double value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_min_close_location 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.min_close_location = value;
+            }
+        }
+        {
+            simdjson::dom::element el;
+            if (t["tf_short_vol_ratio"].get(el) == simdjson::SUCCESS) {
+                double value{};
+                if (el.get(value) != simdjson::SUCCESS) {
+                    if (err) *err = "智能模式：tf_short_vol_ratio 类型或范围不合法";
+                    return false;
+                }
+                tm.rule.following.short_vol_ratio = value;
+            }
+        }
+
         std::string_view sv;
         if (t["interval"].get(sv) == simdjson::SUCCESS) tm.interval = std::string(sv);
         get_num(t, "budget_usdt", tm.budget_usdt);
@@ -1354,11 +1148,12 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
 
     // ── 校验：有一项不合法就整份拒绝，cfg 不动 ──
     auto bad = [&](const std::string& m) { if (err) *err = "智能模式：" + m; return false; };
+    if (c.enabled && !c.dir_long && !c.dir_short) return bad("启用趋势跟踪至少要允许一个交易方向");
     if (!(c.min_quote_vol >= 0))                         return bad("min_quote_vol 不能为负");
     if (c.min_age_days < 0)                              return bad("min_age_days 不能为负");
     if (!(c.atr_pct_min >= 0 && c.atr_pct_max > c.atr_pct_min))
         return bad("ATR% 区间不合法（要求 0 ≤ 下限 < 上限）");
-    if (!(c.max_abs_chg24 > 0))                          return bad("max_abs_chg24 必须大于 0");
+    if (!(c.max_abs_chg24 >= 0))                          return bad("max_abs_chg24 不能为负（0=关）");
     if (!(c.max_abs_funding > 0))                        return bad("max_abs_funding 必须大于 0");
     if (!(c.max_tick_pct > 0))                           return bad("max_tick_pct 必须大于 0");
     if (c.long_n < 0 || c.long_n > 200 || c.short_n < 0 || c.short_n > 200)
@@ -1369,7 +1164,6 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
         return bad("分段门槛不合法（要求 0 < 进段 ≤ 出段 < 50）");
     if (!(c.turn_er >= 0 && c.turn_er <= 1))             return bad("turn_er 要在 0~1 之间");
     if (!(c.hot_pct > 0) || !(c.crash_pct > 0))          return bad("过热 / 暴跌阈值必须大于 0");
-    if (!(c.weak_vol_ratio >= 0))                        return bad("弱势段量比不能为负（0 = 不要求）");
     if (!(c.min_score >= 0 && c.min_score <= 100))       return bad("min_score 要在 0~100 之间");
     if (!(c.drop_rank_factor >= 1))                      return bad("drop_rank_factor 不能小于 1");
     if (c.drop_after_scans < 1)                          return bad("drop_after_scans 至少为 1");
@@ -1378,9 +1172,17 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     if (!(c.daily_loss_limit >= 0) || !(c.float_loss_limit >= 0))
         return bad("亏损限额不能为负（0 = 关）");
     if (c.prio_reserve < 0)                              return bad("prio_reserve 不能为负");
+    if (!following::valid(c.tmpl.rule.following)) return bad("趋势因子参数范围不合法");
+    if (!(std::isfinite(c.max_total_risk_usdt) && c.max_total_risk_usdt >= 0 &&
+          std::isfinite(c.max_direction_risk_usdt) && c.max_direction_risk_usdt >= 0 &&
+          std::isfinite(c.risk_cost_bps) && c.risk_cost_bps >= 0 && c.risk_cost_bps <= 1000))
+        return bad("计划风险预算或成本参数不合法");
+    if (c.event_poll_sec < 30 || c.event_poll_sec > 3600 || c.event_cooldown_sec < c.event_poll_sec ||
+        c.event_cooldown_sec > 3600 || !(c.event_move_atr > 0) || !(c.event_min_move_pct > 0))
+        return bad("异动轮询/冷却/阈值不合法");
     const auto& tm = c.tmpl;
-    if (tm.interval != "1h" && tm.interval != "2h" && tm.interval != "4h")
-        return bad("模板周期只支持 1h / 2h / 4h（扫描按 1h K线打分）");
+    if (tm.interval != "15m" && tm.interval != "30m" && tm.interval != "1h" && tm.interval != "2h" && tm.interval != "4h")
+        return bad("模板周期只支持 15m / 30m / 1h / 2h / 4h（扫描按 1h K线打分）");
     if (!(tm.budget_usdt > 0))                           return bad("模板 budget_usdt 必须大于 0");
     if (tm.leverage < 1 || tm.leverage > 125)            return bad("模板杠杆要在 1~125 之间");
     if (tm.size_mode == TrendConfig::SizeMode::RiskBased && !(tm.risk_usdt > 0))
@@ -1399,46 +1201,6 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     if (!(tm.disaster_stop_buffer_pct > 0))              return bad("模板硬止损缓冲必须大于 0");
     if (!(tm.rule.roi_trail_start > 0) || !(tm.rule.roi_trail_back > 0))
         return bad("追踪止盈的激活收益率与回撤点数必须大于 0");
-    {
-        const auto& vc = c.vol;
-        if (!vol_interval_ok(vc.interval))               return bad("波动顺势周期只支持 5m / 15m / 30m / 1h");
-        if (!(vc.min_quote_vol >= 0) || vc.min_age_days < 0 || !(vc.max_abs_chg24 > 0))
-            return bad("波动顺势成交额 / 上线天数 / 24h 涨跌门槛不合法");
-        if (!(vc.atr_pct_min > 0) || !(vc.slope_min > 0)) return bad("波动顺势的波动率 / 波动斜率门槛必须大于 0");
-        if (c.strategy == Strategy::VolFollow && !vc.use_atr && !vc.use_slope)
-            return bad("波动顺势：波动率大、波动斜率大至少勾一个");
-        if (vc.pool_n < 1 || vc.pool_n > 200)            return bad("波动顺势名单上限要在 1~200 之间");
-        if (!(vc.dead_atr >= 0))                         return bad("波动顺势死区不能为负");
-        if (!(vc.rev_loss_roi > 0))                      return bad("波动顺势亏损反手的收益率必须大于 0");
-        if (vc.max_reverses < 0 || vc.cooldown_bars < 0) return bad("波动顺势反手上限 / 冷却不能为负");
-        if (!(vc.atr_mult > 0))                          return bad("波动顺势追踪止损 ATR 倍数必须大于 0");
-        if (!(vc.max_init_loss_pct >= 0 && vc.max_init_loss_pct < 100))
-            return bad("波动顺势初始止损上限要在 0~100% 之间（0 = 关）");
-        if (!(vc.roi_start > 0) || !(vc.roi_back > 0))   return bad("波动顺势追踪止盈的激活与回撤必须大于 0");
-        if (vc.breakeven && !(vc.breakeven_start > 0))   return bad("波动顺势保本触发收益率必须大于 0");
-        if (vc.breakeven && vc.roi_trail && !(vc.breakeven_start < vc.roi_start))
-            return bad("波动顺势：参数错误：保本触发线应低于追踪止盈启动线");
-        if (vc.max_positions < 0)                        return bad("波动顺势同时持仓上限不能为负");
-    }
-    const auto& bc = c.bare;
-    if (bc.pool_n < 1 || bc.pool_n > 200)                return bad("裸K 埋伏池大小要在 1~200 之间");
-    if (!(bc.min_quote_vol >= 0) || bc.min_age_days < 0) return bad("裸K 成交额 / 上线天数不能为负");
-    if (!(bc.max_abs_chg24 > 0))                         return bad("裸K 24h 涨跌上限必须大于 0");
-    if (!(bc.atr_pct_max > 0))                           return bad("裸K 1h ATR% 上限必须大于 0");
-    if (!(bc.pos_min >= 0 && bc.pos_min < 1))            return bad("裸K 箱体内位置下限要在 0~1 之间");
-    if (!(bc.rise_out_pct > 0))                          return bad("裸K 进池后涨幅上限必须大于 0");
-    if (!(bc.vol_ratio >= 0) || !(bc.body_pct_min >= 0) || !(bc.amp_atr_min >= 0) ||
-        !(bc.edge_tol_pct >= 0) || !(bc.rise_atr_min >= 0))
-        return bad("裸K 点火阈值不能为负");
-    if (!(bc.expand_min > 0))                            return bad("裸K 波动斜率门槛必须大于 0");
-    if (!(bc.close_pos_min >= 0 && bc.close_pos_min <= 1) ||
-        !(bc.upper_wick_max >= 0 && bc.upper_wick_max <= 1) ||
-        !(bc.veto_pos_max >= 0 && bc.veto_pos_max <= 1))
-        return bad("裸K 收盘位置 / 上影 / 否决位置要在 0~1 之间");
-    if (bc.veto_red_bars < 0 || bc.veto_red_bars > 20)   return bad("裸K 连阴否决根数要在 0~20 之间");
-    if (bc.max_positions < 0)                            return bad("裸K 同时持仓上限不能为负");
-    if (!(bc.atr_mult > 0))                              return bad("裸K 追踪止损 ATR 倍数必须大于 0");
-    if (!(bc.roi_start > 0) || !(bc.roi_back > 0))       return bad("裸K 追踪止盈的激活收益率与回撤点数必须大于 0");
     cfg = c;
     return true;
 }

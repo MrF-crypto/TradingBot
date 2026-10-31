@@ -1,4 +1,5 @@
 #pragma once
+#include "core/trend_following.h"
 #include "core/itrading_client.h"
 #include <string>
 #include <vector>
@@ -64,6 +65,8 @@ public:
         // 网络超时且事后查单也无法确认订单是否到达交易所（可能已成交也可能没有）。
         // 调用方对 uncertain 必须区别对待：开仓不能盲目重试（可能双倍仓位），
         // 平仓可以重试（reduceOnly 天然幂等）
+        std::string client_order_id{};
+        bool terminal = false;
         bool        uncertain    = false;
     };
 
@@ -108,6 +111,7 @@ public:
     //   而价格用的【是】当前未收盘K线的实时收盘值——用已收盘的通道，让实时
     //   价格去撞它，这才是突破
     struct TrendSnapshot {
+        following::Signal following;
         bool    ok      = false;   // ATR 与通道都算得出来
         double  price   = 0;
         double  atr     = 0;       // ATR(period, Wilder)，0=数据不足
@@ -123,12 +127,12 @@ public:
         bool    er_ok = false;     // 通道窗口的效率比算得出来
         double  er    = 0;         // 带符号，正 = 净上涨
         int64_t bar_open_ms = 0;   // 当前（未收盘）K线的开盘时间，冷却计数用
-        double  bar_open = 0;      // 当前（未收盘）K线的开盘价（④ 波动顺势的入场基准）
         // 当前根主动买入成交额 ÷ 成交额（数据记录层，不参与决策）。NaN = 拿不到
         double  taker_ratio = std::numeric_limits<double>::quiet_NaN();
     };
     TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,
-                                 int donchian_period, int atr_period);
+                                 int donchian_period, int atr_period,
+                                 const following::Config& following = {});
 
     // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
     // fetch_atr 删于 v5.9.9：零调用者，它只服务已移除的网格 DCA
@@ -399,7 +403,12 @@ public:
     OrderOutcome place_market_order(const std::string& symbol, const std::string& side,
                                     double qty, bool reduce_only) override {
         auto r = place_market(symbol, side, qty, reduce_only);
-        return { r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain };
+        return { r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id };
+    }
+    bool opening_order_terminal(const std::string& symbol, const std::string& id) override {
+        if (id.empty()) return false;
+        const auto r = query_order(symbol, id);
+        return r.terminal && !r.uncertain;
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;

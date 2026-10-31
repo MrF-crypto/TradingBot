@@ -161,6 +161,20 @@ jobs:
           fi
           cp config.example.json pkg/
 
+      - name: Include documentation and dependency licenses
+        shell: bash
+        run: |
+          set -e
+          cp LICENSE README.md config.example.json pkg/
+          cp -R docs pkg/
+          mkdir -p pkg/licenses
+          for notice in build/vcpkg_installed/x64-linux/share/*/copyright; do
+            test -f "$notice" || continue
+            dep=$(basename "$(dirname "$notice")")
+            mkdir -p "pkg/licenses/$dep"
+            cp "$notice" "pkg/licenses/$dep/"
+          done
+
       - name: Zip
         run: |
           VER="${GITHUB_REF#refs/tags/}"
@@ -168,31 +182,10 @@ jobs:
           cd pkg && zip -r "../tradingbot-$VER-linux-x64.zip" . && cd ..
           ls -la tradingbot-*.zip
 
-      # 只在 tag 构建时上传：release job 靠它拿包，而 main 上的普通提交
-      # 只需要验证"能编译、测试通过"，产物没人取用。
-      # 不加这个条件的话每次推送都存一份三平台的包（约 79MB），
-      # 累积到 296 个 / 6.29GB 时会撞上 GitHub 的 artifact 配额，
-      # 表现为构建与测试全绿、唯独 Upload artifact 步骤失败——
-      # 一个与代码完全无关却会挡住发版的故障
+      # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-linux-x64
           path: tradingbot-*.zip
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
-        with:
-          name: tradingbot-linux-x64
-      - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
-        with:
-          files: tradingbot-*.zip
-          fail_on_unmatched_files: true

@@ -6,11 +6,24 @@
 #include <QDir>
 #include <QMessageBox>
 #include "gui/main_window.h"
+#include "version.h"
+#include <iostream>
+#include <string_view>
 
 int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string_view(argv[1]) == "--version") {
+        std::cout << "TradingBot " << ccbot::kVersion << std::endl;
+        return 0;
+    }
     QApplication::setStyle("Fusion");  // 让深色 QSS 完全接管，避免下拉框/勾选框等控件
                                        // 回退到系统原生浅色渲染，出现"一亮一暗"的效果
     QApplication app(argc, argv);
+    // 离线检查 Qt 平台插件及依赖，不创建主窗口、不读取账户数据。
+    if (argc > 1 && std::string_view(argv[1]) == "--check-runtime") {
+        std::cout << "TradingBot " << ccbot::kVersion << " | Qt " << qVersion()
+                  << " | runtime OK" << std::endl;
+        return 0;
+    }
     app.setApplicationName("TradingBot");
     // ⚠ 不要改这个名字：回退模式（程序目录不可写）下的数据目录路径由它决定，
     // 改了等于让老用户的凭证与持仓跟踪失联。它不上界面，用户看不到

@@ -1,4 +1,6 @@
 #include "headless/trend_state.h"
+#include "core/app_logic.h"
+#include <stdexcept>
 #include "core/smart_mode.h"
 
 #include <simdjson.h>
@@ -78,6 +80,11 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            // 智能模式管理的 bot 不在配置文件里，恢复时要靠这个标记 + 智能模式模板
            // 重建参数（见 load_trend_state）
            << "\"auto\":"        << (b.is_auto ? "true" : "false") << ","
+           << "\"open_uncertain\":" << ((b.open_uncertain || (b.pending && b.st.pos == trend::Pos::Flat)) ? "true" : "false") << ","
+           << "\"uncertain_client_id\":\"" << json_escape(b.uncertain_client_id) << "\","
+           << "\"reserved_risk\":" << b.reserved_risk << ","
+           << "\"reserved_margin\":" << b.reserved_margin << ","
+           << "\"reserved_dir\":" << (int)b.reserved_dir << ","
            << "\"pos\":"         << (int)b.st.pos << ","
            << "\"entry_price\":" << b.st.entry_price << ","
            << "\"peak\":"        << b.st.peak << ","
@@ -85,7 +92,7 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            // ② 抛物线SAR 专用：AF 丢了的话重启后 SAR 会从 af_start 重新加速，
            //    止损线瞬间从"贴着价格"退回远处——等于白白让出已经锁住的利润
            << "\"af\":"          << b.st.af << ","
-           // ① 海龟锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
+           // ① 趋势跟踪锁定 ATR / 加速收紧的基准。丢了的话重启后静默退回普通 Chandelier
            << "\"entry_atr\":"   << b.st.entry_atr << ","
            // 开仓时被突破的通道边沿。丢了的话"收盘跌回通道内就走"在重启后失效
            << "\"entry_edge\":"  << b.st.entry_edge << ","
@@ -103,7 +110,7 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            << "\"trough\":"      << b.trough << ","
            << "\"open_stop\":"   << b.open_stop << ","
            // 开仓时的量比 / 箱体 / 触发方式（记录层）；名单代码——智能裸K 的 bot
-           // 重启后靠它认出来，换用 5m 的参数恢复（不能套 1h 海龟模板）
+           // 重启后靠它认出来，换用 5m 的参数恢复（不能套 1h 趋势跟踪模板）
            << (std::isfinite(b.open_vol_ratio)
                    ? "\"open_vol_ratio\":" + std::to_string(b.open_vol_ratio) + ","
                    : std::string())
@@ -113,7 +120,7 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            << (std::isfinite(b.open_taker)
                    ? "\"open_taker\":" + std::to_string(b.open_taker) + ","
                    : std::string())
-           << "\"open_trigger\":" << (int)b.open_trigger << ","
+
            << "\"smart_list\":"  << (int)b.smart_list << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
            //    忘掉，盘中即时模式下同一根里会再开一次
@@ -193,9 +200,7 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
 
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
-                                   const TrendConfig* auto_tmpl,
-                                   const TrendConfig* bare_tmpl,
-                                   const TrendConfig* vol_tmpl) {
+                                   const TrendConfig* auto_tmpl) {
     std::vector<TrendBot> out;
 
     std::ifstream f(path, std::ios::binary);
@@ -225,28 +230,28 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         const int saved_pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
         const char smart_list = (char)(int)get_num(o, "smart_list", 0);
 
+        if (is_auto && app::removed_smart_strategy(smart_list)) {
+            if (saved_pos != (int)trend::Pos::Flat || get_num(o, "qty", 0) > 0)
+                throw std::runtime_error("状态文件包含已移除智能策略的持仓 " + sym +
+                    "；请使用旧版管理至平仓后再升级。原状态文件保持不变。");
+            continue;
+        }
+
         // 配置里已经删掉的品种，落盘状态直接丢弃。
-        // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板（裸K 的用裸K 模板）
+        // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板
         const TrendConfig* cfg = nullptr;
         TrendConfig auto_cfg;
+        bool saved_uncertain = false;
+        const auto uncertain_err = o["open_uncertain"].get(saved_uncertain);
+        if (uncertain_err != simdjson::SUCCESS && uncertain_err != simdjson::NO_SUCH_FIELD)
+            throw std::runtime_error("open_uncertain 状态字段损坏，保留原文件并停止恢复");
         if (is_auto) {
-            // 波动顺势（V）与裸K（K）各认自己的模板；开关关着、持仓中的也按它管完
-            const bool keep_open = auto_tmpl || saved_pos != (int)trend::Pos::Flat;
-            if (smart_list == smart::kSegVol && vol_tmpl && keep_open) {
-                auto_cfg = *vol_tmpl;
-            } else if (smart_list == smart::kSegVol && !keep_open) {
-                continue;   // 智能模式已关，空仓的自动 bot 不再需要
-            } else if (auto_tmpl && smart_list == smart::kSegBare && bare_tmpl) {
-                auto_cfg = *bare_tmpl;
-            } else if (auto_tmpl) {
+            if (auto_tmpl) {
                 auto_cfg = *auto_tmpl;
-            } else if (saved_pos != (int)trend::Pos::Flat && smart_list == smart::kSegBare &&
-                       bare_tmpl) {
-                auto_cfg = *bare_tmpl;   // 智能模式已关，但裸K 仓位还在：按裸K 参数管到走完
-            } else if (saved_pos == (int)trend::Pos::Flat) {
-                continue;   // 智能模式已关，空仓的自动 bot 不再需要
+            } else if (saved_pos == (int)trend::Pos::Flat && !saved_uncertain) {
+                continue;
             }
-            // 没有模板但有持仓：默认参数的海龟接着管，至少止损线还在
+            // 没有模板但有持仓：默认参数的趋势跟踪接着管，至少止损线还在
             auto_cfg.symbol = sym;
             cfg = &auto_cfg;
         } else {
@@ -257,6 +262,12 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         TrendBot b;
         b.cfg   = *cfg;                       // 参数用最新配置，不用落盘的
         b.is_auto = is_auto;
+        bool uncertain = false;
+        if (o["open_uncertain"].get(uncertain) == simdjson::SUCCESS) b.open_uncertain = uncertain;
+        b.uncertain_client_id = get_str(o, "uncertain_client_id", "");
+        b.reserved_risk = get_num(o, "reserved_risk", 0);
+        b.reserved_margin = get_num(o, "reserved_margin", 0);
+        b.reserved_dir = (trend::Pos)(int)get_num(o, "reserved_dir", 0);
         b.state = (TrendBot::State)(int)get_num(o, "state", 0);
 
         const int pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
@@ -282,7 +293,7 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.open_vol_ratio     = get_num(o, "open_vol_ratio", std::numeric_limits<double>::quiet_NaN());
         b.open_box_atr       = get_num(o, "open_box_atr", std::numeric_limits<double>::quiet_NaN());
         b.open_taker         = get_num(o, "open_taker", std::numeric_limits<double>::quiet_NaN());
-        b.open_trigger       = (char)(int)get_num(o, "open_trigger", 0);
+
         b.smart_list         = smart_list;
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);

@@ -119,11 +119,11 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         }
     }
 
-    // ── 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一）──────────────────────────
+    // ── 趋势策略（趋势跟踪 / 抛物线SAR / 纯裸K 三选一）──────────────────────────
     static const std::set<std::string> trend_keys = {
         "symbol", "budget_usdt", "leverage", "interval",
         "strategy", "direction",
-        // ① 海龟
+        // ① 趋势跟踪
         "donchian_period", "atr_period", "atr_mult",
         "squeeze_box_atr", "breakout_vol_ratio", "trend_er_min",
         "lock_atr", "accel_exit", "vol_paced", "fail_exit", "fail_exit_short",
@@ -143,7 +143,7 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
         "mode", "allow_reverse", "reverse_needs_signal",
     };
     // ── 键名：trend_bots（v5.9.9 起）与 sar_bots（旧）──────────────────────
-    // 引擎跑三个策略，而旧键叫 sar_bots —— 配海龟的人会觉得自己配错了地方。
+    // 引擎跑三个策略，而旧键叫 sar_bots —— 配趋势跟踪的人会觉得自己配错了地方。
     // 但旧键是【对外契约】：改名会让在跑的部署"进程正常启动、一个品种都不跑"，
     // 所以旧键继续有效，只是提示一句。
     // ⚠ 两个键同时出现必须报错，不能合并也不能任选一个：合并会让同一品种被
@@ -230,18 +230,18 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                         c.symbol + "：旧键 mode=bar 已改为 strategy=bare_k，"
                         "入场改为收盘突破前一根高点，信号会变少");
                 } else if (!md.empty()) {
-                    strat = "turtle";
+                    strat = "trend_following";
                     out.warnings.push_back(
-                        c.symbol + "：旧键 mode=" + md + " 已迁移为 strategy=turtle，行为不变");
+                        c.symbol + "：旧键 mode=" + md + " 已迁移为 strategy=trend_following，行为不变");
                 } else {
-                    strat = "turtle";
+                    strat = "trend_following";
                 }
             }
             if      (strat == "psar" || strat == "parabolic_sar") c.rule.strategy = trend::Strategy::ParabolicSar;
             else if (strat == "bare_k" || strat == "bare" || strat == "bark") c.rule.strategy = trend::Strategy::BareK;
-            else if (strat == "turtle" || strat == "donchian")    c.rule.strategy = trend::Strategy::Turtle;
+            else if (strat == "trend_following" || strat == "turtle" || strat == "donchian")    c.rule.strategy = trend::Strategy::TrendFollowing;
             else {
-                err = c.symbol + "：strategy 只能是 turtle / psar / bare_k，收到 \"" + strat + "\"";
+                err = c.symbol + "：strategy 只能是 trend_following / psar / bare_k，收到 \"" + strat + "\"";
                 return false;
             }
 
@@ -294,26 +294,26 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
             }
 
             // ── 各策略自己的参数 ────────────────────────────────────────────
-            if (c.rule.strategy == trend::Strategy::Turtle) {
+            if (c.rule.strategy == trend::Strategy::TrendFollowing) {
                 c.rule.donchian_period = (int)get_num(so, "donchian_period", c.rule.donchian_period);
                 c.rule.atr_period      = (int)get_num(so, "atr_period", c.rule.atr_period);
                 c.rule.atr_mult        = get_num(so, "atr_mult", c.rule.atr_mult);
-                if (c.rule.donchian_period < 2) { err = c.symbol + " 海龟: donchian_period 至少为2"; return false; }
-                if (c.rule.atr_period < 2)      { err = c.symbol + " 海龟: atr_period 至少为2";      return false; }
+                if (c.rule.donchian_period < 2) { err = c.symbol + " 趋势跟踪: donchian_period 至少为2"; return false; }
+                if (c.rule.atr_period < 2)      { err = c.symbol + " 趋势跟踪: atr_period 至少为2";      return false; }
                 if (c.rule.atr_mult <= 0) {
-                    err = c.symbol + " 海龟: atr_mult 必须大于0（它是止损距离的倍数）";
+                    err = c.symbol + " 趋势跟踪: atr_mult 必须大于0（它是止损距离的倍数）";
                     return false;
                 }
                 // 横盘突破过滤：0 = 关
                 c.rule.squeeze_box_atr    = get_num(so, "squeeze_box_atr", c.rule.squeeze_box_atr);
                 c.rule.breakout_vol_ratio = get_num(so, "breakout_vol_ratio", c.rule.breakout_vol_ratio);
                 if (!(c.rule.squeeze_box_atr >= 0) || !(c.rule.breakout_vol_ratio >= 0)) {
-                    err = c.symbol + " 海龟: squeeze_box_atr / breakout_vol_ratio 不能为负（0 = 关）";
+                    err = c.symbol + " 趋势跟踪: squeeze_box_atr / breakout_vol_ratio 不能为负（0 = 关）";
                     return false;
                 }
                 c.rule.trend_er_min = get_num(so, "trend_er_min", c.rule.trend_er_min);
                 if (!(c.rule.trend_er_min >= 0 && c.rule.trend_er_min <= 1)) {
-                    err = c.symbol + " 海龟: trend_er_min 要在 0~1 之间（0 = 关）";
+                    err = c.symbol + " 趋势跟踪: trend_er_min 要在 0~1 之间（0 = 关）";
                     return false;
                 }
                 c.rule.lock_atr   = get_bool(so, "lock_atr", c.rule.lock_atr);
@@ -325,27 +325,27 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                 c.rule.max_chase_atr     = get_num(so, "max_chase_atr", c.rule.max_chase_atr);
                 c.rule.max_init_loss_pct = get_num(so, "max_init_loss_pct", c.rule.max_init_loss_pct);
                 if (!(c.rule.max_chase_atr >= 0)) {
-                    err = c.symbol + " 海龟: max_chase_atr 不能为负（0 = 关）";
+                    err = c.symbol + " 趋势跟踪: max_chase_atr 不能为负（0 = 关）";
                     return false;
                 }
                 if (!(c.rule.max_init_loss_pct >= 0 && c.rule.max_init_loss_pct < 100)) {
-                    err = c.symbol + " 海龟: max_init_loss_pct 要在 0~100 之间（0 = 关）";
+                    err = c.symbol + " 趋势跟踪: max_init_loss_pct 要在 0~100 之间（0 = 关）";
                     return false;
                 }
                 c.rule.expand_long     = get_bool(so, "expand_long", c.rule.expand_long);
                 c.rule.expand_long_min = get_num(so, "expand_long_min", c.rule.expand_long_min);
                 if (!(c.rule.expand_long_min > 0)) {
-                    err = c.symbol + " 海龟: expand_long_min 必须大于 0";
+                    err = c.symbol + " 趋势跟踪: expand_long_min 必须大于 0";
                     return false;
                 }
                 c.rule.breakeven       = get_bool(so, "breakeven", c.rule.breakeven);
                 c.rule.breakeven_start = get_num(so, "breakeven_start", c.rule.breakeven_start);
                 if (const char* e = trend::breakeven_config_error(c.rule)) {
-                    err = c.symbol + " 海龟: " + e + "（breakeven_start / roi_trail_start）";
+                    err = c.symbol + " 趋势跟踪: " + e + "（breakeven_start / roi_trail_start）";
                     return false;
                 }
                 if (c.rule.trend_er_min > 0 && !(c.rule.squeeze_box_atr > 0))
-                    out.warnings.push_back(c.symbol + " 海龟：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
+                    out.warnings.push_back(c.symbol + " 趋势跟踪：trend_er_min 只在 squeeze_box_atr > 0 时生效，现在不起作用");
             } else if (c.rule.strategy == trend::Strategy::ParabolicSar) {
                 c.rule.af_start = get_num(so, "af_start", c.rule.af_start);
                 c.rule.af_step  = get_num(so, "af_step",  c.rule.af_step);

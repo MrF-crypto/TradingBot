@@ -22,7 +22,7 @@ struct HeadlessConfig {
     std::string alert_webhook;           // 同 GUI 的关键事件提醒 webhook
     std::string state_path = "ccbot_state.json";   // 仓位运行时状态落盘路径，重启续跑用
     std::string log_path;                // 空=只输出到 stdout，不落盘
-    // 趋势策略（海龟 / 抛物线SAR / 纯裸K 三选一，见 TrendConfig::strategy）。
+    // 趋势策略（趋势跟踪 / 抛物线SAR / 纯裸K 三选一，见 TrendConfig::strategy）。
     //
     // JSON 键 v5.9.9 起是 "trend_bots"；旧键 "sar_bots" 继续有效（会提示一句），
     // 两个同时出现则报错。旧键是【对外契约】——直接改名会让在跑的部署升级后

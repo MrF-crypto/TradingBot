@@ -38,9 +38,9 @@ struct FakeMarket {
         int64_t delivery_ms = 4133404800000LL;
         // 第 140 根起价格整体乘 (1+pump)：一根K线里暴涨。
         // ⚠ 放在最后：上面几个字段有用例按位置花括号初始化
+        double last = 100;
         double  pump = 0;
         std::string utype = "";     // underlyingType；空 = 不发这个字段（带初值：clang 的花括号初始化不报缺字段）
-        double  tail_wide = 0;      // 最后 6 根高低各再放宽这么多（波动顺势：波动斜率变大）
     };
     std::map<std::string, Sym> syms;
     bool fail_info = false, fail_t24 = false;
@@ -61,56 +61,6 @@ struct FakeMarket {
     }
 
     // 一根K线（8 列：开盘时间、开高低收、量、收盘时间、成交额）
-    static std::string kline(int64_t open_ms, int64_t span_ms, double o, double h, double l, double c,
-                             double qv) {
-        return "[" + std::to_string(open_ms) + ",\"" + std::to_string(o) + "\",\"" + std::to_string(h) +
-               "\",\"" + std::to_string(l) + "\",\"" + std::to_string(c) + "\",\"1000\"," +
-               std::to_string(open_ms + span_ms - 1) + ",\"" + std::to_string(qv) + "\"]";
-    }
-
-    // 智能裸K 的 1h（埋伏结构）：201 根在 100 附近窄幅横盘，ATR 约 1%，实体箱体 99.5~100.5，
-    // 最后一根已收盘的收在 100.2（箱体内位置 0.7）
-    //   atr_x：振幅放大倍数，靠影线放大、箱体（实体）不变（4 倍时 1h ATR% 约 2.8%，超上限进不了池）
-    //   low_pos：最后一根收在 99.6（箱体内位置 0.1，进不了池）
-    //   drop：最后一根收到 95（跌破箱体下沿，待命刷新时移出）
-    struct Amb { double atr_x = 1; bool low_pos = false; bool drop = false; };
-    std::map<std::string, Amb> amb;
-    std::string bars1h(const Amb& a) const {
-        std::string s = "[";
-        for (int i = 0; i < 201; ++i) {
-            double o = (i % 2) ? 99.5 : 100.5, c = (i % 2) ? 100.5 : 99.5;
-            if (i == 199 && a.low_pos) c = 99.6;
-            if (i == 199 && a.drop)    c = 95;
-            const double w = 0.3 * (a.atr_x - 1);
-            const double h = std::max(o, c) + w, l = std::min(o, c) - w;
-            s += std::string(i ? "," : "") + kline(kNow - (200 - i) * 3600000LL, 3600000, o, h, l, c, 100000);
-        }
-        return s + "]";
-    }
-
-    // 智能裸K 的 5m（点火判定）：61 根，最后一根未收盘。已收盘的在 99.9 / 100.1 之间（ATR 约 0.6），
-    // 成交额各 1000；刚收盘那根（倒数第二）由 Ign 决定
-    //   fire：点火K线（开 100.2 收 101.4 高 101.5 低 100.1，成交额 qv）
-    //   red5：点火前 5 根连阴（下跌中继反抽，要被否决）
-    struct Ign { bool fire = false; double qv = 5000; bool red5 = false; };
-    std::map<std::string, Ign> ign;
-    int64_t bar_now = kNow;                // 当前（未收盘）5m 的开盘时间
-    std::map<std::string, int> k5_calls;   // 每个币的 5m K线被拉了几次
-    // 裸K 用例会走到下单：兜住其余所有接口（一律报错），绝不能漏到真实网络
-    bool catch_all = false;
-    int  orders = 0;
-    std::string bars5m(const std::string& sym) const {
-        const auto it = ign.find(sym);
-        const Ign g = (it == ign.end()) ? Ign{} : it->second;
-        std::string s = "[";
-        for (int i = 0; i < 61; ++i) {
-            double o = (i % 2) ? 99.9 : 100.1, c = (i % 2) ? 100.1 : 99.9, h = 100.3, l = 99.7, qv = 1000;
-            if (g.red5 && i >= 54 && i <= 58) { o = 100.3; c = 99.9; h = 100.4; l = 99.8; }
-            if (g.fire && i == 59) { o = 100.2; c = 101.4; h = 101.5; l = 100.1; qv = g.qv; }
-            s += std::string(i ? "," : "") + kline(bar_now - (60 - i) * 300000LL, 300000, o, h, l, c, qv);
-        }
-        return s + "]";
-    }
 
     std::string info() const {
         std::string b = "{\"symbols\":[";
@@ -133,7 +83,7 @@ struct FakeMarket {
         bool first = true;
         for (const auto& kv : syms) {
             b += std::string(first ? "" : ",") + "{\"symbol\":\"" + kv.first + "\",\"quoteVolume\":\"" +
-                 std::to_string(kv.second.quote_vol) + "\",\"priceChangePercent\":\"2.0\",\"lastPrice\":\"100\"}";
+                 std::to_string(kv.second.quote_vol) + "\",\"priceChangePercent\":\"2.0\",\"lastPrice\":\"" + std::to_string(kv.second.last) + "\"}";
             first = false;
         }
         return b + "]";
@@ -152,15 +102,13 @@ struct FakeMarket {
         const auto it = syms.find(sym);
         const double slope = (it == syms.end()) ? 0 : it->second.slope;
         const double pump  = (it == syms.end()) ? 0 : it->second.pump;
-        const double wide  = (it == syms.end()) ? 0 : it->second.tail_wide;
         std::string b = "[";
         double prev = 100;
         for (int i = 0; i < 201; ++i) {
             double c = 100 + slope * (i - 200) + ((i % 2) ? 0.6 : -0.6);
             if (i >= 140) c *= (1.0 + pump);
             // 最后 6 根已收盘的（194~199；200 是未收盘那根）
-            const double w = (i >= 194 && i <= 199) ? wide : 0;
-            const double h = std::max(prev, c) + 1 + w, l = std::min(prev, c) - 1 - w;
+            const double h = std::max(prev, c) + 1, l = std::min(prev, c) - 1;
             b += std::string(i ? "," : "") + "[" + std::to_string(kNow - (201 - i) * 3600000LL) + ",\"" +
                  std::to_string(prev) + "\",\"" + std::to_string(h) + "\",\"" + std::to_string(l) + "\",\"" +
                  std::to_string(c) + "\",\"1000\"]";
@@ -176,20 +124,6 @@ struct FakeMarket {
             if (path == "/fapi/v1/premiumIndex") { out.body = funding(); return true; }
             if (path.rfind("/fapi/v1/klines?symbol=", 0) == 0) {
                 const auto s = path.substr(23, path.find('&') - 23);
-                if (path.find("interval=5m") != std::string::npos) {
-                    {
-                        // 点火判定并发拉 5m（parallel_for 4 路）：计数要加锁，不然 TSan 报竞争
-                        static std::mutex m;
-                        std::lock_guard<std::mutex> lk(m);
-                        ++k5_calls[s];
-                    }
-                    out.body = fail_klines.count(s) ? "" : bars5m(s);
-                    return true;
-                }
-                if (path.find("interval=1h") != std::string::npos && amb.count(s)) {
-                    out.body = fail_klines.count(s) ? "" : bars1h(amb.at(s));
-                    return true;
-                }
                 out.body = fail_klines.count(s) ? "" : klines(s);
                 return true;
             }
@@ -204,13 +138,10 @@ struct FakeMarket {
                 out.body = fail_oi.count(s) ? "" : oi_hist(s);
                 return true;
             }
-            if (catch_all) {
-                if (path.find("/order") != std::string::npos) ++orders;
-                out.code = 400;
-                out.body = "{\"code\":-1121,\"msg\":\"test\"}";
-                return true;
-            }
-            return false;
+            // 测试钩子兜住所有未知请求，避免意外访问真实交易所。
+            out.code = 400;
+            out.body = "{}";
+            return true;
         });
     }
 };
@@ -280,6 +211,7 @@ static void basic_market(FakeMarket& m) {
 }
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     const std::string dir = (std::filesystem::temp_directory_path() / "ccg_smart_runner_test").string();
     std::filesystem::create_directories(dir);
 
@@ -298,11 +230,11 @@ int main() {
         const auto b = r.bot("UPAUSDT");
         check(b.is_auto && !b.armed && b.cfg.interval == "1h" &&
               b.cfg.rule.direction == trend::Direction::Both && b.cfg.use_disaster_stop &&
-              b.cfg.rule.lock_atr && b.cfg.rule.accel_exit,
-              "  自动 bot：未上膛、1h 海龟、多空、硬止损、出场优化");
+              b.cfg.rule.lock_atr && !b.cfg.rule.accel_exit && b.cfg.rule.following.enabled,
+              "  自动 bot：未上膛、1h 趋势跟踪、多空、硬止损、出场优化");
         check(b.smart_list == 'L' && b.smart_rank == 1 && b.smart_score > 0, "  名单信息写进了 bot");
         check(r.subs.count("UPAUSDT") == 1, "  通知应用层订阅价格");
-        check(!r.run->due(kNow + 60000), "扫完之后：下个整点前不再到点");
+        check(r.run->due(kNow + 60000), "扫完之后每分钟有轻量异动观察");
         check(r.run->due(kNow / 3600000 * 3600000 + 3600000 + 61000), "  下个整点后 1 分钟到点");
         check(has(r.all_logs(), "新增："), "日志：新增一行");
     }
@@ -356,7 +288,7 @@ int main() {
         check(r.subs.count("DNAUSDT") == 0, "  通知应用层退订");
         check(has(r.all_logs(), "移出：DNAUSDT"), "  日志写明移出原因");
 
-        // 币安 TradFi 永续（股票 / 大宗商品）：海龟也只做币。池里已有的空仓移出，不再加回
+        // 币安 TradFi 永续（股票 / 大宗商品）：趋势跟踪也只做币。池里已有的空仓移出，不再加回
         r.mk.syms["UPAUSDT"].utype = "EQUITY";
         r.mk.syms["UPBUSDT"].utype = "COIN";
         r.run->force();
@@ -428,28 +360,28 @@ int main() {
         m["BTCUSDT"].slope  = 0;
         auto c = r.cfg();
         c.dir_mode = smart::DirMode::Mixed;
-        c.weak_vol_ratio = 1.0;
+        c.tmpl.rule.following.short_vol_ratio = 1.0;
         r.run->set_config(c);
         const auto rep = r.run->run_once(kNow);
         check(rep.ok && rep.groups.size() == 4, "混合模式：名单分四组（强 / 弱 / 中 / 过热）");
         auto dir_of = [&](const std::string& s) { return r.bot(s).cfg.rule.direction; };
         auto seg_of = [&](const std::string& s) { return r.bot(s).smart_list; };
-        check(seg_of("UPAUSDT") == smart::kSegStrong && dir_of("UPAUSDT") == trend::Direction::LongOnly,
-              "  强势币：强势段、仅多");
-        check(seg_of("DNAUSDT") == smart::kSegWeak && dir_of("DNAUSDT") == trend::Direction::ShortOnly,
-              "  弱势币：弱势段、仅空");
+        check(seg_of("UPAUSDT") == smart::kSegStrong && dir_of("UPAUSDT") == trend::Direction::Both,
+              "  强势候选保留多空许可");
+        check(seg_of("DNAUSDT") == smart::kSegWeak && dir_of("DNAUSDT") == trend::Direction::Both,
+              "  弱势候选保留多空许可");
         check(seg_of("FLATUSDT") == smart::kSegMid && dir_of("FLATUSDT") == trend::Direction::Both,
               "  横盘币：中间段、多空（谁突破做谁）");
-        check(seg_of("PUMPUSDT") == smart::kSegHot && dir_of("PUMPUSDT") == trend::Direction::ShortOnly,
-              "  单日暴涨 90% 的币：过热段、仅空（不因强弱分高就去做多）");
-        check(r.bot("PUMPUSDT").cfg.rule.breakout_vol_ratio == 0,
-              "  过热段不要求量比（暴涨后的回落多是缩量阴跌）");
-        check(r.bot("DNAUSDT").cfg.rule.breakout_vol_ratio == 1.0,
-              "  弱势段用自己的量比设置（这里设成 1.0）");
+        check(seg_of("PUMPUSDT") == smart::kSegHot && dir_of("PUMPUSDT") == trend::Direction::Both,
+              "  历史暴涨 90% 的币：仅分组，不预测后续方向");
+        check(r.bot("PUMPUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio,
+              "  历史异动不覆盖多头量比规则");
+        check(r.bot("DNAUSDT").cfg.rule.following.short_vol_ratio == 1.0,
+              "  做空有独立量比参数，不由候选分组决定");
         check(r.bot("FLATUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio &&
               c.tmpl.rule.breakout_vol_ratio > 0,
               "  中间段照常要量比（横盘币缩量跌破多半是洗盘）");
-        check(has(rep.summary, "强势") && has(rep.summary, "过热"), "  汇总里按段列出");
+        check(has(rep.summary, "强势") && has(rep.summary, "异动"), "  汇总里按段列出");
 
         // 数据记录层：扫描快照与候选池事件
         const auto jdir = std::filesystem::path(dir) / "journal_m";
@@ -516,7 +448,7 @@ int main() {
         auto c2 = c; c2.dir_short = false;
         r2.run->set_config(c2);
         r2.run->run_once(kNow);
-        check(!r2.has_bot("DNAUSDT") && !r2.has_bot("PUMPUSDT"), "只勾做多：弱势段、过热段不加");
+        check(r2.has_bot("DNAUSDT") && r2.has_bot("PUMPUSDT") && r2.bot("PUMPUSDT").cfg.rule.direction == trend::Direction::LongOnly, "只勾做多：各段可观察，但实际只允许趋势多头");
         check(r2.bot("FLATUSDT").cfg.rule.direction == trend::Direction::LongOnly,
               "  中间段只做多（与勾选取交集）");
     }
@@ -528,7 +460,7 @@ int main() {
         r.run->set_config(r.cfg());
         r.mk.fail_info = true;
         r.run->run_once(kNow);
-        check(!r.run->due(kNow + 4 * 60000) && r.run->due(kNow + 5 * 60000),
+        check(!r.run->due(kNow + 30000) && r.run->due(kNow + 5 * 60000),
               "扫描失败：5 分钟后重试（不空等到下个整点）");
         // 5 分钟一试：连续 12 轮（一小时）
         for (int i = 1; i < 12; ++i) r.run->run_once(kNow + i * 5 * 60000LL);
@@ -580,292 +512,68 @@ int main() {
         check(r.eng->day_pnl().realized == -1, "状态里已有今天的数：以状态为准，不覆盖");
     }
 
-    // ── 智能裸K（埋伏点火）：建池 → 5m 收盘判定点火 → 开仓；待命刷新移出；每天重建 ──
-    {
-        Rig r(dir + "/bare.json");
-        r.mk.catch_all = true;
-        for (const char* s : {"AAAUSDT", "BBBUSDT", "CCCUSDT", "HOTUSDT", "LOWUSDT", "PAXGUSDT"}) {
-            r.mk.syms[s].slope = 0;
-            r.mk.amb[s] = {};
-        }
-        r.mk.amb["HOTUSDT"].atr_x   = 4;      // 1h ATR% 超 2%
-        r.mk.amb["LOWUSDT"].low_pos = true;   // 收在箱体下部
-        r.mk.syms["THINUSDT"] = {0, 2e6};     // 成交额 200 万 < 裸K 的 300 万
-        r.mk.amb["THINUSDT"] = {};
-        r.mk.syms["BTCUSDT"].slope = 0;
-        const std::string jdir = dir + "/journal_bare";
-        std::filesystem::remove_all(jdir);
-        r.run->set_journal(std::make_shared<Journal>(jdir));
-        std::set<std::string> watched;
-        r.run->on_watch = [&](const std::string& s, bool on) {
-            if (on) watched.insert(s); else watched.erase(s);
-        };
-        const SmartRunner::PriceFn price_of = [](const std::string&) { return 101.4; };
-        auto c = r.cfg();
-        c.strategy = smart::Strategy::BareK;
-        r.run->set_config(c);
-
-        const int64_t t0 = kNow + 60000;
-        auto rep = r.run->run_once(t0);
-        check(rep.ok && rep.groups.size() == 1 && rep.groups[0].rows.size() == 3,
-              "建埋伏池：3 个进池（ATR% 超限、箱体下部、成交额不足、黄金代币、BTC 都不进）");
-        check(watched == std::set<std::string>{"AAAUSDT", "BBBUSDT", "CCCUSDT"} && r.eng->get_bots().empty(),
-              "  埋伏池只订阅价格、不建 bot");
-        check(has(rep.summary, "建埋伏池") && has(rep.summary, "入池 3"), "  一行汇总：建池");
-        if (!rep.groups.empty() && !rep.groups[0].rows.empty()) {
-            const auto& row = rep.groups[0].rows[0];
-            check(row.status == "埋伏中" && row.box_pos > 0.6 && row.kappa > 0, "  名单：状态、κ、箱体内位置");
-        }
-        check(!r.run->due(t0 + 60000) && r.run->due(kNow / 3600000 * 3600000 + 3600000 + 60000),
-              "  下一次：下一根 1h 收盘后 1 分钟");
-
-        // 新的 5m 收盘：AAA 点火，BBB 点火但前 5 根连阴（否决），CCC 没动静
-        r.mk.bar_now = kNow + 300000;
-        r.mk.ign["AAAUSDT"].fire = true;
-        r.mk.ign["BBBUSDT"].fire = true;
-        r.mk.ign["BBBUSDT"].red5 = true;
-        r.run->bare_tick(kNow + 300000 + 1000, price_of);
-        check(r.mk.k5_calls["AAAUSDT"] == 0, "收盘后不到 3 秒：先不判（交易所K线可能还没定稿）");
-        r.run->bare_tick(kNow + 300000 + 3500, price_of);
-        check(r.mk.k5_calls["AAAUSDT"] == 1 && r.mk.k5_calls["CCCUSDT"] == 1, "收盘后 3 秒：池里每个币拉一次 5m");
-        check(r.has_bot("AAAUSDT") && !r.has_bot("BBBUSDT") && !r.has_bot("CCCUSDT"),
-              "  AAA 点火开仓；BBB 前 5 根连阴被否决；CCC 没点火");
-        {
-            const auto b = r.bot("AAAUSDT");
-            check(b.is_auto && b.smart_list == smart::kSegBare && b.cfg.interval == "1h" &&
-                      b.cfg.rule.direction == trend::Direction::LongOnly && b.retiring &&
-                      std::fabs(b.cfg.rule.atr_mult - 3.0) < 1e-9,
-                  "  bot：1h、仅多、3×ATR 追踪、待移出（自己不开仓，只认点火）");
-            check(b.smart_trigger == 'I' && r.mk.orders >= 1, "  按点火直接下单（触发方式记为点火）");
-        }
-        check(has(r.all_logs(), "AAAUSDT 点火") && has(r.all_logs(), "止损 @100.1"),
-              "  日志：点火、止损在点火K线最低点");
-        r.run->bare_tick(kNow + 300000 + 6500, price_of);
-        check(r.mk.k5_calls["CCCUSDT"] == 1, "同一根 5m 每个币只判一次");
-
-        // 下单在测试里被拒，bot 一直空仓：下一拍删掉，币留在池里
-        r.run->bare_tick(kNow + 300000 + 9500, price_of);
-        check(!r.has_bot("AAAUSDT") && r.run->watching("AAAUSDT"), "没开成的空仓 bot 删掉，币留在埋伏池");
-        {
-            const auto rows = r.run->bare_rows(kNow + 300000 + 9500, price_of);
-            bool ign_today = false;
-            for (const auto& row : rows) if (row.symbol == "AAAUSDT") ign_today = row.status == "今日已点火";
-            check(ign_today, "  名单状态：今日已点火");
-        }
-
-        // 记录层：否决的写进 filter（量比够了才记），建池快照写进 ambush
-        bool amb_file = false, veto = false;
-        for (const auto& e : std::filesystem::directory_iterator(jdir)) {
-            const auto n = e.path().filename().string();
-            if (n.rfind("ambush-", 0) == 0) amb_file = true;
-            if (n.rfind("filter-", 0) == 0) {
-                std::ifstream f(e.path());
-                std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                veto = has(all, "BBBUSDT") && has(all, "点火否决") && has(all, "连阴") && !has(all, "CCCUSDT");
-            }
-        }
-        check(amb_file, "记录层：ambush-日期.csv 写了埋伏池快照");
-        check(veto, "  量比达标却被否决的写进 filter（没动静的不记）");
-
-        // 待命刷新：CCC 跌破箱体下沿 → 移出；汇总带上这一小时的点火判定
-        r.mk.amb["CCCUSDT"].drop = true;
-        rep = r.run->run_once(kNow / 3600000 * 3600000 + 3600000 + 60000);
-        check(rep.ok && has(rep.summary, "待命刷新") && has(rep.summary, "埋伏池 2") &&
-                  !r.run->watching("CCCUSDT") && !watched.count("CCCUSDT"),
-              "待命刷新：跌破箱体下沿的移出、退订");
-        check(has(rep.summary, "点火判定 3 次") && has(rep.summary, "被否决 1") && has(rep.summary, "点火 1") &&
-                  has(rep.summary, "开仓 1"),
-              "  汇总：点火判定 / 被否决 / 点火 / 开仓，实际：" + rep.summary);
-        check(has(r.all_logs(), "CCCUSDT（跌破箱体下沿"), "  日志写明移出原因");
-
-        // 第二天 UTC 0 点后：清空重建
-        r.mk.amb["CCCUSDT"].drop = false;
-        const int64_t next_day = (kNow / 86400000 + 1) * 86400000 + 60000;
-        rep = r.run->run_once(next_day);
-        check(rep.ok && has(rep.summary, "建埋伏池") && r.run->watching("CCCUSDT"),
-              "每天 UTC 0 点（北京 08:00）后清空重建：CCC 又回来了");
-
-        // 切回海龟：埋伏池清空、退订
-        c.strategy = smart::Strategy::Turtle;
-        r.run->set_config(c);
-        r.run->run_once(next_day + 3600000);
-        check(!r.run->watching("AAAUSDT") && watched.empty(), "切回海龟：埋伏池清空、退订");
-        std::filesystem::remove_all(jdir);
-    }
-
-    // ── 持仓中改设置：三套的出场参数都跟着换，止损线、周期、杠杆不动 ──────────
+    // 持仓中的趋势跟踪更新出场设置；不改周期、方向、杠杆及已有止损。
     {
         Rig r(dir + "/hold_exit.json");
         auto c = r.cfg();
-        c.strategy = smart::Strategy::BareK;
-        c.bare.roi_trail = true; c.bare.roi_start = 15; c.bare.roi_back = 5;
-        c.bare.lock_atr = true;  c.bare.accel_exit = true; c.bare.atr_mult = 3;
-        c.tmpl.rule.roi_trail = false; c.tmpl.rule.breakeven = false; c.tmpl.rule.fail_exit = false;
-        c.vol.rev_loss = false; c.vol.max_reverses = 3;
-        r.run->set_config(c);
-        auto hold = [&](const TrendConfig& cfg, char list) {
-            TrendBot h;
-            h.cfg = cfg;
-            h.is_auto = true;
-            h.smart_list = list;
-            h.st.pos = trend::Pos::Long;
-            h.st.entry_price = 100; h.st.peak = 106; h.st.stop = 99;
-            h.qty = 1;
-            r.eng->restore_bot(h);
-        };
-        hold(smart::make_bare_bot_config(c, "BAREUSDT"), smart::kSegBare);
-        hold(smart::make_bot_config(c, "TURTUSDT", trend::Direction::LongOnly, smart::kSegStrong),
-             smart::kSegStrong);
-        hold(smart::make_vol_bot_config(c, "VOLXUSDT"), smart::kSegVol);
-        TrendConfig manual = smart::make_bot_config(c, "MANUUSDT", trend::Direction::Both, smart::kSegMid);
-        {
-            TrendBot h;
-            h.cfg = manual; h.st.pos = trend::Pos::Long; h.st.entry_price = 100;
-            h.st.peak = 100; h.st.stop = 95; h.qty = 1;
-            r.eng->restore_bot(h);   // 手动 bot：不归智能模式管
-        }
-
-        c.bare.roi_start = 10; c.bare.roi_back = 2; c.bare.lock_atr = false; c.bare.atr_mult = 2.5;
-        c.tmpl.rule.roi_trail = true; c.tmpl.rule.roi_trail_start = 12; c.tmpl.rule.roi_trail_back = 3;
-        c.tmpl.rule.breakeven = true; c.tmpl.rule.breakeven_start = 6; c.tmpl.rule.fail_exit = true;
+        TrendBot held;
+        held.cfg = smart::make_bot_config(c, "HELDUSDT", trend::Direction::LongOnly, smart::kSegStrong);
+        held.is_auto = true;
+        held.smart_list = smart::kSegStrong;
+        held.st.pos = trend::Pos::Long;
+        held.st.entry_price = 100; held.st.peak = 106; held.st.stop = 99; held.qty = 1;
+        r.eng->restore_bot(held);
+        TrendBot manual = held;
+        manual.cfg.symbol = "MANUUSDT"; manual.is_auto = false;
+        r.eng->restore_bot(manual);
+        c.tmpl.rule.roi_trail = true; c.tmpl.rule.roi_trail_start = 12;
+        c.tmpl.rule.roi_trail_back = 3; c.tmpl.rule.breakeven = true;
+        c.tmpl.rule.breakeven_start = 6; c.tmpl.rule.atr_mult = 2.5;
         c.tmpl.leverage = 5; c.tmpl.interval = "4h";
-        c.vol.rev_loss = true; c.vol.max_reverses = 1; c.vol.interval = "5m";
         r.run->set_config(c);
-
-        const auto b = r.bot("BAREUSDT");
-        check(b.cfg.rule.roi_trail && std::fabs(b.cfg.rule.roi_trail_start - 10) < 1e-9 &&
-                  std::fabs(b.cfg.rule.roi_trail_back - 2) < 1e-9 && !b.cfg.rule.lock_atr &&
-                  b.cfg.rule.accel_exit && std::fabs(b.cfg.rule.atr_mult - 2.5) < 1e-9,
-              "持仓中改设置：裸K 追踪止盈 / 锁定 ATR / ATR 倍数跟着换");
-        check(b.st.pos == trend::Pos::Long && std::fabs(b.st.stop - 99) < 1e-9 && b.qty == 1 &&
-                  std::fabs(b.st.entry_price - 100) < 1e-9,
-              "  仓位、开仓价、止损线不动");
-        const auto t = r.bot("TURTUSDT");
-        check(t.cfg.rule.roi_trail && std::fabs(t.cfg.rule.roi_trail_start - 12) < 1e-9 &&
-                  t.cfg.rule.breakeven && t.cfg.rule.fail_exit &&
-                  t.cfg.rule.direction == trend::Direction::LongOnly,
-              "  海龟：追踪止盈 / 保本 / 假突破跟着换，方向不动");
-        check(t.cfg.leverage != 5 && t.cfg.interval != "4h" && std::fabs(t.st.stop - 99) < 1e-9,
-              "  海龟：杠杆、周期不跟着换（持仓中换了会乱）");
-        const auto v = r.bot("VOLXUSDT");
-        check(v.cfg.rule.vf_rev_loss && v.cfg.rule.max_consecutive_reverses == 1 && v.cfg.interval != "5m",
-              "  波动顺势：反手触发、连续反手上限跟着换，周期不动");
-        check(!r.bot("MANUUSDT").cfg.rule.breakeven, "  手动 bot 不动");
-        check(has(r.all_logs(), "3 个持仓换上新的出场参数"), "  日志一行");
+        const auto b = r.bot("HELDUSDT");
+        check(b.cfg.rule.roi_trail && b.cfg.rule.breakeven &&
+              std::fabs(b.cfg.rule.atr_mult - 2.5) < 1e-9,
+              "趋势跟踪持仓即时更新出场参数");
+        check(b.cfg.interval == "1h" && b.cfg.leverage != 5 &&
+              b.cfg.rule.direction == trend::Direction::LongOnly &&
+              b.st.pos == trend::Pos::Long && b.qty == 1 && b.st.stop == 99 && b.st.entry_price == 100,
+              "已有持仓、止损、方向、杠杆和周期保留");
+        check(!r.bot("MANUUSDT").cfg.rule.breakeven, "手动 bot 不被智能配置覆盖");
+        check(has(r.all_logs(), "1 个持仓换上新的出场参数"), "更新记录一条汇总");
         const auto n = r.logs.size();
         r.run->housekeep(kNow);
-        check(r.logs.size() == n || !has(r.logs.back(), "出场参数"), "  没再改：不重复记日志");
+        check(r.logs.size() == n, "配置未变时不重复记录");
+        c.enabled = false;
+        r.run->set_config(c);
+        r.run->housekeep(kNow);
+        check(r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").qty == 1,
+              "关闭智能模式保留持仓并标为待移出");
+        c.enabled = true;
+        r.run->set_config(c);
+        check(!r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").st.stop == 99,
+              "重新启用会接回持仓，撤销待移出而不改变保护");
     }
 
-    // ── 只跑一套：海龟还有持仓时裸K 不启动；空仓的海龟 bot 与候选池立刻清掉 ──────
+    // Event observations share the production scheduler but do not repeatedly scan candles.
     {
-        Rig r(dir + "/switch.json");
-        r.mk.catch_all = true;
-        basic_market(r.mk);
-        r.mk.amb["FLATUSDT"] = {};   // 裸K 启动后要有一个能进埋伏池的
-        r.run->set_config(r.cfg());
-        r.run->run_once(kNow);                               // 海龟：建了 4 个自动 bot（空仓）
-        // 再放一笔持仓中的海龟自动 bot
-        TrendBot held;
-        held.cfg = smart::make_bot_config(r.cfg(), "HELDUSDT", trend::Direction::Both, smart::kSegMid);
-        held.is_auto = true;
-        held.smart_list = smart::kSegMid;
-        held.smart_rank = 3;
-        held.st.pos = trend::Pos::Long;
-        held.st.entry_price = 100; held.st.peak = 100; held.st.stop = 94;
-        held.qty = 1;
-        const auto held_id = r.eng->restore_bot(held);
-        check(!held_id.empty() && smart_holdings(r.eng->get_bots(), smart::Strategy::Turtle) == 1 &&
-                  smart_holdings(r.eng->get_bots(), smart::Strategy::BareK) == 0,
-              "smart_holdings：按策略数持仓（海龟 1 笔、裸K 0）");
-
-        std::set<std::string> watched;
-        r.run->on_watch = [&](const std::string& s, bool on) {
-            if (on) watched.insert(s); else watched.erase(s);
-        };
-        auto c = r.cfg();
-        c.strategy = smart::Strategy::BareK;
+        Rig r(dir + "/wake.json"); basic_market(r.mk);
+        auto c = r.cfg(); c.event_move_atr = 1; c.event_min_move_pct = 1;
         r.run->set_config(c);
-        auto rep = r.run->run_once(kNow + 3600000);
-        check(!rep.ok && has(rep.summary, "等海龟持仓走完") && watched.empty(),
-              "切到裸K 时海龟还有持仓：裸K 不扫描、不建种子池");
-        check(r.eng->get_bots().size() == 1 && r.has_bot("HELDUSDT"),
-              "  空仓的海龟 bot 立刻删掉，持仓的留着");
-        check(r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").smart_rank == 0,
-              "  持仓的标待移出：管到平仓、不再开新仓（名次清零，界面显示待移出）");
-        check(r.run->watching("AAAUSDT") == false && has(r.all_logs(), "还有 1 笔海龟持仓"),
-              "  日志说明为什么没启动");
-        const auto warns = std::count_if(r.logs.begin(), r.logs.end(),
-                                         [](const std::string& l) { return has(l, "W:智能模式：还有"); });
-        r.run->force();
-        r.run->run_once(kNow + 3600000 + 60000);
-        const auto warns2 = std::count_if(r.logs.begin(), r.logs.end(),
-                                          [](const std::string& l) { return has(l, "智能模式：还有"); });
-        check(warns == 1 && warns2 == 1, "  同样的情况不重复提示（告警只一次）");
-        r.run->bare_tick(kNow + 3600000 + 65000, [](const std::string&) { return 0.0; });
-        check(r.eng->get_bots().size() == 1, "  实时部分同样不动");
-
-        // 这笔走完（这里直接删掉模拟手动平仓后移除）：裸K 启动
-        r.eng->remove_bot(held_id);
-        r.run->force();
-        rep = r.run->run_once(kNow + 3600000 + 120000);
-        check(rep.ok && !watched.empty() && has(r.all_logs(), "海龟持仓已全部走完，裸K开始运行"),
-              "海龟持仓走完：裸K 开始运行");
-    }
-
-    // ── 波动顺势：波动斜率大的进名单建 bot，连续 2 轮不在名单、空仓才移出 ─────────
-    {
-        Rig r(dir + "/v.json");
-        r.mk.syms["HOTUSDT"].tail_wide  = 3;   // 最后 6 根真实波幅约 2.6 → 8.6：斜率约 2.5
-        r.mk.syms["CALMUSDT"].tail_wide = 0;   // 斜率约 1
-        r.mk.syms["BTCUSDT"].tail_wide  = 3;   // 内置排除
-        auto c = r.cfg();
-        c.strategy = smart::Strategy::VolFollow;
-        c.vol.interval = "15m";
-        c.vol.atr_pct_min = 50;   // 波动率这条放到够不着：只测斜率那条
-        r.run->set_config(c);
-        auto rep = r.run->run_once(kNow);
-        check(rep.ok && rep.added == 1 && r.has_bot("HOTUSDT") && !r.has_bot("CALMUSDT") && !r.has_bot("BTCUSDT"),
-              "波动顺势：斜率大的建 bot，平的不建，BTC 内置排除: " + rep.summary);
-        const auto b = r.bot("HOTUSDT");
-        check(b.is_auto && b.smart_list == smart::kSegVol && b.smart_rank == 1 && b.smart_score > 1.5 &&
-                  b.cfg.interval == "15m" && b.cfg.rule.strategy == trend::Strategy::VolFollow &&
-                  b.cfg.rule.reverse == trend::ReverseMode::Immediate,
-              "  bot：名单代码 V、第 1 名、15m 波动顺势、立即反手");
-        check(rep.groups.size() == 1 && rep.groups[0].code == smart::kSegVol && rep.groups[0].rows.size() == 1 &&
-                  rep.groups[0].rows[0].slope > 1.5,
-              "  名单页：一份「波动名单」");
-        check(!r.run->due(kNow + 60000) && r.run->due(kNow / 900000 * 900000 + 900000 + 5000),
-              "  下一次：下一根 15m 收盘后 5 秒");
-        check(smart_holdings(r.eng->get_bots(), smart::Strategy::VolFollow) == 0, "  smart_holdings 认得波动顺势");
-
-        // 波动回落：第一轮只计数，第二轮（空仓）移出
-        r.mk.syms["HOTUSDT"].tail_wide = 0;
-        r.run->force();
-        rep = r.run->run_once(kNow + 900000);
-        check(rep.ok && r.has_bot("HOTUSDT") && r.bot("HOTUSDT").smart_rank == 0,
-              "  第一轮不在名单：留着，名次清零");
-        // 这一轮拉不到它的K线：没拿到 ≠ 不合格，不计数
-        r.mk.fail_klines.insert("HOTUSDT");
-        r.run->force();
-        rep = r.run->run_once(kNow + 1800000);
-        check(r.has_bot("HOTUSDT"), "  K线拉不到的那一轮不算");
-        r.mk.fail_klines.clear();
-        r.run->force();
-        rep = r.run->run_once(kNow + 2700000);
-        check(rep.removed == 1 && !r.has_bot("HOTUSDT") && has(r.all_logs(), "波动回落"),
-              "  连续 2 轮不在名单、空仓：移出");
-
-        // 切到海龟：空仓的波动顺势 bot 删掉
-        r.mk.syms["HOTUSDT"].tail_wide = 3;
-        r.run->force();
-        r.run->run_once(kNow + 3600000);
-        check(r.has_bot("HOTUSDT"), "  波动又起来：重新加回");
-        auto t = r.cfg();
-        r.run->set_config(t);
-        r.run->run_once(kNow + 3600000 + 60000);
-        check(!r.has_bot("HOTUSDT") || r.bot("HOTUSDT").cfg.rule.strategy == trend::Strategy::Turtle,
-              "  切到海龟：空仓的波动顺势 bot 删掉");
+        const int64_t t = kNow / 3600000 * 3600000 + 120000;
+        const auto first = r.run->run_once(t);
+        for (int n = 1; n <= 5; ++n) {
+            const auto idle = r.run->run_once(t + n * 60000);
+            check(idle.at_ms == first.at_ms, "lightweight unchanged polls preserve last full-scan report");
+        }
+        r.mk.syms["UPAUSDT"].last = 110;
+        r.mk.syms["DNAUSDT"].last = 90;
+        const auto event = r.run->run_once(t + 360000);
+        check(event.ok && event.at_ms == t + 360000 && has(r.all_logs(), "双向价格异动"),
+              "simultaneous directional events cause one real merged rescan");
+        r.mk.syms["UPAUSDT"].last = 130;
+        const auto cooled = r.run->run_once(t + 420000);
+        check(cooled.at_ms == event.at_ms, "additional event during cooldown does not repeat full scan");
     }
 
     // ── 池状态与当日盈亏落盘 ─────────────────────────────────────────────────

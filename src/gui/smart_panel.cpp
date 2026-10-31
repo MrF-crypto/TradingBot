@@ -3,7 +3,6 @@
 // 这里只负责"什么时候调"和"怎么显示"。
 #include "gui/main_window.h"
 
-#include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
@@ -23,7 +22,6 @@
 #include <QSaveFile>
 #include <QScrollArea>
 #include <QSpinBox>
-#include <QStackedWidget>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QVBoxLayout>
@@ -87,13 +85,6 @@ void MainWindow::startSmartRunner() {
         QMetaObject::invokeMethod(this, [this, s]() { unsubscribeIfUnused(s); },
                                   Qt::QueuedConnection);
     };
-    // 智能裸K 的埋伏池进 / 出：只订阅价格，不建 bot（价格是全市场一次拉，多订不多花请求）
-    smart_->on_watch = [this](const std::string& s, bool on) {
-        QMetaObject::invokeMethod(this, [this, s, on]() {
-            if (on) { if (ticker_) ticker_->subscribe(s); }
-            else    unsubscribeIfUnused(s);
-        }, Qt::QueuedConnection);
-    };
     smart_->set_journal(journal_);
     smart_->load();
     // 状态文件里没有今天的数（升级后第一次运行）：用成交明细补，亏损限额不从 0 算
@@ -127,20 +118,6 @@ void MainWindow::smartTick() {
         });
         return;
     }
-    // 智能裸K 的点火检测：每拍一次（新的 5m 收盘了就判定池里的币，点火就建 bot 开仓）
-    if (smartCfg_.enabled && smartCfg_.strategy == smart::Strategy::BareK &&
-        !bareBusy_.exchange(true)) {
-        auto sr = smart_;
-        auto tk = ticker_;   // 副本：后台线程不碰成员（重连会换掉它）
-        run_async([this, sr, tk, now]() {
-            try {
-                sr->bare_tick(now, [tk](const std::string& s) {
-                    return tk ? tk->mark_price(s) : 0.0;
-                });
-            } catch (...) {}
-            bareBusy_.store(false);
-        });
-    }
     // 轻量维护每分钟一次：关闭后清空仓自动 bot、当日盈亏落盘
     if (slowTickCount_ % 20 == 7 && !smartBusy_.load()) {
         smart_->housekeep(now);
@@ -161,20 +138,6 @@ void MainWindow::refreshSmartBadge() {
     QString text, color = "#8b949e", tip;
     if (!smartCfg_.enabled) {
         text = autos > 0 ? QString("智能：关（%1 个待走完）").arg(autos) : QString("智能：关");
-    } else if (smartCfg_.strategy == smart::Strategy::BareK) {
-        int seeds = 0;
-        if (smart_) {
-            const auto rep = smart_->last_report();
-            if (!rep.groups.empty()) seeds = (int)rep.groups.front().rows.size();
-        }
-        text = QString("智能裸K 埋伏 %1 · 持仓 %2").arg(seeds).arg(holding);
-        color = "#58a6ff";
-        if (smart_ && smartBusy_.load()) text += " · 扫描中";
-    } else if (smartCfg_.strategy == smart::Strategy::VolFollow) {
-        text = QString("智能波动顺势 %1 监控 %2 · 持仓 %3")
-                   .arg(QString::fromStdString(smartCfg_.vol.interval)).arg(autos).arg(holding);
-        color = "#58a6ff";
-        if (smart_ && smartBusy_.load()) text += " · 扫描中";
     } else {
         text = QString("智能 监控 %1 · 持仓 %2").arg(autos).arg(holding);
         color = "#58a6ff";
@@ -201,10 +164,7 @@ void MainWindow::refreshSmartBadge() {
                                      "padding:0 8px;}").arg(color));
 }
 
-// 智能模式弹窗。两套策略（海龟 1h / 裸K 埋伏点火）二选一，选哪套就只显示哪套的设置页与名单页，
-// 另一套的项不出现。两套共用的设置（硬门槛、仓位、亏损限额）两页各放一份控件，
-// 切换时把当前页的值抄到另一页，保存时取正在显示的那一页——所以改一边另一边跟着变。
-// 顶部的切换只是换显示，按「保存」才真正切策略
+// 智能模式只保留趋势跟踪：设置、候选名单与账户风控。
 void MainWindow::openSmartDialog() {
     QDialog dlg(this);
     dlg.setWindowTitle("智能模式");
@@ -212,67 +172,12 @@ void MainWindow::openSmartDialog() {
     auto* root = new QVBoxLayout(&dlg);
     const smart::Config c0 = smartCfg_;
 
-    // ── 顶部：启用 + 策略切换 + 暂停开新仓（这三项两套共用，只放一份）──────────
     auto* top = new QHBoxLayout();
     auto* cbEnable = new QCheckBox("启用");
     cbEnable->setChecked(c0.enabled);
-    cbEnable->setToolTip("扫描全市场、自动建 bot。两套策略共用这一个开关，同一时刻只跑一套。");
+    cbEnable->setToolTip("扫描全市场、自动建 bot。使用趋势跟踪规则等待通道突破。");
     top->addWidget(cbEnable);
-    top->addSpacing(16);
-    top->addWidget(new QLabel("策略："));
-    auto* btnTurtle = new QPushButton("海龟 1h");
-    auto* btnBare   = new QPushButton("裸K 埋伏点火");
-    auto* btnVol    = new QPushButton("波动顺势");
-    btnTurtle->setToolTip("1h 打分排名 → 候选池 → 常驻海龟 bot 等突破");
-    btnBare->setToolTip("只做多：1h 结构建埋伏池（每天 08:00）→ 5m 收盘判定点火 → 点火K线低点止损");
-    btnVol->setToolTip("波动率大或波动斜率大的币进名单 → 看正在走的这根顺势开 → 方向反了亏损就反手");
-    auto* stratGroup = new QButtonGroup(&dlg);
-    stratGroup->setExclusive(true);
-    stratGroup->addButton(btnTurtle, 0);
-    stratGroup->addButton(btnBare, 1);
-    stratGroup->addButton(btnVol, 2);
-    for (auto* b : {btnTurtle, btnBare, btnVol}) {
-        b->setCheckable(true);
-        b->setStyleSheet("QPushButton{background:#21262d;color:#8b949e;padding:4px 16px;"
-                         "border:1px solid #30363d;border-radius:4px;}"
-                         "QPushButton:checked{background:#1f6feb;color:#ffffff;border-color:#1f6feb;}");
-        top->addWidget(b);
-    }
-    // 页码 ↔ 策略（按钮 id、设置页、名单页都按这个顺序）
-    auto idx_of = [](smart::Strategy s) {
-        return s == smart::Strategy::BareK ? 1 : s == smart::Strategy::VolFollow ? 2 : 0;
-    };
-    auto strat_of = [](int i) {
-        return i == 1 ? smart::Strategy::BareK : i == 2 ? smart::Strategy::VolFollow : smart::Strategy::Turtle;
-    };
-    auto name_of = [](smart::Strategy s) {
-        return s == smart::Strategy::BareK ? QString("裸K")
-             : s == smart::Strategy::VolFollow ? QString("波动顺势") : QString("海龟");
-    };
-    stratGroup->button(idx_of(c0.strategy))->setChecked(true);
-    // 只跑一套：当前这套还有持仓时，另外两套的按钮置灰。走完（或在主表手动平仓）才能切
-    auto holdings_now = [this](smart::Strategy s) {
-        return trend_engine_ ? smart_holdings(trend_engine_->get_bots(), s) : 0;
-    };
-    auto* lockNote = new QLabel();
-    lockNote->setStyleSheet("color:#d29922;font-size:11px;");
-    lockNote->setVisible(false);
-    {
-        const int hold = holdings_now(c0.strategy);
-        if (hold > 0) {
-            const QString msg = QString("还有 %1 笔%2持仓，走完才能切换（也可以在主表手动平仓）")
-                                    .arg(hold).arg(name_of(c0.strategy));
-            for (int i = 0; i < 3; ++i) {
-                if (i == idx_of(c0.strategy)) continue;
-                stratGroup->button(i)->setEnabled(false);
-                stratGroup->button(i)->setToolTip(msg);
-            }
-            lockNote->setText(msg);
-            lockNote->setVisible(true);
-        }
-    }
-    top->addSpacing(8);
-    top->addWidget(lockNote);
+    top->addWidget(new QLabel("策略：趋势跟踪"));
     top->addStretch();
     auto* cbPause = new QCheckBox("暂停开新仓");
     cbPause->setChecked(c0.pause_new);
@@ -325,7 +230,6 @@ void MainWindow::openSmartDialog() {
         l->setStyleSheet("color:#8b949e;font-size:11px;");
         return l;
     };
-    // 收益率追踪止盈那一行（海龟模板、裸K 出场各一份）
     auto roiRowOf = [&dlg](bool on, double start, double back) {
         auto* cb = new QCheckBox("收益率追踪止盈");
         cb->setChecked(on);
@@ -359,9 +263,7 @@ void MainWindow::openSmartDialog() {
         return scroll;
     };
 
-    // ── 每页一份的门槛 / 仓位 / 风控控件 ───────────────────────────────────
-    // vol / age / chg（成交额、上线天数、24h 涨跌）两套各有各的值（裸K 的门槛更严）；
-    // 其余是两套共用的同一个值，切换页面时抄过去
+    // ── 门槛 / 仓位 / 风控控件 ───────────────────────────────────
     struct Shared {
         QDoubleSpinBox *vol = nullptr, *chg = nullptr, *fund = nullptr;
         QSpinBox*       age = nullptr;
@@ -378,15 +280,15 @@ void MainWindow::openSmartDialog() {
         s.vol->setToolTip("24h 成交额下限。");
         s.age = ispin(0, 3650, age, " 天");
         s.age->setToolTip("太新的币K线不够，ATR 与箱体都算不准。");
-        s.chg = dspin(1, 1000, 5, 0, chg, " %");
-        s.chg->setToolTip("24h 涨跌幅绝对值超过这个不新加：已经走完一大段的不追，在跌的不埋伏。");
+        s.chg = dspin(0, 1000, 5, 0, chg, " %", "关");
+        s.chg->setToolTip("24h 涨跌幅绝对值超过这个不新加：已经走完一大段的不追。");
         s.fund = dspin(0.001, 5, 0.01, 3, c0.max_abs_funding, " %");
         s.fund->setToolTip("资金费率绝对值（每 8 小时）超过这个不新加：太拥挤，或被操纵。");
         QStringList bl;
         for (const auto& x : c0.blacklist) bl << QString::fromStdString(x);
         s.black = new QLineEdit(bl.join(", "));
         s.black->setPlaceholderText("例如 XXXUSDT, YYYUSDT");
-        s.black->setToolTip("永远不进名单 / 埋伏池。已有的自动 bot 空仓时会被移除，持仓中的等走完。\n"
+        s.black->setToolTip("永远不进名单。已有的自动 bot 空仓时会被移除，持仓中的等走完。\n"
                             "BTC、ETH、稳定币已内置排除。");
         s.size = new QComboBox();
         s.size->addItem("固定名义", (int)TrendConfig::SizeMode::Notional);
@@ -406,21 +308,10 @@ void MainWindow::openSmartDialog() {
         s.flt->setToolTip("全部持仓的浮动盈亏合计 ≤ −限额 就停开新仓，回落后自动恢复。");
         return s;
     };
-    auto copyShared = [](const Shared& a, const Shared& b) {
-        b.fund->setValue(a.fund->value());
-        b.black->setText(a.black->text());
-        b.size->setCurrentIndex(a.size->currentIndex());
-        b.bud->setValue(a.bud->value());
-        b.risk->setValue(a.risk->value());
-        b.lev->setValue(a.lev->value());
-        b.buf->setValue(a.buf->value());
-        b.day->setValue(a.day->value());
-        b.flt->setValue(a.flt->value());
-    };
     auto addGateRows = [](QFormLayout* f, const Shared& s) {
         f->addRow("24h 成交额 ≥", s.vol);
         f->addRow("上线天数 ≥", s.age);
-        f->addRow("24h 涨跌 <", s.chg);
+        f->addRow("24h 涨跌上限", s.chg);
         f->addRow("资金费率 <", s.fund);
         f->addRow("拉黑", s.black);
     };
@@ -432,13 +323,9 @@ void MainWindow::openSmartDialog() {
         f->addRow("硬止损外扩", s.buf);
     };
     const Shared sT = mkShared(c0.min_quote_vol, c0.min_age_days, c0.max_abs_chg24);
-    const Shared sB = mkShared(c0.bare.min_quote_vol, c0.bare.min_age_days, c0.bare.max_abs_chg24);
-    const Shared sV = mkShared(c0.vol.min_quote_vol, c0.vol.min_age_days, c0.vol.max_abs_chg24);
-    auto shared_of = [&](int i) -> const Shared& { return i == 1 ? sB : i == 2 ? sV : sT; };
-
-    // ════════════════════════════ 海龟 1h 设置页 ════════════════════════════
+    // ════════════════════════════ 趋势跟踪 1h 设置页 ════════════════════════════
     QVBoxLayout* tv = nullptr;
-    auto* turtlePage = makePage(tv);
+    auto* trendPage = makePage(tv);
 
     auto* fTGate = group(tv, "硬门槛（不满足直接排除）");
     addGateRows(fTGate, sT);
@@ -449,8 +336,8 @@ void MainWindow::openSmartDialog() {
     atrRow->addWidget(new QLabel("~"));
     atrRow->addWidget(sAtrHi);
     atrRow->addStretch();
-    sAtrHi->setToolTip("建议 2%：回测里 1h ATR% > 2% 的期望≈0。");
-    sAtrLo->setToolTip("建议 0.5%：再低的话 3×ATR 止损太近，手续费占一个 R 的比例变大。");
+    sAtrHi->setToolTip("候选波动上限，需按历史样本验证；高波动不自动产生反向信号。");
+    sAtrLo->setToolTip("低波动仍可能有趋势；需评估手续费与资金费占比。");
     fTGate->addRow("1h ATR% 区间", atrRow);
 
     auto* fList = group(tv, "方向与名单");
@@ -467,14 +354,10 @@ void MainWindow::openSmartDialog() {
     dirRow->addStretch();
     fList->addRow("方向", dirRow);
     auto* cbMode = new QComboBox();
-    cbMode->addItem("混合：强势仅多 / 弱势仅空 / 中间多空 / 过热仅空", (int)smart::DirMode::Mixed);
+    cbMode->addItem("分组候选：强势 / 弱势 / 中间 / 异动（方向由趋势决定）", (int)smart::DirMode::Mixed);
     cbMode->addItem("突破定方向：全部多空，谁突破做谁", (int)smart::DirMode::Breakout);
     cbMode->setCurrentIndex(c0.dir_mode == smart::DirMode::Mixed ? 0 : 1);
-    cbMode->setToolTip(
-        "混合：按 7 天相对强弱分段，每段固定方向——跟着趋势走，强势币不逆势做空、弱势币不逆势做多；\n"
-        "  中间段（名额最多）是横盘蓄势、方向未出的币，多空都做，谁突破做谁；\n"
-        "  7 天内单日暴涨 ≥ 过热阈值的币单独一段，只做空（等它派发回落）。\n"
-        "突破定方向：不分段，所有自动 bot 都是多空。");
+    cbMode->setToolTip("分组只影响候选排序；两个方向都允许时，所有分组都按自身趋势做多或做空。过热不是做空信号。");
     fList->addRow("方向模式", cbMode);
 
     // 混合模式的名额与门槛
@@ -503,23 +386,13 @@ void MainWindow::openSmartDialog() {
     fList->addRow("掉头 效率比", sTurn);
     auto* sHot   = dspin(1, 1000, 5, 0, c0.hot_pct, " %");
     auto* sCrash = dspin(1, 100, 5, 0, c0.crash_pct, " %");
-    sHot->setToolTip("7 天内任意连续 24 小时涨幅 ≥ 这个 ⇒ 过热段，只做空。\n"
-                     "相对强弱是这一下堆出来的，后面多半是派发、阴跌回原位。");
-    sCrash->setToolTip("7 天内任意连续 24 小时跌幅 ≥ 这个 ⇒ 放到中间段（不进弱势段，做空易被轧）。");
+    sHot->setToolTip("历史急涨用于分组观察，不产生反向交易许可。");
+    sCrash->setToolTip("历史急跌归入中间候选；当前方向仍由自身趋势判断。");
     auto* hotRow = new QHBoxLayout();
     hotRow->addWidget(new QLabel("过热 ≥")); hotRow->addWidget(sHot);
     hotRow->addWidget(new QLabel("暴跌 ≥")); hotRow->addWidget(sCrash);
     hotRow->addStretch();
     fList->addRow("单日涨跌", hotRow);
-    auto* sWeakVol = dspin(0, 20, 0.1, 1, c0.weak_vol_ratio, " 倍", "不要求");
-    sWeakVol->setToolTip(
-        "弱势段（仅空）跌破时要求的量比，覆盖下面的「突破量比」。\n"
-        "下跌不需要有人砸，阴跌缩量是常态——1.5 倍会挡掉一部分真实下跌。\n"
-        "1.0 = 不低于均量：挡明显缩量的假跌破、放行正常阴跌。0 = 不要求。\n"
-        "过热段固定不要求；中间段沿用模板（横盘币缩量跌破多半是洗盘）。\n"
-        "建议先用 1.5，日志里弱势段常见「突破待放量」再往下调。");
-    fList->addRow("弱势段量比≥", sWeakVol);
-
     // 突破模式的名额
     auto* sLn = ispin(0, 200, c0.long_n, " 个");
     auto* sSn = ispin(0, 200, c0.short_n, " 个");
@@ -533,7 +406,7 @@ void MainWindow::openSmartDialog() {
         auto sync = [=]() {
             const bool mixed = (smart::DirMode)cbMode->currentData().toInt() == smart::DirMode::Mixed;
             for (QWidget* w : std::initializer_list<QWidget*>{sSn_, sWn, sMn, sHn, sEnter, sExit,
-                                                               sTurn, sHot, sCrash, sWeakVol})
+                                                               sTurn, sHot, sCrash})
                 w->setEnabled(mixed);
             sLn->setEnabled(!mixed);
             sSn->setEnabled(!mixed);
@@ -548,13 +421,35 @@ void MainWindow::openSmartDialog() {
     fList->addRow(hint("淘汰：空仓时掉出前 1.5N 且连续 2 轮、加入满 24 小时才移除；"
                        "硬门槛不合格立即移除；持仓中绝不移除，等这笔走完。"
                        "一笔走完后 bot 保留，继续等下一次突破。"
-                       "混合模式下币换了段，空仓时 bot 跟着换方向，持仓中的等走完。"));
+                       "名单换组不会改变趋势判定；持仓继续按止损和反转退出。"));
 
-    auto* fTpl = group(tv, "海龟参数（不反手、硬止损强制开）");
+    auto* fTpl = group(tv, "趋势跟踪参数（不反手、硬止损强制开）");
     auto* cbIv = new QComboBox();
-    cbIv->addItems({"1h", "2h", "4h"});
+    cbIv->addItems({"15m", "30m", "1h", "2h", "4h"});
     cbIv->setCurrentText(QString::fromStdString(t0.interval));
     fTpl->addRow("信号周期", cbIv);
+    auto* fTrend = group(tv, "趋势许可与入场确认");
+    auto* cbTrend = new QCheckBox("启用绝对趋势过滤（已收盘 EMA）");
+    cbTrend->setChecked(t0.rule.following.enabled);
+    auto* cbClose = new QCheckBox("收盘确认突破（取消勾选为盘中突破）");
+    cbClose->setChecked(t0.rule.following.close_confirm);
+    auto* cbReversal = new QCheckBox("确认相反趋势时离场；不立即反手");
+    cbReversal->setChecked(t0.rule.following.reversal_exit);
+    auto* sFast = ispin(2, 199, t0.rule.following.fast_period);
+    auto* sSlow = ispin(3, 200, t0.rule.following.slow_period);
+    auto* sSlopeBars = ispin(1, 20, t0.rule.following.slope_bars);
+    auto* sSlope = dspin(0, 2, 0.01, 3, t0.rule.following.min_slope_atr);
+    auto* sSeparation = dspin(0, 10, 0.05, 2, t0.rule.following.min_separation_atr);
+    auto* sBuffer = dspin(0, 5, 0.05, 2, t0.rule.following.breakout_buffer_atr);
+    auto* sLocation = dspin(0.5, 1, 0.05, 2, t0.rule.following.min_close_location);
+    auto* sShortVol = dspin(0, 20, 0.1, 1, t0.rule.following.short_vol_ratio, " 倍", "不要求放量");
+    fTrend->addRow(cbTrend); fTrend->addRow(cbClose); fTrend->addRow(cbReversal);
+    fTrend->addRow("快 EMA", sFast); fTrend->addRow("慢 EMA", sSlow);
+    fTrend->addRow("斜率回看根数", sSlopeBars); fTrend->addRow("慢线每根斜率 / ATR ≥", sSlope);
+    fTrend->addRow("均线间距 / ATR ≥", sSeparation); fTrend->addRow("突破缓冲 / ATR", sBuffer);
+    fTrend->addRow("收盘在振幅中的方向位置 ≥", sLocation); fTrend->addRow("做空量比 ≥", sShortVol);
+    fTrend->addRow(hint("上涨许可只做多，下跌许可只做空，其余等待。收盘确认使用突破前通道和 ATR；追价上限仍生效。参数为研究起点，需回测验证。"));
+
     auto* sDc = ispin(2, 200, t0.rule.donchian_period, " 根");
     fTpl->addRow("通道周期", sDc);
     auto* sAtrP = ispin(2, 100, t0.rule.atr_period, " 根");
@@ -566,7 +461,7 @@ void MainWindow::openSmartDialog() {
     auto* sEr = dspin(0, 1, 0.05, 2, t0.rule.trend_er_min, {}, "关");
     fTpl->addRow("趋势 效率比≥", sEr);
     auto* sVr = dspin(0, 20, 0.1, 1, t0.rule.breakout_vol_ratio, " 倍", "关");
-    fTpl->addRow("突破量比≥", sVr);
+    fTpl->addRow("做多量比≥（趋势过滤启用时）", sVr);
     auto* cbLock  = new QCheckBox("锁定 ATR");
     auto* cbAccel = new QCheckBox("盈利后加速收紧");
     cbLock->setChecked(t0.rule.lock_atr);
@@ -670,250 +565,20 @@ void MainWindow::openSmartDialog() {
     priRow->addWidget(sPri);
     priRow->addStretch();
     fTRisk->addRow("名额紧张", priRow);
+    auto* sTotalRisk = dspin(0, 1e7, 1, 2, c0.max_total_risk_usdt, " U", "关");
+    auto* sDirectionRisk = dspin(0, 1e7, 1, 2, c0.max_direction_risk_usdt, " U", "关");
+    auto* sRiskCost = dspin(0, 1000, 1, 1, c0.risk_cost_bps, " bps");
+    fTRisk->addRow("组合计划风险上限", sTotalRisk);
+    fTRisk->addRow("同向计划风险上限", sDirectionRisk);
+    fTRisk->addRow("往返手续费与滑点估算", sRiskCost);
+    fTRisk->addRow(hint("含在途开仓，所有山寨币同向共享预算。按初始风险预留至平仓；估算不能限制跳价下的实际损失。异动每分钟观察，最多每五分钟触发一次重扫。"));
     tv->addStretch();
 
-    // ════════════════════════ 裸K（埋伏点火）设置页 ════════════════════════
-    QVBoxLayout* bv = nullptr;
-    auto* barePage = makePage(bv);
-    const auto& b0 = c0.bare;
-    bv->addWidget(hint("只做多。每天北京 08:00（币安日K 切换）用 1h 结构建埋伏池，程序任何时候启动先建一次；"
-                       "每根 1h 收盘后刷新池内；每根 5m 收盘后 3 秒内判定池里的币是否点火，点火就开仓。"));
+    tabs->addTab(trendPage, "设置");
 
-    auto* fPool = group(bv, "埋伏池（12 根 1h 的结构）");
-    auto* sPool = ispin(1, 200, b0.pool_n, " 个");
-    sPool->setToolTip("按结构分取前这么多个。分数：κ 40、箱体内位置 25、1h ATR% 20、威科夫 10、ATR 压缩比 5。");
-    fPool->addRow("池子大小", sPool);
-    auto* sBAtr = dspin(0.1, 20, 0.1, 2, b0.atr_pct_max, " %");
-    sBAtr->setToolTip("1h ATR% 超过这个不埋伏（回测 >2% 期望≈0，这条最重要）。≤1% 打分最高。");
-    fPool->addRow("1h ATR% ≤", sBAtr);
-    auto* sPosMin = dspin(0, 0.99, 0.05, 2, b0.pos_min);
-    sPosMin->setToolTip("收盘在 12 根 1h 箱体里的位置（0 = 下沿，1 = 上沿）。只埋伏贴近上沿的。");
-    fPool->addRow("箱体内位置 ≥", sPosMin);
-    auto* sRiseOut = dspin(1, 500, 5, 0, b0.rise_out_pct, " %");
-    sRiseOut->setToolTip("进池后涨超这么多就移出（已经走了，不再埋伏）。");
-    fPool->addRow("进池后涨超移出", sRiseOut);
-    fPool->addRow(hint("κ = (箱体高度% ÷ 1h ATR%) ÷ √12：0.8~1.2 最优；< 0.5 是假突破重灾区，> 1.5 已在走趋势。"
-                       "每小时刷新时跌破箱体下沿、ATR% 超限、进池后涨太多的移出，不补人，等第二天重建。"));
-
-    auto* fBGate = group(bv, "硬门槛");
-    addGateRows(fBGate, sB);
-    fBGate->addRow(hint("成交额、上线天数、24h 涨跌是裸K 自己的；资金费率、拉黑与海龟共用。"
-                        "稳定币、黄金代币、股票等非币标的不埋伏。"));
-
-    auto* fIgn = group(bv, "点火（刚收盘的那根 5m，全部满足）");
-    auto* sBVol = dspin(0, 100, 0.5, 1, b0.vol_ratio, " 倍");
-    sBVol->setToolTip("本根成交额 ÷ 前 20 根成交额的中位数。");
-    fIgn->addRow("量比 ≥", sBVol);
-    auto* sBody = dspin(0, 20, 0.1, 2, b0.body_pct_min, " %");
-    fIgn->addRow("实体涨幅 ≥", sBody);
-    auto* sClosePos = dspin(0, 1, 0.05, 2, b0.close_pos_min);
-    sClosePos->setToolTip("收盘在这根K线高低之间的位置，越靠上越好。");
-    fIgn->addRow("收盘位置 ≥", sClosePos);
-    auto* sWick = dspin(0, 1, 0.05, 2, b0.upper_wick_max);
-    sWick->setToolTip("上影 ÷ 振幅。上影长 = 冲上去被砸回来。");
-    fIgn->addRow("上影 ≤", sWick);
-    auto* sAmp = dspin(0, 20, 0.1, 2, b0.amp_atr_min, " ATR");
-    sAmp->setToolTip("振幅 ÷ 点火前的 5m ATR。");
-    fIgn->addRow("振幅 ≥", sAmp);
-    auto* sEdge = dspin(0, 10, 0.1, 2, b0.edge_tol_pct, " %");
-    sEdge->setToolTip("收盘不低于 1h 箱体上沿 −这么多 %（要贴着上沿或已站上）。");
-    fIgn->addRow("离箱体上沿 ≥ −", sEdge);
-    auto* cbBExp = new QCheckBox("要波动放大");
-    cbBExp->setChecked(b0.expand);
-    const QString bExpTip = "最近 6 根 5m（含点火那根）的平均真实波幅 ÷ 最近 48 根的 ≥ 门槛才点火。\n"
-                            ">1 = 波动在放大。";
-    cbBExp->setToolTip(bExpTip);
-    auto* sBExp = dspin(0.1, 20, 0.1, 2, b0.expand_min, " 倍");
-    sBExp->setToolTip(bExpTip);
-    sBExp->setEnabled(b0.expand);
-    connect(cbBExp, &QCheckBox::toggled, sBExp, &QWidget::setEnabled);
-    auto* bExpRow = new QHBoxLayout();
-    bExpRow->addWidget(cbBExp);
-    bExpRow->addWidget(new QLabel("波动斜率 ≥"));
-    bExpRow->addWidget(sBExp);
-    bExpRow->addStretch();
-    fIgn->addRow("波动", bExpRow);
-
-    auto* fVeto = group(bv, "否决（任一成立就不做）");
-    auto* sRed = ispin(0, 20, b0.veto_red_bars, " 根", "关");
-    sRed->setToolTip("点火前这么多根全是阴线 = 下跌中继的反抽。");
-    fVeto->addRow("点火前连阴", sRed);
-    auto* sVetoPos = dspin(0, 1, 0.05, 2, b0.veto_pos_max);
-    sVetoPos->setToolTip("点火前收盘在箱体里的位置低于这个 = 箱内乱窜，不是贴顶突破。");
-    fVeto->addRow("点火前箱体位置 <", sVetoPos);
-    auto* sRiseAtr = dspin(0, 20, 0.1, 2, b0.rise_atr_min, " ATR");
-    sRiseAtr->setToolTip("涨幅 ÷ 5m ATR 低于这个 = 相对自身波动太弱，是噪音。");
-    fVeto->addRow("涨幅 <", sRiseAtr);
-
-    auto* fExit = group(bv, "出场");
-    fExit->addRow(hint("初始止损 = 点火K线最低点（点火时 5m ATR 会瞬间膨胀好几倍，按点火前 ATR 算的止损不可用）。"
-                       "之后按 k × 1h ATR 追踪，只上移。"));
-    auto* sBK = dspin(0.5, 20, 0.5, 1, b0.atr_mult, " × 1h ATR");
-    fExit->addRow("追踪止损", sBK);
-    auto* cbBLock  = new QCheckBox("锁定 ATR");
-    auto* cbBAccel = new QCheckBox("暴涨收紧（≥6 ATR 时 k=2，≥10 ATR 时 k=1.5）");
-    cbBLock->setChecked(b0.lock_atr);
-    cbBAccel->setChecked(b0.accel_exit);
-    auto* bExRow = new QHBoxLayout();
-    bExRow->addWidget(cbBLock);
-    bExRow->addWidget(cbBAccel);
-    bExRow->addStretch();
-    fExit->addRow("出场优化", bExRow);
-    QCheckBox* cbBRoi = nullptr;
-    QDoubleSpinBox *sBRoiStart = nullptr, *sBRoiBack = nullptr;
-    QHBoxLayout* bRoiRow = nullptr;
-    std::tie(cbBRoi, sBRoiStart, sBRoiBack, bRoiRow) = roiRowOf(b0.roi_trail, b0.roi_start, b0.roi_back);
-    fExit->addRow("止盈", bRoiRow);
-
-    auto* fBSize = group(bv, "仓位（与海龟共用）");
-    addSizeRows(fBSize, sB);
-
-    auto* fBRisk = group(bv, "风控（全部 bot 生效）");
-    auto* sBPos = ispin(0, 500, b0.max_positions, " 个", "不限");
-    sBPos->setToolTip("全部 bot（含手动）同时持仓的上限。点火时已满就不开，记进 journal。");
-    fBRisk->addRow("同时持仓上限", sBPos);
-    fBRisk->addRow("当日亏损限额", sB.day);
-    fBRisk->addRow("持仓浮亏限额", sB.flt);
-    bv->addStretch();
-
-    // ════════════════════════ 波动顺势设置页 ════════════════════════
-    QVBoxLayout* vv = nullptr;
-    auto* volPage = makePage(vv);
-    const auto& v0 = c0.vol;
-    vv->addWidget(hint("波动率大或波动斜率大的币进名单，每个币一个常驻 bot：看正在走的这根K线，"
-                       "实时价离开盘价超过死区就顺着做（阳做多、阴做空）；方向反了、处在亏损时立刻反手。"
-                       "每根K线收盘后重扫一次全市场。"));
-
-    auto* fVSel = group(vv, "周期与选币");
-    auto* cbVIv = new QComboBox();
-    cbVIv->addItems({"5m", "15m", "30m", "1h"});
-    cbVIv->setCurrentText(QString::fromStdString(v0.interval));
-    cbVIv->setToolTip("入场看的K线、ATR、波动率、波动斜率都按这个周期算；每根收盘后重扫名单。");
-    fVSel->addRow("周期", cbVIv);
-    addGateRows(fVSel, sV);
-    auto* cbVAtr = new QCheckBox("波动率大");
-    cbVAtr->setChecked(v0.use_atr);
-    auto* sVAtr = dspin(0.01, 50, 0.1, 2, v0.atr_pct_min, " %");
-    sVAtr->setToolTip("所选周期的 ATR14 ÷ 收盘价。");
-    sVAtr->setEnabled(v0.use_atr);
-    connect(cbVAtr, &QCheckBox::toggled, sVAtr, &QWidget::setEnabled);
-    auto* vAtrRow = new QHBoxLayout();
-    vAtrRow->addWidget(cbVAtr);
-    vAtrRow->addWidget(new QLabel("ATR% ≥"));
-    vAtrRow->addWidget(sVAtr);
-    vAtrRow->addStretch();
-    fVSel->addRow("条件一", vAtrRow);
-    auto* cbVSlope = new QCheckBox("波动斜率大");
-    cbVSlope->setChecked(v0.use_slope);
-    auto* sVSlope = dspin(0.1, 20, 0.1, 2, v0.slope_min, " 倍");
-    sVSlope->setToolTip("最近 6 根的平均真实波幅 ÷ 最近 48 根的。>1 = 波动在放大。");
-    sVSlope->setEnabled(v0.use_slope);
-    connect(cbVSlope, &QCheckBox::toggled, sVSlope, &QWidget::setEnabled);
-    auto* vSlopeRow = new QHBoxLayout();
-    vSlopeRow->addWidget(cbVSlope);
-    vSlopeRow->addWidget(new QLabel("近 6 根 ÷ 近 48 根 ≥"));
-    vSlopeRow->addWidget(sVSlope);
-    vSlopeRow->addStretch();
-    fVSel->addRow("条件二", vSlopeRow);
-    auto* sVPool = ispin(1, 200, v0.pool_n, " 个");
-    sVPool->setToolTip("满足任一条件的币按波动斜率排，取前这么多个。");
-    fVSel->addRow("名单上限", sVPool);
-    fVSel->addRow(hint("两条满足一个就进。不在名单了：连续 2 轮、空仓才移出（硬门槛不合格立刻），持仓中的等这笔走完。"));
-
-    auto* fVIn = group(vv, "入场（正在走的这根K线）");
-    auto* sVDead = dspin(0, 5, 0.05, 2, v0.dead_atr, " ATR", "0（不设）");
-    sVDead->setToolTip("实时价 > 开盘价 + 死区 ⇒ 做多；< 开盘价 − 死区 ⇒ 做空。\n"
-                       "挡开盘价附近的来回抖：这个模式配立即反手，不挡就是一根里来回开平。");
-    fVIn->addRow("死区", sVDead);
-    fVIn->addRow(hint("盈利出场后不反手，等下一根再开。"));
-
-    auto* fVRev = group(vv, "方向反了、亏损时反手（勾的任一条成立）");
-    auto* cbVRevOpen = new QCheckBox("价格回到开仓那根K线开盘价的另一边（越过死区）");
-    cbVRevOpen->setChecked(v0.rev_open);
-    cbVRevOpen->setToolTip("按开仓那一根的开盘价算，开仓后就固定，跨到下一根也不换。");
-    fVRev->addRow("", cbVRevOpen);
-    auto* cbVRevLoss = new QCheckBox("收益率跌到");
-    cbVRevLoss->setChecked(v0.rev_loss);
-    cbVRevLoss->setToolTip("收益率同追踪止盈的口径（带杠杆）。");
-    auto* sVRevRoi = dspin(0.5, 1000, 0.5, 1, v0.rev_loss_roi, " %");
-    sVRevRoi->setEnabled(v0.rev_loss);
-    connect(cbVRevLoss, &QCheckBox::toggled, sVRevRoi, &QWidget::setEnabled);
-    auto* vRoiRow = new QHBoxLayout();
-    vRoiRow->addWidget(cbVRevLoss);
-    vRoiRow->addWidget(new QLabel("−"));
-    vRoiRow->addWidget(sVRevRoi);
-    vRoiRow->addStretch();
-    fVRev->addRow("", vRoiRow);
-    auto* cbVRevStop = new QCheckBox("打到止损线");
-    cbVRevStop->setChecked(v0.rev_stop);
-    cbVRevStop->setToolTip("不勾的话止损线照样平仓，只是不反手。");
-    fVRev->addRow("", cbVRevStop);
-    auto* sVMaxRev = ispin(0, 50, v0.max_reverses, " 次", "不限");
-    auto* sVCool   = ispin(0, 100, v0.cooldown_bars, " 根");
-    auto* vGuardRow = new QHBoxLayout();
-    vGuardRow->addWidget(new QLabel("连续反手"));
-    vGuardRow->addWidget(sVMaxRev);
-    vGuardRow->addWidget(new QLabel("后只平不反手，冷却"));
-    vGuardRow->addWidget(sVCool);
-    vGuardRow->addStretch();
-    fVRev->addRow("护栏", vGuardRow);
-    auto* cbVOneRev = new QCheckBox("同一根K线最多反手一次（第二次只平不反手）");
-    cbVOneRev->setChecked(v0.one_rev_per_bar);
-    fVRev->addRow("", cbVOneRev);
-    fVRev->addRow(hint("每次反手是两笔手续费（平 + 开）。状态列会显示连续反手了几次。"));
-
-    auto* fVExit = group(vv, "出场");
-    auto* sVK = dspin(0.5, 20, 0.5, 1, v0.atr_mult, " × ATR");
-    fVExit->addRow("追踪止损", sVK);
-    auto* cbVLock  = new QCheckBox("锁定 ATR");
-    auto* cbVAccel = new QCheckBox("盈利后加速收紧");
-    cbVLock->setChecked(v0.lock_atr);
-    cbVAccel->setChecked(v0.accel_exit);
-    auto* vExRow = new QHBoxLayout();
-    vExRow->addWidget(cbVLock);
-    vExRow->addWidget(cbVAccel);
-    vExRow->addStretch();
-    fVExit->addRow("出场优化", vExRow);
-    auto* sVInit = dspin(0, 50, 0.5, 1, v0.max_init_loss_pct, " %", "关");
-    sVInit->setToolTip("开仓时止损最多离开仓价这么多（按价格，不乘杠杆），k×ATR 更近时用 k×ATR。");
-    fVExit->addRow("初始止损≤", sVInit);
-    QCheckBox* cbVRoi = nullptr;
-    QDoubleSpinBox *sVRoiStart = nullptr, *sVRoiBack = nullptr;
-    QHBoxLayout* vRoiTrailRow = nullptr;
-    std::tie(cbVRoi, sVRoiStart, sVRoiBack, vRoiTrailRow) = roiRowOf(v0.roi_trail, v0.roi_start, v0.roi_back);
-    fVExit->addRow("止盈", vRoiTrailRow);
-    auto* cbVBe = new QCheckBox("保本止损");
-    cbVBe->setChecked(v0.breakeven);
-    auto* sVBe = dspin(0.5, 1000, 0.5, 1, v0.breakeven_start, " %");
-    sVBe->setEnabled(v0.breakeven);
-    connect(cbVBe, &QCheckBox::toggled, sVBe, &QWidget::setEnabled);
-    auto* vBeRow = new QHBoxLayout();
-    vBeRow->addWidget(cbVBe);
-    vBeRow->addWidget(new QLabel("收益率到"));
-    vBeRow->addWidget(sVBe);
-    vBeRow->addWidget(new QLabel("后，止损挪到开仓价"));
-    vBeRow->addStretch();
-    fVExit->addRow("保本", vBeRow);
-
-    auto* fVSize = group(vv, "仓位（三套共用）");
-    addSizeRows(fVSize, sV);
-    auto* fVRisk = group(vv, "风控（全部 bot 生效）");
-    auto* sVPos = ispin(0, 500, v0.max_positions, " 个", "不限");
-    fVRisk->addRow("同时持仓上限", sVPos);
-    fVRisk->addRow("当日亏损限额", sV.day);
-    fVRisk->addRow("持仓浮亏限额", sV.flt);
-    vv->addStretch();
-
-    auto* stack = new QStackedWidget();
-    stack->addWidget(turtlePage);
-    stack->addWidget(barePage);
-    stack->addWidget(volPage);
-    stack->setCurrentIndex(idx_of(c0.strategy));
-    tabs->addTab(stack, "设置");
-
-    // ── 名单页（跟着正在显示的策略换）──────────────────────────────────────
+    // ── 候选名单──────────────────────────────────────
     const auto rep = smart_ ? smart_->last_report() : SmartRunner::Report{};
-    auto turtleTable = [](const std::vector<SmartRunner::Row>& rows) {
+    auto trendTable = [](const std::vector<SmartRunner::Row>& rows) {
         auto* t = new QTableWidget((int)rows.size(), 9);
         t->setHorizontalHeaderLabels({"#", "品种", "分数", "强弱", "7天最大单日涨",
                                       "ATR%", "箱体/ATR", "量能抬升", "已开 bot"});
@@ -940,112 +605,15 @@ void MainWindow::openSmartDialog() {
         }
         return t;
     };
-    auto bareTable = [this]() {
-        // 状态按此刻的价格与 bot 现算
-        const auto rows = smart_ ? smart_->bare_rows(QDateTime::currentMSecsSinceEpoch(),
-                                                     [this](const std::string& s) {
-                                                         return ticker_ ? ticker_->mark_price(s) : 0.0;
-                                                     })
-                                 : std::vector<SmartRunner::Row>{};
-        auto* t = new QTableWidget((int)rows.size(), 9);
-        t->setHorizontalHeaderLabels({"#", "品种", "状态", "分数", "κ", "箱体内位置",
-                                      "1h ATR%", "离箱体上沿", "上涨量占比"});
-        t->verticalHeader()->setVisible(false);
-        t->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        t->setSelectionBehavior(QAbstractItemView::SelectRows);
-        t->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-        auto pct = [](double v) {
-            return QString("%1%2%").arg(v >= 0 ? "" : "−").arg(std::abs(v), 0, 'f', 2);
-        };
-        for (int i = 0; i < (int)rows.size(); ++i) {
-            const auto& r = rows[i];
-            auto set = [&](int col, const QString& s, const char* color = nullptr) {
-                auto* it = new QTableWidgetItem(s);
-                it->setTextAlignment(Qt::AlignCenter);
-                if (color) it->setForeground(QColor(color));
-                t->setItem(i, col, it);
-            };
-            const QString st = QString::fromStdString(r.status);
-            set(0, QString::number(r.rank));
-            set(1, QString::fromStdString(r.symbol));
-            set(2, st, st == "持仓中" ? "#3fb950" : st == "今日已点火" ? "#d29922" : nullptr);
-            set(3, QString::number(r.score, 'f', 0));
-            // κ 在最优区间 0.8~1.2 的标绿
-            set(4, QString::number(r.kappa, 'f', 2),
-                (r.kappa >= 0.8 && r.kappa <= 1.2) ? "#3fb950" : nullptr);
-            set(5, QString::number(r.box_pos, 'f', 2));
-            set(6, QString::number(r.atr_pct, 'f', 2));
-            set(7, pct(r.dist_up_pct));
-            set(8, QString::number(r.up_vol_share * 100.0, 'f', 0) + "%");
-        }
-        t->setToolTip("离箱体上沿：价格离 12 根 1h 箱体上沿还有多少（负数 = 已站上）。\n"
-                      "κ 0.8~1.2 标绿（回测最优区间）。今日已点火 = 今天开过仓、现在空仓，还能再点火。");
-        return std::make_pair(t, (int)rows.size());
-    };
-    auto volTable = [](const std::vector<SmartRunner::Row>& rows) {
-        auto* t = new QTableWidget((int)rows.size(), 5);
-        t->setHorizontalHeaderLabels({"#", "品种", "波动斜率", "ATR%", "已开 bot"});
-        t->verticalHeader()->setVisible(false);
-        t->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        t->setSelectionBehavior(QAbstractItemView::SelectRows);
-        t->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-        for (int i = 0; i < (int)rows.size(); ++i) {
-            const auto& r = rows[i];
-            auto set = [&](int col, const QString& s) {
-                auto* it = new QTableWidgetItem(s);
-                it->setTextAlignment(Qt::AlignCenter);
-                t->setItem(i, col, it);
-            };
-            set(0, QString::number(r.rank));
-            set(1, QString::fromStdString(r.symbol));
-            set(2, QString::number(r.slope, 'f', 2));
-            set(3, QString::number(r.atr_pct, 'f', 2));
-            set(4, r.has_bot ? "✓" : "");
-        }
-        t->setToolTip("波动斜率 = 最近 6 根 ÷ 最近 48 根平均真实波幅；ATR% 按所选周期算。按斜率排。");
-        return t;
-    };
-    auto rebuildLists = [&, tabs](int page) {
-        while (tabs->count() > 1) {
-            QWidget* w = tabs->widget(1);
-            tabs->removeTab(1);
-            delete w;
-        }
-        if (page == 1) {
-            auto [t, n] = bareTable();
-            tabs->addTab(t, QString("埋伏池 %1/%2").arg(n).arg(sPool->value()));
-            return;
-        }
-        if (page == 2) {
-            // 上一次扫描不是波动顺势的话，没有名单可看
-            for (const auto& g : rep.groups)
-                if (g.code == smart::kSegVol)
-                    tabs->addTab(volTable(g.rows), QString("%1 %2/%3")
-                                                       .arg(QString::fromStdString(g.title))
-                                                       .arg(g.rows.size()).arg(g.quota));
-            return;
-        }
-        // 上一次扫描是裸K（埋伏池）/ 波动顺势的话，没有海龟名单可看
-        for (const auto& g : rep.groups) {
-            if (g.code == smart::kSegBare || g.code == smart::kSegVol) continue;
-            tabs->addTab(turtleTable(g.rows), QString("%1 %2/%3")
-                                                  .arg(QString::fromStdString(g.title))
-                                                  .arg(g.rows.size()).arg(g.quota));
-        }
-    };
+    for (const auto& g : rep.groups)
+        tabs->addTab(trendTable(g.rows), QString("%1 %2/%3")
+            .arg(QString::fromStdString(g.title)).arg(g.rows.size()).arg(g.quota));
 
     // ── 状态行 ────────────────────────────────────────────────────────────
-    auto updateStatus = [&, status](int page) {
-        QString s = !c0.enabled ? QString("状态：关闭。")
-                  : c0.strategy == smart::Strategy::BareK
-                      ? QString("状态：已启用（裸K 埋伏点火），每天 08:00 建埋伏池、每根 1h 收盘后刷新，"
-                                "每根 5m 收盘后 3 秒内判定点火。")
-                  : c0.strategy == smart::Strategy::VolFollow
-                      ? QString("状态：已启用（波动顺势 %1），每根K线收盘后 5 秒重扫名单。")
-                            .arg(QString::fromStdString(c0.vol.interval))
-                      : QString("状态：已启用（海龟 1h），每小时整点后 1 分钟扫描一次。");
-        if (page != idx_of(c0.strategy))
-            s += QString("\n正在查看%1的设置：按「保存」后才切换过去。").arg(name_of(strat_of(page)));
+    {
+        QString s = c0.enabled
+            ? QString("状态：已启用（趋势跟踪），每小时整点后 1 分钟扫描一次。")
+            : QString("状态：关闭。");
         if (rep.at_ms > 0)
             s += QString("\n上次扫描 %1：%2")
                      .arg(QDateTime::fromMSecsSinceEpoch(rep.at_ms).toString("MM-dd HH:mm"))
@@ -1059,30 +627,15 @@ void MainWindow::openSmartDialog() {
                 s += QString(" / 限额 %1U").arg(c0.daily_loss_limit, 0, 'f', 0);
         }
         status->setText(s);
-    };
-
-    rebuildLists(stack->currentIndex());
-    updateStatus(stack->currentIndex());
-    connect(stratGroup, &QButtonGroup::idClicked, &dlg, [&, stack](int id) {
-        if (id == stack->currentIndex()) return;
-        // 共用的设置跟着带过去：在这一页改过的，切过去看到的是同一个值
-        copyShared(shared_of(stack->currentIndex()), shared_of(id));
-        stack->setCurrentIndex(id);
-        rebuildLists(id);
-        updateStatus(id);
-    });
+    }
 
     // ── 回读 ──────────────────────────────────────────────────────────────
-    // 三套的专属参数都回读（没在看的保持原样）；共用的取正在显示的那一页
     auto collect = [&]() {
         smart::Config c = c0;
-        const int page = stack->currentIndex();
-        const Shared& s = shared_of(page);
+        const Shared& s = sT;
         c.enabled   = cbEnable->isChecked();
-        c.strategy  = strat_of(page);
         c.pause_new = cbPause->isChecked();
 
-        // 海龟的成交额 / 上线天数 / 24h 涨跌永远取海龟页那一份（裸K 的在下面）
         c.min_quote_vol   = sT.vol->value() * 1e6;
         c.min_age_days    = sT.age->value();
         c.max_abs_chg24   = sT.chg->value();
@@ -1101,7 +654,7 @@ void MainWindow::openSmartDialog() {
         t.leverage    = s.lev->value();
         t.disaster_stop_buffer_pct = s.buf->value();
 
-        // 海龟专属
+        // 趋势跟踪专属
         c.atr_pct_min = sAtrLo->value();
         c.atr_pct_max = sAtrHi->value();
         c.dir_long  = cbLong->isChecked();
@@ -1116,7 +669,6 @@ void MainWindow::openSmartDialog() {
         c.turn_er   = sTurn->value();
         c.hot_pct   = sHot->value();
         c.crash_pct = sCrash->value();
-        c.weak_vol_ratio = sWeakVol->value();
         c.long_n    = sLn->value();
         c.short_n   = sSn->value();
         c.min_score = sMin->value();
@@ -1129,6 +681,22 @@ void MainWindow::openSmartDialog() {
         t.rule.atr_mult           = sK->value();
         t.rule.squeeze_box_atr    = sBox->value();
         t.rule.trend_er_min       = sEr->value();
+        t.rule.following.enabled = cbTrend->isChecked();
+        t.rule.following.close_confirm = cbClose->isChecked();
+        t.rule.following.reversal_exit = cbReversal->isChecked();
+        t.rule.following.fast_period = sFast->value();
+        t.rule.following.slow_period = sSlow->value();
+        t.rule.following.slope_bars = sSlopeBars->value();
+        t.rule.following.min_slope_atr = sSlope->value();
+        t.rule.following.min_separation_atr = sSeparation->value();
+        t.rule.following.breakout_buffer_atr = sBuffer->value();
+        t.rule.following.min_close_location = sLocation->value();
+        t.rule.following.short_vol_ratio = sShortVol->value();
+
+        c.max_total_risk_usdt = sTotalRisk->value();
+        c.max_direction_risk_usdt = sDirectionRisk->value();
+        c.risk_cost_bps = sRiskCost->value();
+
         t.rule.breakout_vol_ratio = sVr->value();
         t.rule.lock_atr           = cbLock->isChecked();
         t.rule.accel_exit         = cbAccel->isChecked();
@@ -1146,63 +714,6 @@ void MainWindow::openSmartDialog() {
         t.rule.roi_trail_start    = sTRoiStart->value();
         t.rule.roi_trail_back     = sTRoiBack->value();
 
-        // 裸K 专属（成交额 / 上线天数 / 24h 涨跌各套各的，取裸K 页那一份）
-        auto& bc = c.bare;
-        bc.min_quote_vol  = sB.vol->value() * 1e6;
-        bc.min_age_days   = sB.age->value();
-        bc.max_abs_chg24  = sB.chg->value();
-        bc.pool_n         = sPool->value();
-        bc.atr_pct_max    = sBAtr->value();
-        bc.pos_min        = sPosMin->value();
-        bc.rise_out_pct   = sRiseOut->value();
-        bc.vol_ratio      = sBVol->value();
-        bc.body_pct_min   = sBody->value();
-        bc.close_pos_min  = sClosePos->value();
-        bc.upper_wick_max = sWick->value();
-        bc.amp_atr_min    = sAmp->value();
-        bc.edge_tol_pct   = sEdge->value();
-        bc.expand         = cbBExp->isChecked();
-        bc.expand_min     = sBExp->value();
-        bc.veto_red_bars  = sRed->value();
-        bc.veto_pos_max   = sVetoPos->value();
-        bc.rise_atr_min   = sRiseAtr->value();
-        bc.atr_mult       = sBK->value();
-        bc.lock_atr       = cbBLock->isChecked();
-        bc.accel_exit     = cbBAccel->isChecked();
-        bc.roi_trail      = cbBRoi->isChecked();
-        bc.roi_start      = sBRoiStart->value();
-        bc.roi_back       = sBRoiBack->value();
-        bc.max_positions  = sBPos->value();
-
-        // 波动顺势专属（成交额 / 上线天数 / 24h 涨跌取波动顺势页那一份）
-        auto& vc = c.vol;
-        vc.interval        = cbVIv->currentText().toStdString();
-        vc.min_quote_vol   = sV.vol->value() * 1e6;
-        vc.min_age_days    = sV.age->value();
-        vc.max_abs_chg24   = sV.chg->value();
-        vc.use_atr         = cbVAtr->isChecked();
-        vc.atr_pct_min     = sVAtr->value();
-        vc.use_slope       = cbVSlope->isChecked();
-        vc.slope_min       = sVSlope->value();
-        vc.pool_n          = sVPool->value();
-        vc.dead_atr        = sVDead->value();
-        vc.rev_open        = cbVRevOpen->isChecked();
-        vc.rev_loss        = cbVRevLoss->isChecked();
-        vc.rev_loss_roi    = sVRevRoi->value();
-        vc.rev_stop        = cbVRevStop->isChecked();
-        vc.max_reverses    = sVMaxRev->value();
-        vc.cooldown_bars   = sVCool->value();
-        vc.one_rev_per_bar = cbVOneRev->isChecked();
-        vc.atr_mult        = sVK->value();
-        vc.lock_atr        = cbVLock->isChecked();
-        vc.accel_exit      = cbVAccel->isChecked();
-        vc.max_init_loss_pct = sVInit->value();
-        vc.roi_trail       = cbVRoi->isChecked();
-        vc.roi_start       = sVRoiStart->value();
-        vc.roi_back        = sVRoiBack->value();
-        vc.breakeven       = cbVBe->isChecked();
-        vc.breakeven_start = sVBe->value();
-        vc.max_positions   = sVPos->value();
         return c;
     };
     // 校验走和 headless 同一套（config_from_json），保证两边认同一份规则
@@ -1213,45 +724,25 @@ void MainWindow::openSmartDialog() {
             QMessageBox::warning(&dlg, "设置不合法", QString::fromStdString(err));
             return false;
         }
-        if (out.enabled && out.strategy == smart::Strategy::Turtle &&
+        if (out.enabled &&
             !out.dir_long && !out.dir_short) {
             QMessageBox::warning(&dlg, "设置不合法", "启用智能模式至少要勾一个方向。");
             return false;
         }
-        // 打开弹窗之后可能又开了仓：保存时再查一次
-        if (out.strategy != c0.strategy) {
-            for (const auto old : {smart::Strategy::Turtle, smart::Strategy::BareK, smart::Strategy::VolFollow}) {
-                if (old == out.strategy) continue;
-                if (const int hold = holdings_now(old); hold > 0) {
-                    QMessageBox::warning(&dlg, "不能切换策略",
-                        QString("还有 %1 笔%2持仓，走完才能切换（也可以在主表手动平仓）。")
-                            .arg(hold).arg(name_of(old)));
-                    return false;
-                }
-            }
-        }
         return true;
     };
     auto confirm_enable = [&](const smart::Config& c) {
-        // 第一次启用、或换了策略（三套开仓的节奏完全不同）都要确认一次
-        if (!c.enabled || (c0.enabled && c0.strategy == c.strategy)) return true;
-        const bool bare = (c.strategy == smart::Strategy::BareK);
-        const bool vol  = (c.strategy == smart::Strategy::VolFollow);
+        if (!c.enabled || c0.enabled) return true;
         return confirmDanger(
-            bare ? "启用智能裸K（埋伏点火）" : vol ? "启用智能波动顺势" : "启用智能模式（海龟 1h）",
-            QString("智能模式会扫描全市场，在你【没有逐个看过】的币上自动建 bot 并开仓。%5\n\n"
+            "启用智能模式（趋势跟踪）",
+            QString("智能模式会扫描全市场，在你【没有逐个看过】的币上自动建 bot 并开仓。\n\n"
                     "当前设置：同时持仓上限 %1 个，每笔名义 %2U、%3x 杠杆，当日亏损限额 %4。\n"
                     "确认这些数字在你能承受的范围内。")
-                .arg(bare ? c.bare.max_positions : vol ? c.vol.max_positions : c.max_positions)
+                .arg(c.max_positions)
                 .arg(c.tmpl.budget_usdt, 0, 'f', 0)
                 .arg(c.tmpl.leverage)
                 .arg(c.daily_loss_limit > 0 ? QString::number(c.daily_loss_limit, 'f', 0) + "U"
-                                            : QString("未设"))
-                .arg(bare ? QString("\n裸K 只做多，点火当下市价开仓；止损在点火K线最低点，"
-                                    "单笔止损距离可能有好几个百分点。")
-                     : vol ? QString("\n波动顺势盘中开仓、方向反了立刻反手，每次反手是两笔手续费；"
-                                     "名单里的每个币都可能一直开着仓。")
-                           : QString()),
+                                            : QString("未设")),
             "启用");
     };
 
@@ -1272,11 +763,7 @@ void MainWindow::openSmartDialog() {
         if (!validate(collect(), c) || !confirm_enable(c)) return;
         applySmartConfig(c);
         log(QString("智能模式设置已保存（%1）")
-                .arg(!c.enabled ? QString("关闭")
-                     : c.strategy == smart::Strategy::BareK ? QString("启用 · 裸K 埋伏点火")
-                     : c.strategy == smart::Strategy::VolFollow
-                         ? QString("启用 · 波动顺势 %1").arg(QString::fromStdString(c.vol.interval))
-                         : QString("启用 · 海龟 1h")),
+                .arg(c.enabled ? QString("启用 · 趋势跟踪") : QString("关闭")),
             "OK");
         dlg.accept();
     });

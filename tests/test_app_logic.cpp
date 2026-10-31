@@ -143,6 +143,9 @@ int main() {
         check(app::resume_overshoot_pct(Pos::Flat, 50, 100) == 0, "空仓 ⇒ 0");
     }
 
+    check(app::removed_smart_strategy('K') && app::removed_smart_strategy('V') &&
+          !app::removed_smart_strategy('M') && !app::removed_smart_strategy('U'),
+          "旧智能策略标记需要迁移拦截，趋势跟踪分段可以恢复");
     std::printf(g_fail ? "\n%d 项失败\n" : "\nOK: 应用层判定测试全部通过\n", g_fail);
     return g_fail ? 1 : 0;
 }

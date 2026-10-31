@@ -41,13 +41,13 @@ struct TrendConfig {
     //                  数量 = 单笔愿亏金额 ÷ |开仓价 − 止损线|
     //
     // ⚠ 它用的是【真实止损线】，不是 ATR。界面上曾经叫"按ATR等风险"，那是个
-    //   误导性的名字——三个策略的止损线来源各不相同（海龟=极值∓k×ATR、
+    //   误导性的名字——三个策略的止损线来源各不相同（趋势跟踪=极值∓k×ATR、
     //   PSAR=SAR值、裸K=摆动极值），公式只要 |开仓价 − 止损线|，与 ATR 无关。
     //
     // 为什么要有它：同一份名义价值，在止损距离 1.6% 和 5.3% 的品种上，单次止损
     // 亏的钱差 3.3 倍。固定名义 = 风险全压在高波动那几个品种上，而"铺开品种
     // 分散风险"这件事就此失效——趋势策略胜率只有 30~40%，靠的正是分散摊平。
-    // 这是海龟的"单位"概念。
+    // 这是趋势跟踪的"单位"概念。
     enum class SizeMode { Notional, RiskBased };
 
     std::string symbol;
@@ -75,6 +75,7 @@ struct TrendConfig {
     // 取 2.5 根并保底 60 秒
     int effective_max_age_sec() const {
         if (signal_max_age_sec > 0) return signal_max_age_sec;
+        if (rule.following.enabled) return 120;
         return std::max(60, (int)(bar_seconds(interval) * 5 / 2));
     }
 
@@ -122,10 +123,21 @@ struct TrendBot {
     State       state   = State::Running;
     bool        pending = false;   // 有在途订单，本 tick 跳过
 
+    // Reserve before sending an opening order. Uncertain outcomes retain the
+    // reservation across restart until a fresh reconciliation proves exposure absent.
+    double reserved_risk = 0, reserved_margin = 0;
+    trend::Pos reserved_dir = trend::Pos::Flat;
+    bool open_uncertain = false;
+    std::string uncertain_client_id;
+    bool uncertain_terminal = false;
+    std::chrono::steady_clock::time_point uncertain_terminal_time{};
+    std::chrono::steady_clock::time_point uncertain_last_query{};
+    int uncertain_empty_seen = 0;
     double current_price = 0;
     double qty           = 0;      // 当前持仓数量（绝对值，0=空仓）
 
     // 信号快照（由应用层拉取K线后喂入）
+    following::Signal following;
     bool    sig_ok  = false;
     double  atr     = 0;
     double  atr_pct = 0;
@@ -141,7 +153,7 @@ struct TrendBot {
     double  taker_ratio = std::numeric_limits<double>::quiet_NaN();
     // 突破被过滤时日志每根K线只记一次（拦截每 3 秒都会命中）。不落盘
     int64_t squeeze_noted_bar_ms = 0;
-    // ── K线快照（裸K 与 抛物线SAR 用；海龟只用上面的 ATR + 通道）──────────
+    // ── K线快照（裸K 与 抛物线SAR 用；趋势跟踪只用上面的 ATR + 通道）──────────
     bool    bar_ok      = false;
     double  bar_open    = 0;    // 当前这根【未收盘】的开盘价（裸K·立即顺势用）
     double  prev_close  = 0;    // 刚收盘那根的收盘价（裸K·等收盘突破用）
@@ -268,16 +280,7 @@ struct TrendBot {
     // 都是采样价（每拍一次），不额外请求；程序离线期间的波动采不到
     double  trough         = 0;
     double  open_stop      = 0;
-    // 开仓那一刻的量比与箱体（海龟才有；NaN = 没有），以及触发方式。
-    // smart_trigger 是 force_open 打的标记（智能裸K 点火 = 'I'），成交时抄进 open_trigger。
-    // open_* 随仓位落盘，smart_trigger 不落盘（它只活到这一笔成交）
-    char    smart_trigger  = 0;
-    char    open_trigger   = 0;
-    // force_open 带进来的初始止损与开仓读数（点火K线最低点、点火量比、箱体/ATR）。
-    // 只活到这一笔下单：submit_open 读走即清，不落盘
-    double  forced_stop    = 0;
-    double  forced_vol     = std::numeric_limits<double>::quiet_NaN();
-    double  forced_box     = std::numeric_limits<double>::quiet_NaN();
+    // 开仓时的量比与箱体（NaN = 无有效读数），随仓位落盘。
     double  open_vol_ratio = std::numeric_limits<double>::quiet_NaN();
     double  open_box_atr   = std::numeric_limits<double>::quiet_NaN();
     double  open_taker     = std::numeric_limits<double>::quiet_NaN();   // 开仓那根的主动买入占比
@@ -311,15 +314,15 @@ struct TrendTrade {
     char        seg     = 0;      // 开仓时所在的名单 / 分段（smart::kList* / kSeg*）
     int         rank    = 0;
     double      score   = 0;
-    // 开仓价离通道边沿多远（ATR 为单位，向突破方向为正）。只有海龟有；NaN = 没有
+    // 开仓价离通道边沿多远（ATR 为单位，向突破方向为正）。只有趋势跟踪有；NaN = 没有
     double      entry_dist_atr = std::numeric_limits<double>::quiet_NaN();
-    trend::Strategy strategy = trend::Strategy::Turtle;
+    trend::Strategy strategy = trend::Strategy::TrendFollowing;
     std::string interval;
 
     // 持仓期浮盈亏的最高 / 最低（MFE / MAE），带符号：最高是最好的那一刻，
     // 最低是最差的那一刻。开仓那一刻浮盈亏为 0，所以最高 ≥ 0、最低 ≤ 0。
     // 四种单位：美元、占开仓价 %、开仓 ATR 倍数、R（初始止损距离）倍数。
-    // NaN = 算不了（ATR：非海龟或老仓位；R：老仓位没记初始止损）
+    // NaN = 算不了（ATR：非趋势跟踪或老仓位；R：老仓位没记初始止损）
     double mfe_usd = std::numeric_limits<double>::quiet_NaN();
     double mae_usd = std::numeric_limits<double>::quiet_NaN();
     double mfe_pct = std::numeric_limits<double>::quiet_NaN();
@@ -329,11 +332,9 @@ struct TrendTrade {
     double mfe_r   = std::numeric_limits<double>::quiet_NaN();
     double mae_r   = std::numeric_limits<double>::quiet_NaN();
 
-    // 开仓那一刻的量比 / 箱体（海龟才有，NaN = 没有）与触发方式（智能裸K 点火 = 'I'，0 = 自己的信号）
-    char   trigger         = 0;
     double entry_vol_ratio = std::numeric_limits<double>::quiet_NaN();
     double entry_box_atr   = std::numeric_limits<double>::quiet_NaN();
-    double entry_taker     = std::numeric_limits<double>::quiet_NaN();   // 开仓那根的主动买入占比（海龟）
+    double entry_taker     = std::numeric_limits<double>::quiet_NaN();   // 开仓那根的主动买入占比（趋势跟踪）
 };
 
 // 一次被过滤掉的突破（每个 bot 每根K线最多一次）。数据记录层用：事后看这些被拦下的
@@ -406,6 +407,7 @@ public:
     // 判定用【保证金】口径（名义 ÷ 杠杆），与界面上"账户总保证金上限"同名同义。
     // 新仓的占用按 budget_usdt ÷ leverage 估——等风险模式下实际名义可能更小，
     // 所以这是保守估计：宁可早拦一点，不要漏拦
+    void set_risk_limits(double total, double direction, double cost_bps);
     void set_max_total_margin(double usdt);
     void set_max_open_positions(int n);
 
@@ -427,12 +429,6 @@ public:
     void set_priority_reserve(int reserve, double min_score);
     // 智能模式每轮扫描后写入排名与分数（界面显示、名额取舍用）
     void set_smart_meta(const std::string& bot_id, double score, int rank, char list);
-    // 智能裸K 点火：不看这个 bot 自己的入场信号，按给定价格立刻开仓，初始止损用 stop
-    // （点火K线最低点）。待移出也照开（裸K 的 bot 一建好就标待移出，自己不开仓）。
-    // 账户级闸门照常拦。vol / box 记进这一笔（入场量比、入场箱体ATR）。
-    // 返回空串 = 已提交下单，否则是没开的原因
-    std::string force_open(const std::string& bot_id, trend::Pos dir, double price, double stop,
-                           char trigger, double vol, double box);
     // 标为待移出：手上的仓位照常管到平仓，平仓后不再开新仓。on=false 撤销
     // （关掉智能模式又用同一套策略打开：这些 bot 重新归它管）
     void set_retiring(const std::string& bot_id, bool on = true);
@@ -440,7 +436,7 @@ public:
     // 用户在策略弹窗里亲手改了一个自动 bot 的参数，就是在接管它
     void release_auto(const std::string& bot_id);
     // 持仓中换出场参数（追踪 ATR 倍数、锁定 ATR、暴涨收紧、收益率追踪止盈、保本、假突破、
-    // 初始止损上限、波动顺势的反手触发与护栏），周期 / 杠杆 / 仓位 / 入场过滤不动。
+    // 初始止损上限和反手护栏），周期 / 杠杆 / 仓位 / 入场过滤不动。
     // 止损线照旧走棘轮：放宽不会把线往回挪，收紧可能当拍就触线。返回 true = 有改动
     bool update_exit_params(const std::string& bot_id, const trend::Config& want);
 
@@ -464,11 +460,8 @@ public:
                        double box_atr = 0, double vol_ratio = 0,
                        bool er_ok = false, double er = 0, double prev_close = 0,
                        double taker_ratio = std::numeric_limits<double>::quiet_NaN(),
-                       double range_pace = 0, double bar_open = 0);
-    // ④ 波动顺势：快照停在上一根（新K线已经开始、还没拉到）= 本根开盘价不知道，不开新仓。
-    // 应用层据此在K线交接时立刻补拉，不等下一个拉取周期
-    static bool vf_bar_stale(const TrendBot& b, int64_t now_ms);
-    // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：海龟要的是
+                       double range_pace = 0, const following::Signal& following = {});
+    // K线快照（裸K 与 抛物线SAR 用）。与 update_signal 分开：趋势跟踪要的是
     // ATR+通道，这两个要的是原始高低点，合成一个大函数会让调用方被迫为
     // 用不到的参数填占位值。
     //
@@ -648,6 +641,8 @@ private:
     double plan_qty(const TrendConfig& cfg, double price, double stop_price) const;
     // 账户级闸门：空串=放行，否则是拦截原因。⚠ 调用方须已持 mtx_
     std::string open_gate_block(const TrendBot& self) const;
+    std::string risk_gate_block(const TrendBot& self, trend::Pos dir, double risk) const;
+    double max_total_risk_ = 0, max_direction_risk_ = 0, risk_cost_rate_ = 0;
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;

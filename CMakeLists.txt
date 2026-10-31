@@ -1,17 +1,19 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 5.11.0 LANGUAGES CXX)
+project(TradingBot VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(_ccbot_gui_default OFF)
+if(WIN32 OR APPLE)
+    set(_ccbot_gui_default ON)
+endif()
+option(CCBOT_BUILD_GUI "构建 Qt 图形界面（关闭后只构建 headless 与测试）" ${_ccbot_gui_default})
 
 # 版本号唯一来源：上面那行。窗口标题和 headless 启动横幅都从这里取（src/version.h），
 # 发版时只改一处。发布流水线的泄漏检查会核对 tag 版本号确实内嵌在可执行文件里，
 # 所以"改了 tag 忘了改源码"会被门禁拦住而不是发到用户手上
 set(CCBOT_VERSION_DEF CCBOT_VERSION="${PROJECT_VERSION}")
-
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTORCC ON)
 
 # ── 警告门禁 ──────────────────────────────────────────────────────────────────
 # 在此之前本项目【一个警告开关都没开】——三个编译器只兑现了"能编过"这一层保证，
@@ -86,9 +88,6 @@ function(ccbot_harden tgt)
     endif()
 endfunction()
 
-# ixwebsocket 已于 v5.9.9 移除：它只服务 book_ticker_stream（WebSocket 行情），
-# 而那个文件自 v5.7.0 起就不在生产路径上（见 CORE_SOURCES 那段）。
-# HMAC 签名用的 mbedtls 是下面独立 find 的，不经过它
 find_package(simdjson CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 find_package(MbedTLS CONFIG REQUIRED)
@@ -103,18 +102,7 @@ set(CORE_SOURCES
     src/app/smart_runner.cpp
     src/net/trading_client.cpp
     src/net/rate_gate.cpp
-    # 行情源：REST 轮询。v5.7.0 起替代 book_ticker_stream（WebSocket）。
-    # 理由见 rest_price_feed.h 的头注释：WS 有"连上了却没有数据"这个失败模式，
-    # 识别它要背六种机制，而轮询没有"连接"这个中间状态，压根不存在那个问题。
-    #
-    # book_ticker_stream.{cpp,h} 与它的测试 test_price_feed.cpp 已于 v5.9.9 删除
-    # （共约 2030 行）。v5.7.0~v5.9.8 期间它留在仓库里"作为将来的低延迟来源"，
-    # 但那段时间它的代价是每轮都在付的：
-    #   · ixwebsocket 这个依赖只为它而存在
-    #   · 它的 128 条断言让全仓断言总数虚高约 16%（测的是不在跑的代码）
-    #   · 每轮 CI 都要编译、链接、运行它
-    # 那套陈旧/静默/分片判定的知识没有丢：它在 git 历史与 v5.9.8 及之前的
-    # 每个 tag 里都完整可取。真要重新接 WS，从那里拿比留着它腐烂便宜
+    # GUI 与 headless 统一使用 REST 行情。
     src/net/rest_price_feed.cpp
     src/net/alert.cpp
 )
@@ -126,13 +114,16 @@ set(CORE_LIBS
 )
 
 # ── GUI 版（Qt Widgets，Windows / macOS）──────────────────────────────────────
-if(WIN32 OR APPLE)
+if(CCBOT_BUILD_GUI)
     find_package(Qt6 COMPONENTS Widgets REQUIRED)
 
     # 图标资源。app.qrc（窗口/任务栏图标，AUTORCC 编译）两个平台都要；
     # app.rc（exe 文件本身的图标）是 Windows 资源脚本，只有 MSVC 认
     set(APP_ICON_SOURCES assets/app.qrc)
-    if(WIN32)
+    if(MSVC)
+        list(APPEND APP_ICON_SOURCES assets/app.rc)
+    elseif(MINGW)
+        enable_language(RC)
         list(APPEND APP_ICON_SOURCES assets/app.rc)
     endif()
 
@@ -146,6 +137,7 @@ if(WIN32 OR APPLE)
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
+    set_target_properties(TradingBot PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON)
     target_include_directories(TradingBot PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(TradingBot PRIVATE ${CORE_LIBS} Qt6::Widgets)
     target_compile_definitions(TradingBot PRIVATE ${CCBOT_VERSION_DEF})
@@ -161,13 +153,15 @@ if(WIN32 OR APPLE)
             set(_vcpkg_inst "${CMAKE_BINARY_DIR}/vcpkg_installed")
         endif()
 
-        add_custom_command(TARGET TradingBot POST_BUILD
+        if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET STREQUAL "x64-windows")
+            add_custom_command(TARGET TradingBot POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:TradingBot>/platforms"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_vcpkg_inst}/x64-windows/Qt6/plugins/platforms/qwindows.dll"
                 "$<TARGET_FILE_DIR:TradingBot>/platforms/qwindows.dll"
-        )
+            )
+        endif()
     elseif(APPLE)
         # 密钥存储走系统钥匙串（key_store.cpp 的 __APPLE__ 分支）
         target_link_libraries(TradingBot PRIVATE
@@ -195,36 +189,6 @@ if(MSVC)
     # 不链接 Qt6，拿不到 Qt 自带的 /utf-8 编译选项，源文件里的中文注释要自己声明编码
     target_compile_options(ccbot_headless PRIVATE /utf-8)
 endif()
-
-# ── 回测已移出本仓库（v4.0.13）────────────────────────────────────────────────
-# src/backtest/ 整个子系统（3418 行，占当时代码量 18%）连同 ccbot_backtest 目标
-# 一并删除，回测由独立项目承担。
-#
-# 删它的理由不只是省代码量：那套东西是【第二份策略逻辑】。它要重新实现指标
-# 推进、K线聚合、撮合、资金费，任何一处与实盘的偏差都会让回测结论悄悄失真，
-# 而偏差在哪儿只有踩到才知道。v4.0.7 的涨幅拦截就已经出现"回测侧未实现，
-# 强制归零"这种补丁——两套逻辑之间的缝开始显形。本仓库现在只留一条真相。
-#
-# 保留的是 EngineHost 的时钟/执行器注入（engine_host.h）：那不是为回测存在的，
-# 单元测试的虚拟时钟与确定性复现全靠它。
-#
-# 历史结论仍记录在 docs/BACKTEST.md 与各处代码注释里，只是产生它们的工具搬走了。
-
-# ── 网格DCA 已整体移除（本版）──────────────────────────────────────────────────
-# CcgEngine（1809 行）、decision.h（DCA 入场拦截）、headless_state（DCA 落盘）、
-# tools/ladder_depth（梯子深度推演，纯 DCA 工具）连同 ccg_risk_tests /
-# ccg_persist_tests / ccg_stress_tests 一并删除。
-#
-# 不是"暂时停用"而是删干净：本仓库现在只做一件事——为趋势类策略提供稳定的
-# 实时行情。两套并列策略时期最大的成本不是代码量，是每改一处共享代码都要同时
-# 保两套语义不变，而 DCA 的补仓/止盈语义建立在"每 3 秒一次、价格用标记价"
-# 这个节拍上，行情层要改成事件驱动就必须先把这份约束拿掉。
-#
-# DCA 的实测结论（哪些参数有效、哪些被证伪）保留在 docs/NEGATIVE_RESULTS.md，
-# 代码删了但花钱买来的结论不删。
-#
-# ccg_stress_tests 删除后，并发压力覆盖由 ccg_trend_stress_tests 承担——
-# 那是 TSan 矩阵里的目标之一，不能随 DCA 一起消失（见下）。
 
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──
 add_executable(ccg_indicator_tests tests/test_indicators.cpp)
@@ -334,11 +298,6 @@ if(MSVC)
     target_compile_options(ccg_timesync_tests PRIVATE /utf-8)
 endif()
 
-# ccg_price_tests（book_ticker_stream 的测试）已于 v5.9.9 随被测对象一并删除。
-# 它的 128 条断言测的是自 v5.7.0 起就不在生产路径上的代码 —— 留着它，
-# 全仓断言总数就一直虚高约 16%。v5.9.3 揪出过"陈旧 exe 让统计虚高 135 条"，
-# 那是同一种病的另一种形态：那次是产物陈旧，这次是被测对象已经下线
-
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
@@ -392,18 +351,13 @@ if(MSVC)
     target_compile_options(ccg_journal_tests PRIVATE /utf-8)
 endif()
 
-# ccg_persist_tests 随网格DCA 一并移除（本版）：它测的是 headless_state 的
-# DCA 落盘往返。SAR 侧的同类覆盖在 ccg_trend_state_tests 里，一条不少。
-#
-# ccg_liq_tests 随回测子系统一并移除（v4.0.13）。它测的全部是【回测模拟器
-# 内部】的强平会计（PortfolioResult / MultiSimClient / run_portfolio），
-# 实盘引擎侧不损失任何覆盖——实盘的强平价来自交易所，不由本地逻辑推算。
-
 # ── 凭证存储格式测试（含加账户类型字段后的向后兼容）──────────────────────────
 add_executable(ccg_key_store_tests tests/test_key_store.cpp src/core/key_store.cpp)
 target_include_directories(ccg_key_store_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(MSVC)
     target_compile_options(ccg_key_store_tests PRIVATE /utf-8)
+endif()
+if(WIN32)
     target_link_libraries(ccg_key_store_tests PRIVATE crypt32)
 elseif(APPLE)
     target_link_libraries(ccg_key_store_tests PRIVATE
@@ -423,9 +377,16 @@ set(CCBOT_OWN_TARGETS
     ccg_key_store_tests ccg_rest_feed_tests ccg_app_logic_tests ccg_smart_tests
     ccg_smart_runner_tests ccg_journal_tests
 )
-if(WIN32 OR APPLE)
+if(TARGET TradingBot)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)
 endif()
 foreach(t ${CCBOT_OWN_TARGETS})
     ccbot_harden(${t})
+endforeach()
+
+enable_testing()
+foreach(t ${CCBOT_OWN_TARGETS})
+    if(t MATCHES "^ccg_.*_tests$")
+        add_test(NAME ${t} COMMAND ${t})
+    endif()
 endforeach()

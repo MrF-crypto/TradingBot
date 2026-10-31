@@ -49,6 +49,27 @@ static const char* kExchangeInfo =
     R"({"filterType":"PRICE_FILTER","tickSize":"0.10"}]}]})";
 
 int main() {
+    for (const auto mode : {TradingClient::AccountMode::Futures, TradingClient::AccountMode::PortfolioMargin}) {
+        auto cfg = test_cfg(); cfg.account_mode = mode;
+        TradingClient tc(cfg);
+        std::string status = "NEW", used_path;
+        tc.set_test_hook([&](const std::string&, const std::string& path,
+                            const std::string&, TradingClient::FakeReply& out) {
+            used_path = path;
+            out.body = "{\"orderId\":1,\"status\":\"" + status + "\",\"executedQty\":\"0\",\"avgPrice\":\"0\"}";
+            return true;
+        });
+        check(!tc.opening_order_terminal("BTCUSDT", "pending-id"), "NEW order cannot release risk reservation");
+        check(used_path.find(mode == TradingClient::AccountMode::Futures ? "/fapi/v1/order" : "/papi/v1/um/order") != std::string::npos,
+              "order recovery uses the correct account-mode endpoint");
+        status = "PARTIALLY_FILLED";
+        check(!tc.opening_order_terminal("BTCUSDT", "pending-id"), "partial nonterminal order stays reserved");
+        status = "FILLED";
+        check(tc.opening_order_terminal("BTCUSDT", "pending-id"), "FILLED order has confirmed terminal status");
+        status = "EXPIRED";
+        check(tc.opening_order_terminal("BTCUSDT", "pending-id"), "EXPIRED order has confirmed terminal status");
+    }
+
     std::printf("── 用例1：下单超时，但订单其实已成交 ──\n");
     {
         // 最危险的场景：请求超时（空响应），而订单其实已经到达交易所并成交。

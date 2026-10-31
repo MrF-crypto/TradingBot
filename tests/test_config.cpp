@@ -76,7 +76,7 @@ int main() {
         // （而不是抄一遍字面量），所以引擎改默认值时这里不会悄悄漂走
         const TrendConfig def;
         const auto& g = hc.trend_bots[0];
-        check(g.rule.strategy == def.rule.strategy,                "  策略默认是海龟");
+        check(g.rule.strategy == def.rule.strategy,                "  策略默认是趋势跟踪");
         check(g.rule.donchian_period == def.rule.donchian_period, "  通道周期取默认值");
         check(g.rule.atr_period == def.rule.atr_period,           "  ATR周期取默认值");
         eqd(g.rule.atr_mult, def.rule.atr_mult, "  k 取默认值");
@@ -226,6 +226,21 @@ int main() {
         check(!load_headless_config(path, hc4, err4), "没有手动 bot 且智能模式关着：拒绝启动（什么都不会跑）");
     }
     {
+        for (const auto* strategy : {"trend_following", "turtle"}) {
+            write_file(path, std::string("{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"") + strategy + "\"}]}");
+            HeadlessConfig hc; std::string err;
+            check(load_headless_config(path, hc, err) && hc.trend_bots.size() == 1 &&
+                  hc.trend_bots[0].rule.strategy == trend::Strategy::TrendFollowing,
+                  std::string("新旧趋势跟踪名称兼容：") + strategy);
+        }
+        for (const auto* strategy : {"bare", "vol"}) {
+            write_file(path, std::string("{\"api_key\":\"k\",\"api_secret\":\"s\",\"smart_mode\":{\"enabled\":true,\"strategy\":\"") + strategy + "\"}}");
+            HeadlessConfig hc; std::string err;
+            check(!load_headless_config(path, hc, err) && err.find("trend_following") != std::string::npos,
+                  std::string("已移除智能策略不能静默启动：") + strategy);
+        }
+    }
+    {
         // 裸K 信号K量比
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
                          "\"trend_bots\":[{\"symbol\":\"BTCUSDT\",\"strategy\":\"bare_k\","
@@ -373,7 +388,7 @@ int main() {
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err) && hc.trend_bots.size() == 2 &&
                   hc.trend_bots[0].rule.once_per_bar && !hc.trend_bots[1].rule.once_per_bar,
-              "海龟也认 once_per_bar（手动 bot 不写 = 关）: " + err);
+              "趋势跟踪也认 once_per_bar（手动 bot 不写 = 关）: " + err);
     }
     {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
@@ -385,7 +400,7 @@ int main() {
                   hc.trend_bots[0].rule.max_chase_atr == 1.5 &&
                   hc.trend_bots[0].rule.max_init_loss_pct == 6 &&
                   hc.trend_bots[1].rule.max_chase_atr == 0 && hc.trend_bots[1].rule.max_init_loss_pct == 0,
-              "海龟认追高与初始止损上限（不写 = 关）: " + err);
+              "趋势跟踪认追高与初始止损上限（不写 = 关）: " + err);
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"max_init_loss_pct\":-1}]}");
         HeadlessConfig hc2;
@@ -397,7 +412,7 @@ int main() {
         HeadlessConfig hc3;
         check(load_headless_config(path, hc3, err) && hc3.trend_bots[0].rule.breakeven &&
                   hc3.trend_bots[0].rule.breakeven_start == 6,
-              "海龟认保本止损: " + err);
+              "趋势跟踪认保本止损: " + err);
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"breakeven\":true,"
                          "\"breakeven_start\":12,\"roi_trail\":true,\"roi_trail_start\":10}]}");
@@ -412,7 +427,7 @@ int main() {
         HeadlessConfig hc5;
         check(load_headless_config(path, hc5, err) && hc5.trend_bots[0].rule.expand_long &&
                   hc5.trend_bots[0].rule.expand_long_min == 3 && !hc5.trend_bots[1].rule.expand_long,
-              "海龟认多单波动放大（不写 = 关）: " + err);
+              "趋势跟踪认多单波动放大（不写 = 关）: " + err);
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"turtle\",\"expand_long_min\":0}]}");
         HeadlessConfig hc6;
@@ -445,7 +460,7 @@ int main() {
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\",\"trend_bots\":["
                          "{\"symbol\":\"BTCUSDT\",\"strategy\":\"martingale\"}]}");
         HeadlessConfig hc; std::string err;
-        check(!load_headless_config(path, hc, err), "未知 strategy 应被拒绝而不是默默跑海龟");
+        check(!load_headless_config(path, hc, err), "未知 strategy 应被拒绝而不是默默跑趋势跟踪");
     }
 
     // ── ②c 旧键迁移：必须被明确报出来，不能静默改变行为 ─────────────────────

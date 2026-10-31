@@ -212,8 +212,8 @@ static void part_a_concurrency() {
             c.rule.max_consecutive_reverses = 3;
             c.rule.cooldown_bars            = 2;
             psar_syms.insert(s);
-        } else {                                    // ① 海龟
-            c.rule.strategy = trend::Strategy::Turtle;
+        } else {                                    // ① 趋势跟踪
+            c.rule.strategy = trend::Strategy::TrendFollowing;
             c.rule.atr_mult = 3.0;
             c.rule.reverse  = (s == "SOLUSDT") ? trend::ReverseMode::Immediate
                                                : trend::ReverseMode::None;
@@ -260,7 +260,7 @@ static void part_a_concurrency() {
             for (const auto& s : syms) {
                 const std::string& id = ids[s];
                 if (bare_syms.count(s) || psar_syms.count(s)) {
-                    // ⚠ v5.1 起 update_bars【自己】置 sig_ok，非海龟策略只调这一次。
+                    // ⚠ v5.1 起 update_bars【自己】置 sig_ok，非趋势跟踪策略只调这一次。
                     //   上一版必须成对调用 update_signal 才能把 sig_ok 置起，
                     //   漏一次的表现是"配置正常、日志正常、一单不开"
                     TrendEngine::BarSnap bs;

@@ -174,7 +174,6 @@ MainWindow::~MainWindow() {
     if (tradesDirty_) save_trades(true);
     if (trend_engine_) save_trend_bots();
 
-    // ④ 没排空就【不要】走正常析构路径。
     //
     // 在途任务捏着引擎的裸指针，而成员逆序析构会先销毁 bots_/mtx_——
     // 任务一访问就是 use-after-free。v4.0.1 加"等排空"正是为了消除它，但超时
@@ -650,7 +649,7 @@ void MainWindow::openTradeHistoryDialog() {
             };
             QStringList parts;
             parts << (std::isfinite(r)   ? sg(r, 2) + "R"     : QString("R 算不了（没有初始止损记录）"));
-            parts << (std::isfinite(atr) ? sg(atr, 2) + "ATR" : QString("ATR 算不了（非海龟或老仓位）"));
+            parts << (std::isfinite(atr) ? sg(atr, 2) + "ATR" : QString("ATR 算不了（非趋势跟踪或老仓位）"));
             if (std::isfinite(pct)) parts << sg(pct, 2) + "%";
             it->setToolTip(QString("%1 %2").arg(name, parts.join(" / ")));
             return it;
@@ -1293,6 +1292,13 @@ void MainWindow::onConnect() {
 
             // 恢复上次保存的 Bot
             load_and_restore_trend();
+            if (trendStateBlocked_) {
+                tick_timer_->stop();
+                ticker_->stop();
+                trend_engine_.reset();
+                setConnState(ConnState::Failed);
+                return;
+            }
             // 智能模式：运行器持有引擎指针，随引擎一起重建
             startSmartRunner();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
@@ -1591,13 +1597,6 @@ void MainWindow::openStrategyDialog(const std::string& symbol) {
     const TrendBot* trendBot = nullptr;
     for (const auto& b : bots)
         if (b.cfg.symbol == symbol) { trendBot = &b; break; }
-    // 波动顺势只给智能模式用，手动表单没有这一页：在这里改会把它悄悄变成海龟
-    if (trendBot && trendBot->cfg.rule.strategy == trend::Strategy::VolFollow) {
-        QMessageBox::information(this, "波动顺势",
-            "这个 bot 是智能模式「波动顺势」管理的，参数在智能模式设置里改。");
-        return;
-    }
-
     QDialog dlg(this);
     dlg.setWindowTitle(QString("趋势策略配置 - %1").arg(QString::fromStdString(symbol)));
     dlg.resize(860, 760);
@@ -1785,14 +1784,12 @@ void MainWindow::onTick() {
         // 每个 bot 按自己周期该有的节奏拉：4h 的每 60 秒一次就够，3m 的要 45 秒
         // 一次才不会错过收盘。tick 是 3 秒一拍，所以除以 3 换算成拍数
         const bool forced = trendSigForce_.exchange(false);
-        const int64_t now_ms = QDateTime::currentMSecsSinceEpoch();
         std::vector<TrendBot> need;
         for (const auto& b : trend_engine_->get_bots()) {
             if (b.state != TrendBot::State::Running) continue;
             const int ticks = std::max(1,
                 TrendEngine::signal_period_sec(b.cfg.interval) / 3);
-            // 波动顺势看的是正在走的这根：K线一交接就补拉，不等下一个周期（最多晚 60 秒）
-            if (forced || (slowTickCount_ % ticks) == 1 || TrendEngine::vf_bar_stale(b, now_ms))
+            if (forced || (slowTickCount_ % ticks) == 1)
                 need.push_back(b);
         }
         if (!need.empty()) {
@@ -1814,8 +1811,7 @@ void MainWindow::onTick() {
                   try {
                     const auto& b = need[idx];
                     if (!client_ || !trend_engine_) return;
-                    if (b.cfg.rule.strategy != trend::Strategy::Turtle &&
-                        b.cfg.rule.strategy != trend::Strategy::VolFollow) {
+                    if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) {
                         auto bp = client_->fetch_bar_pattern(
                             b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
                         if (!bp.ok) { mark_failed(b.cfg.symbol); return; }
@@ -1848,7 +1844,7 @@ void MainWindow::onTick() {
                     }
                     auto snap = client_->fetch_trend_signal(
                         b.cfg.symbol, b.cfg.interval,
-                        b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
+                        b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.cfg.rule.following);
                     if (!snap.ok) {
                         mark_failed(b.cfg.symbol);
                         return;
@@ -1861,7 +1857,7 @@ void MainWindow::onTick() {
                                                b.cfg.rule.vol_paced ? snap.vol_ratio_paced
                                                                     : snap.vol_ratio,
                                                snap.er_ok, snap.er, snap.prev_close,
-                                               snap.taker_ratio, snap.range_pace, snap.bar_open);
+                                               snap.taker_ratio, snap.range_pace, snap.following);
                   } catch (...) {
                     // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
                     mark_failed(need[idx].cfg.symbol);
@@ -2301,8 +2297,6 @@ void MainWindow::unsubscribeIfUnused(const std::string& symbol) {
     // 价格——止损线永远不会被触发，仓位静默裸奔
     for (const auto& b : trend_engine_->get_bots())
         if (b.cfg.symbol == symbol) return;
-    // 智能裸K 的埋伏池在盯它（bot 删了，币还在池里，之后还能再点火）
-    if (smart_ && smart_->watching(symbol)) return;
     ticker_->unsubscribe(symbol);
 }
 

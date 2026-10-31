@@ -1,16 +1,24 @@
 {
-  "name": "ccg-monitor",
-  "version": "5.11.0",
-  "description": "TradingBot — Binance USDT-M 永续合约趋势策略交易程序：海龟/抛物线SAR/纯裸K 三策略，含 GUI 与 headless 两个可执行文件",
+  "name": "tradingbot",
+  "version": "1.0.0",
+  "description": "TradingBot — Binance USDT-M 趋势跟踪交易框架，含单一策略智能模式、手动策略、GUI 与 headless",
+  "default-features": ["gui"],
   "dependencies": [
     "simdjson",
     "curl",
-    "mbedtls",
-    {
-      "name": "qtbase",
-      "default-features": true,
-      "features": ["widgets"],
-      "platform": "windows | osx"
+    "mbedtls"
+  ],
+  "features": {
+    "gui": {
+      "description": "Qt Widgets 图形界面",
+      "dependencies": [
+        {
+          "name": "qtbase",
+          "default-features": false,
+          "features": ["widgets", "thread", "pcre2", "png"],
+          "platform": "windows | osx"
+        }
+      ]
     }
-  ]
+  }
 }

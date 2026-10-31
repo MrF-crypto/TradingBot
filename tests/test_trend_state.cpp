@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -192,7 +193,7 @@ int main() {
         }
     }
 
-    // ── 开仓时 ATR 跨重启存活（海龟锁定 ATR / 加速收紧的基准）───────────────
+    // ── 开仓时 ATR 跨重启存活（趋势跟踪锁定 ATR / 加速收紧的基准）───────────────
     {
         auto b = mk_bot("BTCUSDT", trend::Pos::Long, 100, 100, 94, 1);
         b.st.entry_atr = 2.345678901234;
@@ -237,45 +238,21 @@ int main() {
         check(!flat_back, "没有模板：空仓的自动 bot 丢弃");
     }
 
-    // ── 智能裸K 的 bot：名单代码 K 随仓位落盘，恢复时用裸K 模板而不是海龟模板 ──
-    {
-        auto k = mk_bot("BAREAUSDT", trend::Pos::Long, 100, 103, 97, 1);
-        k.is_auto = true;
-        k.smart_list = 'K';
-        k.open_trigger = 'I';
-        k.open_vol_ratio = 3.25;
-        k.open_taker = 0.625;
-        auto t = mk_bot("TURTAUSDT", trend::Pos::Long, 100, 100, 94, 1);
-        t.is_auto = true;
-        t.smart_list = 'M';
-        save_trend_state(path, {k, t});
-
-        TrendConfig tmpl = mk_cfg("");
-        tmpl.interval = "1h";
-        TrendConfig bare = mk_cfg("");
-        bare.interval = "1h";
-        bare.rule.atr_mult  = 2.5;                              // 裸K 自己的 k，和海龟模板区分开
-        bare.rule.direction = trend::Direction::LongOnly;
-        auto got = load_trend_state(path, {}, &tmpl, &bare);
-        bool k_ok = false, t_ok = false;
-        for (const auto& g : got) {
-            if (g.cfg.symbol == "BAREAUSDT")
-                k_ok = g.cfg.rule.atr_mult == 2.5 && g.cfg.rule.direction == trend::Direction::LongOnly &&
-                       g.smart_list == 'K' && g.open_trigger == 'I' &&
-                       std::fabs(g.open_vol_ratio - 3.25) < 1e-6 && std::isnan(g.open_box_atr) &&
-                       std::fabs(g.open_taker - 0.625) < 1e-6;
-            if (g.cfg.symbol == "TURTAUSDT")
-                t_ok = g.cfg.rule.atr_mult != 2.5 && g.smart_list == 'M' && std::isnan(g.open_taker);
-        }
-        check(k_ok, "裸K 的 bot 用裸K 模板恢复，名单代码、触发方式、开仓量比、主动买入占比接得上（箱体没有仍是 NaN）");
-        check(t_ok, "  海龟的自动 bot 照旧用海龟模板");
-
-        auto got2 = load_trend_state(path, {}, nullptr, &bare);
-        bool k_back = false;
-        for (const auto& g : got2)
-            if (g.cfg.symbol == "BAREAUSDT")
-                k_back = (g.cfg.rule.atr_mult == 2.5 && g.st.pos == trend::Pos::Long);
-        check(k_back, "  智能模式已关：持仓中的裸K bot 仍按裸K 参数恢复（不套默认海龟）");
+    // 已移除策略的旧持仓必须拒绝启动，不能改套趋势跟踪参数。
+    for (const char list : {'K', 'V'}) {
+        TrendConfig tmpl;
+        TrendBot legacy = mk_bot("OLDUSDT", trend::Pos::Long, 100, 100, 95, 1);
+        legacy.is_auto = true; legacy.smart_list = list;
+        legacy.st.pos = trend::Pos::Long;
+        legacy.st.entry_price = 100; legacy.st.stop = 95; legacy.qty = 1;
+        save_trend_state(path, {legacy});
+        bool rejected = false;
+        try { load_trend_state(path, {}, &tmpl); }
+        catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("OLDUSDT") != std::string::npos; }
+        check(rejected, "旧智能策略持仓拒绝恢复，并指出品种");
+        legacy.st.pos = trend::Pos::Flat; legacy.qty = 0;
+        save_trend_state(path, {legacy});
+        check(load_trend_state(path, {}, &tmpl).empty(), "旧智能策略空仓条目可安全移除");
     }
 
     // ── 半截状态防御：有方向却没有止损线 ─────────────────────────────────────
@@ -443,6 +420,25 @@ int main() {
               "同品种重复恢复应被拒");
         check(eng.add_bot(mk_cfg("BTCUSDT")).empty(),
               "已恢复的品种再 add_bot 应被拒（否则会开出第二笔）");
+    }
+
+    {
+        auto unknown = mk_bot("UNKNOWNUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        unknown.is_auto = true; unknown.open_uncertain = true;
+        unknown.reserved_risk = 2.3; unknown.reserved_margin = 10;
+        unknown.reserved_dir = trend::Pos::Long;
+        unknown.uncertain_client_id = "persist-client-id";
+        save_trend_state(path, {unknown});
+        const auto loaded = load_trend_state(path, {});
+        check(loaded.size() == 1 && loaded[0].open_uncertain &&
+              loaded[0].reserved_risk == 2.3 && loaded[0].uncertain_client_id == "persist-client-id",
+              "disabled smart mode still restores unknown opening reservations");
+        TrendEngine engine(cli, inline_host());
+        if (!loaded.empty()) {
+            const auto id = engine.restore_bot(loaded[0]);
+            check(!engine.remove_if_flat(id) && engine.replace_bot(id, mk_cfg("UNKNOWNUSDT")).empty(),
+                  "unknown opening cannot be evicted or replaced as an empty bot");
+        }
     }
 
     std::remove(path.c_str());

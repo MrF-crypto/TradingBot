@@ -1,11 +1,12 @@
 // 趋势决策核心的单元测试——纯计算，不连网络。
-// 三个策略（① 海龟 ② 抛物线SAR ③ 纯裸K）各一段，外加一段共享语义。
+// 三个策略（① 趋势跟踪 ② 抛物线SAR ③ 纯裸K）各一段，外加一段共享语义。
 // 全部通过打印 OK 并 exit 0，否则打印失败断言并 exit 1。
 #include "core/trend_decision.h"
 #include "core/indicators.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
+#include <string>
 
 using namespace ccbot::trend;
 using ccbot::indicators::Ohlc;
@@ -24,7 +25,7 @@ static bool near(double a, double b, double eps = 1e-6) {
     return std::fabs(a - b) < eps;
 }
 
-// ① 海龟的输入：通道 [90,110]，ATR=2
+// ① 趋势跟踪的输入：通道 [90,110]，ATR=2
 // 注：on_filled 的第4参是【止损线】而非 ATR（k=3、ATR=2 ⇒ 距离 6）
 static Inputs mk(double price, double atr = 2.0,
                  double up = 110, double dn = 90) {
@@ -35,11 +36,11 @@ static Inputs mk(double price, double atr = 2.0,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ① 海龟（唐奇安突破 + Chandelier ATR）
+// ① 趋势跟踪（唐奇安突破 + Chandelier ATR）
 // ─────────────────────────────────────────────────────────────────────────────
-static void test_turtle() {
-    Config cfg;   // 默认：Turtle / 20 / 14 / k=3 / 不反手 / 不限次数 / 不冷却
-    CHECK(cfg.strategy == Strategy::Turtle, "默认策略应是海龟");
+static void test_trend_following() {
+    Config cfg;   // 默认：TrendFollowing / 20 / 14 / k=3 / 不反手 / 不限次数 / 不冷却
+    CHECK(cfg.strategy == Strategy::TrendFollowing, "默认策略应是趋势跟踪");
     CHECK(cfg.reverse == ReverseMode::None, "默认应【不反手】——震荡市的保命默认值");
     CHECK(cfg.max_consecutive_reverses == 0 && cfg.cooldown_bars == 0,
           "反手刹车默认关闭（不反手就不会有连续反手）");
@@ -411,14 +412,14 @@ static void test_psar() {
               "PSAR 盈利触及同样翻转——这是 stop-and-reverse 的定义");
     }
 
-    // ── 对照组：同样的局面，海龟必须只平不反 ─────────────────────────────────
+    // ── 对照组：同样的局面，趋势跟踪必须只平不反 ─────────────────────────────────
     {
         Config t; t.reverse = ReverseMode::Immediate;   // 连反手都开着
         State st;
         on_filled(st, Pos::Long, 100, 94, t, false);
         step(st, t, mk(120));
         auto v = step(st, t, mk(114, 2.0, 130, 114));
-        CHECK(v.action == Action::Close, "海龟盈利出场永不反手（与 PSAR 对照）");
+        CHECK(v.action == Action::Close, "趋势跟踪盈利出场永不反手（与 PSAR 对照）");
     }
 
     // ── 亏损触及也翻转 ──────────────────────────────────────────────────────
@@ -798,7 +799,7 @@ static void test_bare_k() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ① 海龟 · 横盘突破过滤（箱体 ≤ x ATR、突破量比 ≥ y）
+// ① 趋势跟踪 · 横盘突破过滤（箱体 ≤ x ATR、突破量比 ≥ y）
 // ─────────────────────────────────────────────────────────────────────────────
 static Inputs sq_in(double price, double box_atr, double vol_ratio) {
     Inputs in = mk(price);          // 通道 [90, 110]，ATR 2
@@ -969,7 +970,7 @@ static void test_squeeze_filter() {
         // 其它策略即便字段里有值也不生效
         Config ck = c;
         ck.strategy = Strategy::BareK;
-        CHECK(!squeeze_filter_on(ck), "过滤只属于海龟");
+        CHECK(!squeeze_filter_on(ck), "过滤只属于趋势跟踪");
     }
 }
 
@@ -1184,7 +1185,7 @@ static void test_bare_regime() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ① 海龟出场优化：锁定 ATR / 盈利后加速收紧
+// ① 趋势跟踪出场优化：锁定 ATR / 盈利后加速收紧
 // ─────────────────────────────────────────────────────────────────────────────
 static void test_exit_opt() {
     auto open_long = [](const Config& c) {
@@ -1213,18 +1214,18 @@ static void test_exit_opt() {
         step(st, c, mk(110, 2.0));
         CHECK(near(st.stop, 104.0), "浮盈 5ATR < 6：k 仍为 3（110 − 6）");
         step(st, c, mk(112, 2.0));
-        CHECK(near(turtle_k(st, c), 2.0) && near(st.stop, 108.0), "浮盈 6ATR：k=2（112 − 4）");
+        CHECK(near(trailing_atr_mult(st, c), 2.0) && near(st.stop, 108.0), "浮盈 6ATR：k=2（112 − 4）");
         step(st, c, mk(120, 2.0));
-        CHECK(near(turtle_k(st, c), 1.5) && near(st.stop, 117.0), "浮盈 10ATR：k=1.5（120 − 3）");
+        CHECK(near(trailing_atr_mult(st, c), 1.5) && near(st.stop, 117.0), "浮盈 10ATR：k=1.5（120 − 3）");
         step(st, c, mk(118, 2.0));
-        CHECK(near(turtle_k(st, c), 1.5) && near(st.stop, 117.0),
+        CHECK(near(trailing_atr_mult(st, c), 1.5) && near(st.stop, 117.0),
               "回落时 k 不回升（按极值算），止损棘轮不退");
     }
     {
         Config c; c.accel_exit = true; c.atr_mult = 1.0;
         State st = open_long(c);
         step(st, c, mk(112, 2.0));
-        CHECK(near(turtle_k(st, c), 1.0), "用户 k 本来就比档位小：不放大");
+        CHECK(near(trailing_atr_mult(st, c), 1.0), "用户 k 本来就比档位小：不放大");
     }
     {
         Config c; c.lock_atr = true; c.accel_exit = true;
@@ -1239,7 +1240,7 @@ static void test_exit_opt() {
         State st;
         on_filled(st, Pos::Short, 100, 106, c, false, 0, 2.0);
         step(st, c, mk(88, 5.0, 110, 90));
-        CHECK(near(turtle_mfe_atr(st), 6.0) && near(st.stop, 92.0),
+        CHECK(near(entry_mfe_atr(st), 6.0) && near(st.stop, 92.0),
               "空头：浮盈 6ATR，k=2，锁定 ATR=2 ⇒ 88 + 4 = 92");
     }
     {
@@ -1250,7 +1251,7 @@ static void test_exit_opt() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ① 海龟假突破提前出场：开仓那根收完后，有K线收盘跌回开仓时的通道边沿以内就走
+// ① 趋势跟踪假突破提前出场：开仓那根收完后，有K线收盘跌回开仓时的通道边沿以内就走
 // ─────────────────────────────────────────────────────────────────────────────
 static void test_fail_exit() {
     const int64_t H = 3600000, t0 = 100 * H;   // 开仓那根K线的开盘时间
@@ -1482,7 +1483,7 @@ static void test_breakeven() {
         Config p = c; p.strategy = Strategy::BareK;
         State s3;
         on_filled(s3, Pos::Long, 100, 94, p, false);
-        CHECK(!breakeven_armed(s3, p, lv(110)), "只认海龟");
+        CHECK(!breakeven_armed(s3, p, lv(110)), "只认趋势跟踪");
     }
 
     // 配置校验：和追踪止盈都开时，触发线必须严格低于启动线
@@ -1547,148 +1548,14 @@ static void test_expand_long() {
     }
 }
 
-// ④ 波动顺势：正在走的这根顺势开，方向反了、亏损时反手（三种触发 + 三道护栏）
-static void test_vol_follow() {
-    Config c;
-    c.strategy = Strategy::VolFollow;
-    c.reverse  = ReverseMode::Immediate;
-    c.once_per_bar = true;
-    c.max_consecutive_reverses = 3;
-    c.cooldown_bars = 2;
-    // 本根开盘 100、ATR 2、死区 0.3 ATR = 0.6
-    auto vin = [](double price, double open = 100, int64_t bar = 1, double atr = 2.0) {
-        Inputs in;
-        in.price = price; in.atr = atr; in.bar_open = open; in.bar_open_ms = bar; in.leverage = 2;
-        return in;
-    };
-    {
-        State st;
-        CHECK(step(st, c, vin(100.5)).action == Action::Hold, "开盘价 + 0.5 < 死区 0.6：不开");
-        CHECK(step(st, c, vin(100.7)).action == Action::OpenLong, "过了死区：顺着做多");
-        CHECK(step(st, c, vin(99.3)).action == Action::OpenShort, "开盘价 − 死区以下：做空");
-        CHECK(step(st, c, vin(110, 0)).action == Action::Hold, "本根开盘价不知道（快照停在上一根）：不开");
-        CHECK(step(st, c, vin(110, 100, 1, 0)).action == Action::Hold, "ATR 缺失：不开");
-    }
-    auto open_long = [&](State& st, double fill = 100.7, int64_t bar = 1) {
-        on_filled(st, Pos::Long, fill, initial_stop(Pos::Long, fill, c, vin(fill)), c, false, bar, 2.0,
-                  /*开仓那根开盘*/ 100);
-    };
-    {
-        // (a) 回到开仓那根开盘价另一边（越过死区）且在亏损：反手做空
-        State st;
-        open_long(st);
-        CHECK(near(st.stop, 94.7), "初始止损 = 3×ATR Chandelier");
-        CHECK(step(st, c, vin(99.6)).action == Action::Hold, "回到开盘价下方但没越过死区：拿着");
-        const auto v = step(st, c, vin(99.3));
-        CHECK(v.action == Action::CloseReverseShort && std::string(v.reason).find("方向反了") != std::string::npos,
-              "越过死区、亏损：反手做空");
-        CHECK(!v.profitable_exit, "  反手是亏损出场");
-        // 跨到下一根，新开盘价 98：判据仍用开仓那根的 100，不换
-        State st2;
-        open_long(st2);
-        CHECK(step(st2, c, vin(99.9, 98.0, 2)).action == Action::Hold,
-              "到了下一根（开盘 98）：99.9 没跌破开仓那根的 100 − 死区，不反手");
-    }
-    {
-        // 不在亏损：(a) 不成立（开仓价低于开盘价的特殊情况，价格在开仓价上方）
-        State st;
-        on_filled(st, Pos::Long, 98.0, 92.0, c, false, 1, 2.0, 100);
-        CHECK(step(st, c, vin(99.0)).action == Action::Hold, "价格在开盘价 − 死区以下但仍盈利：不反手");
-    }
-    {
-        // (b) 收益率跌到 −X%（2 倍杠杆：价格跌 2.5% ≈ 收益率 −5%）
-        Config g = c;
-        g.vf_rev_open = false;
-        g.vf_rev_loss = true;
-        g.vf_rev_loss_roi = 5;
-        State st;
-        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        CHECK(step(st, g, vin(99.0)).action == Action::Hold, "收益率 −3.4%：不到 −5%");
-        CHECK(step(st, g, vin(98.0)).action == Action::CloseReverseShort, "收益率 −5.5%：反手");
-    }
-    {
-        // (c) 打到止损线：勾了反手，没勾只平
-        Config g = c;
-        g.vf_rev_open = false;
-        State st;
-        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        CHECK(step(st, g, vin(94.6)).action == Action::CloseReverseShort, "打到止损线、亏损：反手");
-        g.vf_rev_stop = false;
-        State st2;
-        on_filled(st2, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        const auto v = step(st2, g, vin(94.6));
-        CHECK(v.action == Action::Close && std::string(v.reason).find("不反手") != std::string::npos,
-              "没勾打到止损线反手：只平");
-    }
-    {
-        // 盈利出场不反手
-        State st;
-        open_long(st);
-        step(st, c, vin(110));   // 极值 110 ⇒ 止损线 104
-        const auto v = step(st, c, vin(103.9));
-        CHECK(v.action == Action::Close && v.profitable_exit, "盈利打到追踪线：平，不反手");
-    }
-    {
-        // 护栏：同一根最多反手一次
-        State st;
-        open_long(st);
-        CHECK(step(st, c, vin(99.3)).action == Action::CloseReverseShort, "第一次反手");
-        on_filled(st, Pos::Short, 99.3, 105.3, c, true, 1, 2.0, 100);
-        CHECK(st.last_reverse_bar_ms == 1 && st.consec_reverses == 1, "  反手开仓记下这一根、连续反手 1");
-        const auto v = step(st, c, vin(100.7));   // 空单：回到开盘价 + 死区以上、亏损
-        CHECK(v.action == Action::Close && std::string(v.reason).find("本根已反手") != std::string::npos,
-              "同一根第二次：只平不反手");
-        // 下一根就可以再反
-        State st2 = st;
-        CHECK(step(st2, c, vin(100.7, 100, 2)).action == Action::CloseReverseLong, "下一根：照常反手");
-        // 平仓后同一根不再开（等下一根）
-        State st3;
-        st3.last_entry_bar_ms = 1;
-        CHECK(step(st3, c, vin(102)).action == Action::Hold, "平仓后这根里不再开");
-        CHECK(step(st3, c, vin(102, 100, 2)).action == Action::OpenLong, "  下一根照常开");
-    }
-    {
-        // 护栏：连续反手上限 ⇒ 只平、转冷却
-        Config g = c;
-        g.vf_one_rev_per_bar = false;
-        State st;
-        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        st.consec_reverses = 3;
-        const auto v = step(st, g, vin(99.3));
-        CHECK(v.action == Action::Close && std::string(v.reason).find("上限") != std::string::npos &&
-                  st.cooldown_left == 2 && st.consec_reverses == 0,
-              "连续反手 3 次后：只平，冷却 2 根");
-    }
-    {
-        // 反向不允许 / 不反手模式
-        Config g = c;
-        g.direction = Direction::LongOnly;
-        State st;
-        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        CHECK(step(st, g, vin(99.3)).action == Action::Close, "仅多：只平");
-        Config n = c;
-        n.reverse = ReverseMode::None;
-        State st2;
-        on_filled(st2, Pos::Long, 100.7, 94.7, n, false, 1, 2.0, 100);
-        CHECK(step(st2, n, vin(99.3)).action == Action::Close, "不反手模式：只平");
-    }
-    {
-        // 保本、锁定 ATR 照样认（和海龟同一套出场）
-        Config g = c;
-        g.breakeven = true;
-        g.breakeven_start = 6;   // 收益率 6%（2 倍杠杆 ≈ 价格 +3%）
-        State st;
-        on_filled(st, Pos::Long, 100.7, 94.7, g, false, 1, 2.0, 100);
-        step(st, g, vin(104.0));
-        CHECK(st.stop >= 100.7, "保本：收益率到过 6% 后止损抬到开仓价以上");
-    }
-}
+
+#include "following_scenarios.h"
 
 int main() {
-    test_turtle();
+    test_following_scenarios();
+    test_trend_following();
     test_chase_and_init_cap();
     test_expand_long();
-    test_vol_follow();
     test_breakeven();
     test_exit_opt();
     test_fail_exit();
@@ -1700,7 +1567,7 @@ int main() {
     test_bare_k();
 
     if (g_fail == 0) {
-        std::printf("OK: 全部趋势决策测试通过（海龟 / 抛物线SAR / 纯裸K）\n");
+        std::printf("OK: 全部趋势决策测试通过（趋势跟踪 / 抛物线SAR / 纯裸K）\n");
         return 0;
     }
     std::fprintf(stderr, "共 %d 条断言失败\n", g_fail);

@@ -3,29 +3,67 @@
   "api_secret": "你的Binance API Secret",
   "testnet": true,
   "account_mode": "futures",
-
   "max_total_margin": 500,
   "max_open_positions": 0,
-
   "alert_webhook": "",
   "state_path": "ccbot_state.json",
   "log_path": "ccbot.log",
-
+  "smart_mode": {
+    "enabled": false,
+    "strategy": "trend_following",
+    "dir_long": true,
+    "dir_short": true,
+    "dir_mode": "mixed",
+    "atr_pct_min": 0.1,
+    "atr_pct_max": 8,
+    "max_abs_chg24": 0,
+    "max_total_risk_usdt": 6,
+    "max_direction_risk_usdt": 4,
+    "risk_cost_bps": 20,
+    "event_poll_sec": 60,
+    "event_cooldown_sec": 300,
+    "event_move_atr": 2,
+    "event_min_move_pct": 1,
+    "template": {
+      "interval": "1h",
+      "size_mode": "risk",
+      "risk_usdt": 1,
+      "budget_usdt": 100,
+      "leverage": 3,
+      "donchian_period": 12,
+      "atr_period": 14,
+      "atr_mult": 3,
+      "squeeze_box_atr": 0,
+      "breakout_vol_ratio": 1.5,
+      "tf_enabled": true,
+      "tf_close_confirm": true,
+      "tf_reversal_exit": true,
+      "tf_fast_period": 20,
+      "tf_slow_period": 60,
+      "tf_slope_bars": 3,
+      "tf_min_slope_atr": 0.02,
+      "tf_min_separation_atr": 0.1,
+      "tf_breakout_buffer_atr": 0.1,
+      "tf_min_close_location": 0.6,
+      "tf_short_vol_ratio": 0,
+      "max_chase_atr": 1.5,
+      "lock_atr": true,
+      "accel_exit": false,
+      "signal_max_age_sec": 120
+    }
+  },
   "trend_bots": [
     {
       "symbol": "ETHUSDT",
       "budget_usdt": 500,
       "leverage": 3,
       "interval": "4h",
-
-      "strategy": "turtle",
+      "strategy": "trend_following",
       "donchian_period": 20,
       "atr_period": 14,
       "atr_mult": 3.0,
-
       "reverse": "none",
       "signal_max_age_sec": 0,
-
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0
     },
@@ -34,16 +72,13 @@
       "budget_usdt": 500,
       "leverage": 3,
       "interval": "1h",
-
       "strategy": "psar",
       "af_start": 0.02,
       "af_step": 0.02,
-      "af_max": 0.20,
-
+      "af_max": 0.2,
       "max_consecutive_reverses": 3,
       "cooldown_bars": 2,
       "signal_max_age_sec": 0,
-
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0
     },
@@ -52,20 +87,16 @@
       "budget_usdt": 500,
       "leverage": 3,
       "interval": "5m",
-
       "strategy": "bare_k",
       "bare_entry": "break_prev",
       "once_per_bar": false,
       "swing_bars": 3,
-
       "size_mode": "risk_based",
       "risk_usdt": 20,
-
       "reverse": "immediate",
       "max_consecutive_reverses": 2,
       "cooldown_bars": 3,
       "signal_max_age_sec": 0,
-
       "use_disaster_stop": true,
       "disaster_stop_buffer_pct": 1.0
     }

@@ -203,7 +203,6 @@ private:
     // rest_price_feed.h 的头注释：WS 有一个"连上了却没有数据"的失败模式，
     // 识别它需要六种机制（静默看门狗、强制重连、退避、升级重建、订阅确认
     // 取证、对照探针），而轮询没有"连接"这个中间状态，压根不存在那个问题
-    // shared_ptr：后台任务（智能裸K 点火判定）要拿一份副本用——重连会换掉 ticker_，
     // 后台线程直接读成员的话，旧的那个析构后就是悬空指针
     std::shared_ptr<RestPriceFeed>     ticker_;
 
@@ -234,6 +233,7 @@ private:
     // 跟 Failed（一开始就没连上，比如密钥错）区分开，方便判断要不要报警、要不要重置计时
     enum class ConnState { Disconnected, Connecting, Connected, Failed, NetworkError };
     ConnState      connState_ = ConnState::Disconnected;
+    bool           trendStateBlocked_ = false;
     QString        connNetName_;       // "主网"/"测试网"，连接成功后顶部计时行要用
     QElapsedTimer  connect_elapsed_;   // 连接成功后开始计时，用于顶部计时显示
     QElapsedTimer  breathe_clock_;     // 呼吸灯相位时钟
@@ -340,7 +340,6 @@ private:
     std::shared_ptr<Journal>     journal_;
     smart::Config                smartCfg_;
     std::atomic<bool>            smartBusy_{false};
-    std::atomic<bool>            bareBusy_{false};    // 智能裸K 的点火判定（每拍一次，5m 收盘后要拉K线）
     QPushButton*                 smartBtn_ = nullptr;
 
     // ── 日志 ──

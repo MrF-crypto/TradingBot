@@ -46,6 +46,9 @@ bool send_webhook(const std::string& url, const std::string& text, std::string* 
 
     CURL* curl = curl_easy_init();
     if (!curl) { if (err_out) *err_out = "curl_easy_init 失败"; return false; }
+#if defined(_WIN32) && defined(CURLSSLOPT_NATIVE_CA)
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_NATIVE_CA));
+#endif
 
     struct curl_slist* hdrs = curl_slist_append(nullptr, "Content-Type: application/json");
 

@@ -1,321 +1,97 @@
-# TradingBot
+# TradingBot · 趋势跟踪
 
-<img src="assets/banner.jpg" alt="TradingBot" width="360">
+面向 Binance USDT-M 永续合约的 C++20 交易框架。Qt6 桌面版与配置驱动的 headless 版共用引擎和智能执行层。基于 [CCBot v5.11.0](https://github.com/MrF-crypto/CCBot) 整理和升级，作为独立项目从 **v1.0.0** 开始发布。
 
-Binance USDT-M 永续合约的**趋势跟随自动交易程序**，C++20 编写。
+## 下载与运行
 
-图形界面版（Qt6）支持 Windows 与 macOS；核心引擎另有一个不依赖 Qt 的 **headless 版**，配置文件驱动，可在 Linux 服务器上后台常驻。**两者共用同一份策略引擎代码**，行为完全一致。
+从 [Releases](https://github.com/MrF-crypto/TradingBot/releases) 下载 Windows x64 便携包，完整解压到可写目录后运行 `TradingBot.exe`。DLL、`platforms/` 和许可证文件应与程序一起保留，不要只复制 EXE。首版同时包含 `ccbot_headless.exe`、配置模板和文档；Linux/macOS 可按下文从源码构建。
 
-> **v5.1.0：一套框架，三个趋势策略。** ① 海龟（唐奇安突破 + ATR 止损）、② 趋势 SAR（Wilder 抛物线）、③ 纯裸K（摆动极值止损）。
-> 参数各自成套不混搭，界面按策略换页。旧的「裸K线 = 阳线就做多」规则已删除，换成严格得多的「收盘突破前一根高/低」；
-> 反手从两个 bool 合并成一个枚举（四种组合里有一种根本没有含义）。**每一处行为变化在启动时都会明确告警，不会静默生效。**
->
-> **v5.0.0：网格 DCA 已整体移除。** 本仓库现在只做一件事——为趋势类策略提供稳定的实时行情，以及执行上面那三个策略。
->
-> 不是"暂时停用"而是删干净（`CcgEngine` 1809 行、DCA 入场拦截、DCA 落盘、梯子深度工具，连同三套测试）。两套并列策略时期最大的成本不是代码量，是每改一处共享代码都要同时保两套语义不变——而 DCA 的补仓/止盈语义建立在"每 3 秒一拍、价格用标记价"这个节拍上，行情层要往事件驱动走就必须先把这份约束拿掉。
->
-> **升级注意**：旧配置文件里的 `bots` 数组不再运行。它不会被静默忽略——启动时会明确报出"这些条目完全不会运行"。DCA 的实测结论（哪些参数有效、哪些被证伪）保留在 [docs/NEGATIVE_RESULTS.md](docs/NEGATIVE_RESULTS.md)：代码删了，花钱买来的结论不删。
-
-> ⚠️ **风险提示**
->
-> 本项目直接对接 Binance 合约账户的**真实订单接口**，涉及杠杆交易，存在**本金全部亏损**的风险。代码按「原样」提供，不构成任何投资建议，作者不对使用本软件造成的任何资金损失负责。
->
-> **请务必先在测试网（Testnet）验证策略行为，确认无误后再连接真实账户，并从小额资金开始。**
-
----
-
-## 它和「随便一个趋势机器人」的区别
-
-**① 行情链路会自己好，而且看得见**
-
-趋势策略的全部保护是那条活在进程里的止损线，而止损线靠每个 tick 的实时价往前棘轮——**喂不到价 = 保护停在原地，而行情该跑多远照样跑**。所以这个仓库在行情层花的功夫比在策略上多：
-
-- **静默看门狗**：WebSocket 半开（TCP 还在、Open 状态还在、数据早停了）时主动掀掉连接重连，连续三次不见效就整条重建。此前的行为是**永久降级**——陈旧保护让引擎拿到 0、REST 兜底补上价格、于是一条告警都不发，链路死了而所有指标全绿
-- **`Health` 快照**：把"引擎还能不能拿到新鲜价格"摊成数字（各流新鲜/陈旧/无数据的品种数、重连次数、丢包数、连接数）。`is_connected()` 在半开时照样返回 true，这个不会
-- **REST 兜底不计入健康度**：兜底成功是"还能交易"的证据，不是"链路活着"的证据。混在一起算，看门狗和健康快照就同时白做了
-- **多连接分片**：超过币安单连接 200 条流的上限时自动多开连接。此前超出部分是**静默**收不到行情
-- **序号断层检测**：`aggTrade` 的聚合成交ID 逐一递增，断层就是丢包的铁证——这是唯一能证明"WebSocket 悄悄漏了消息"的东西
-
-**② 失败必须是响的**
-
-这个程序设计成连续挂几个月无人值守，所以最危险的不是报错，是**静默降级**：
-
-- WebSocket 半开（连接还在、数据早停了）→ 缓存里躺着冻结价，引擎拿着僵尸价格继续决策
-- 某条行情流没订阅上 → 界面一片空白，日志一个字都没有
-- 兜底路径生效了 → 价格新鲜度从亚秒掉到十秒，界面看不出任何异常
-
-这些都在实盘里真实发生过。现在每一条都会主动报告：连接状态、首包到达、行情来源切换、静默超时、批次耗时、品种精度异常。
-
-**③ 进程外保护**
-
-交易所侧灾难止损单（`STOP_MARKET + closePosition`）挂在币安服务器上——**程序崩了、断电了、窗口被误关了，它依然生效**。这是唯一不依赖本进程存活的保护。默认关闭，因为它会把浮亏变成实亏，是否启用属于策略取向。
-
-**④ 只有一条真相**
-
-回测已移出为独立项目（v4.0.13）、支撑/阻力结构层已整体移除（v4.0.16）、网格 DCA 整体移除（v5.0.0）。本仓库只剩一条策略路径，不存在需要同步维护的第二份逻辑。
-
----
-
-## 功能
-
-### 三个趋势策略
-
-一个 bot 选一个策略，参数**各自成套，不混搭**——混搭没有实证依据，只会让参数空间翻倍而没人知道怎么填。
-
-| | 入场 | 止损 | 特点 |
-|---|---|---|---|
-| **① 海龟** | 唐奇安通道突破：上破 N 根最高 → 做多，下破 N 根最低 → 做空。通道**只由已收盘K线构成**，当前这根去撞它——把当前根算进去等于「价格≥上沿」恒成立、信号恒真 | Chandelier：`持仓期极值 ∓ k×ATR`。ATR 用 Wilder 平滑，与 TradingView / 币安同口径 | 信号最少、对参数最不敏感。适合 4h 以上 |
-| **② 趋势 SAR** | 价格站上/跌破前一根极值；建仓之后入场信号**只由翻转产生** | SAR 值本身：`SAR += AF×(EP−SAR)`。**AF 只在刷新极值点的那一根递增**，封顶后每根固定吃掉「当前距极值」的 20%——趋势越强收得越快。实现了 Wilder 的夹逼（SAR 不得落进前两根的价格范围） | 天然 stop-and-reverse，永远持有一个方向 |
-| **③ 纯裸K** | 两种模式：**盘中即时**（实时价 vs 本根开盘价，不等收盘）或**等收盘突破**（收盘价 > 上一根最高 ⇒ 做多，< 上一根最低 ⇒ 做空） | 最近 N 根的摆动极值，棘轮 | 没有任何指标。最快也最吵，适合短周期 |
-
-共享的语义：
-
-| | |
-|---|---|
-| **无固定止盈** | 这是设计而非遗漏。趋势跟随胜率天然只有 30~40%，收益全来自少数跑得很远的单子；固定止盈砍断它们而亏损笔大小不变，等于单方面砍掉盈利分布的右尾 |
-| **止损线是棘轮的** | 只朝有利方向移动，绝不回退。数据断流时**沿用最后一条有效线**，绝不因为拿不到数据就撤掉保护 |
-| **止损后怎么办** | 两选一：**立即反手**开反向仓，或**只平掉**回到正常入场流程（方向不限，同向信号先来就同向再进）。**盈利出场永不反手**——力竭不等于反转。⚠ ② 趋势 SAR 是例外：它的定义就是触及即翻转，**盈利触及也翻**，而且不可关——它的入场信号只有翻转一个来源，不翻就永远空仓 |
-| **连续反手上限** | 默认关。② 是唯一真会连续翻转的策略，不设上限时启动会明确告警——那是 PSAR 最著名的弱点，不是实现缺陷 |
-| **固定单笔风险下单** | 名义 = `单次愿亏 ÷ 入场价到止损线的距离%`，用的是**当前策略算出来的那条线**。同一份名义在波动 1.6% 和 5.3% 的品种上单次亏损差 3.3 倍——固定名义等于把风险全压在高波动那几个上，「铺开品种分散风险」就此失效。海龟的「单位」概念 |
-| **账户级闸门** | 总保证金上限 + 同时持仓品种数上限。**只拦开新仓，永不拦出场**——拦住出场等于把该止损的仓位困在原地，闸门就从风控变成了风险源。铺品种是这套策略有效的前提，所以这道闸比单个 bot 的预算上限更要紧：每笔都带止损只保证【单笔】亏损有界，不保证同时被打的十笔加起来有界 |
-| **跨重启** | 持仓、开仓价、止损线、加速因子、反手计数全部落盘；启动与运行中各与交易所对账。**本地空仓而交易所有仓会直接停 bot**——不停的话下一个信号会再开一笔，净敞口翻倍 |
-| **进程外保护** | 止损线镜像成交易所侧的 `STOP_MARKET + closePosition` 单。趋势策略的全部保护就是那条活在进程里的止损线，程序崩了、断电了就什么都不剩。挂不上会重试 13 次，第 10 次起界面标红**「此仓位无交易所侧保护」**，第 13 次仍失败**立刻平掉刚开的仓**；连续 2 次这样平仓就熔断停掉该 bot |
-
-界面里**「委托止损」**列是交易所侧那张单的状态（`挂单中…` / 触发价 / `重试 N/13` / `⚠ 无保护` / `已熔断`），
-**「移动止损」**列是本地那条棘轮线和它离现价多远——**越过成本价后转绿**（这笔已锁定盈利）。
-没有有效止损线时两列都显示 `—`，此时引擎不会开仓。
-
-统计页的判据是 **胜率 × 盈亏比**，不是胜率。趋势策略的典型画像是胜率低、盈亏比高——35% 胜率配 3.0 盈亏比比 70% 胜率配 0.4 赚得多。
-
-### 资金安全
-
-- **对账**：启动时 + 运行中周期性与交易所核对。判定刻意保守——本地空仓而交易所有仓、或方向不一致，一律**停 bot 告警**而不是自动收敛，任何自动收敛都是在猜
-- **下单幂等**：网络超时后按 clientOrderId 查单确认，杜绝盲目重试造成重复下单
-- **部分成交续平**：平仓只成交一部分时下个 tick 继续，不留残仓
-- **单实例锁**：PID 锁文件，防止双开同账户重复下单
-- **原子落盘**：凭证、策略配置、成交明细、运行状态全部 tmp+rename 或 QSaveFile，崩在写文件中途也不会损坏
-- **退出保护**：等在途下单任务排空再落盘；超时则跳过清理直接结束进程，绝不在已释放的对象上执行代码
-
-### 可观测性
-
-- **实时表**：策略·周期、方向、**委托止损**（交易所侧那张单的状态）、开仓价、标记价、24h涨跌、延迟、浮动P&L、保证金、收益率、**移动止损**（本地棘轮线，越过成本转绿）、已实现
-- **顶部常驻**：权益、可用、uniMMR、累计资金费、累计盈亏、连接时长与呼吸灯
-- **日志落盘**：按天分文件，重启/崩溃后可复盘
-- **webhook 告警**：企业微信 / 飞书 / Telegram Bot。连接失败、网络异常、对账不一致时推送（**带明细**，不是只报条数）。交易所侧灾难止损被触发时本地收不到成交回调，它在对账里表现为「交易所已无此仓位」，同样会推送
-- **资金费账本**：永续每 8 小时结算的真实现金流出，单独记账（它和浮亏性质完全不同）
-
----
-
-## 快速开始
-
-### 1. 下载
-
-[Releases](https://github.com/MrF-crypto/CCBot/releases) 页面下载对应平台的包：
-
-| 平台 | 文件 |
-|---|---|
-| Windows x64 | `tradingbot-vX.Y.Z-win64.zip` |
-| macOS Apple Silicon | `tradingbot-vX.Y.Z-macos-arm64.zip` |
-| macOS Intel | `tradingbot-vX.Y.Z-macos-x64.zip` |
-| Linux x64（headless） | `tradingbot-vX.Y.Z-linux-x64.zip` |
-
-macOS 产物未做 Apple 签名/公证，解压后需要：
-
-```bash
-chmod +x TradingBot ccbot_headless
-xattr -dr com.apple.quarantine .
-```
-
-### 2. 准备 API 密钥
-
-币安 → API 管理 → 创建 API：
-
-- ✅ **启用合约**
-- ❌ **不要**开启提现权限
-- ✅ 建议绑定 IP 白名单
-
-### 3. 先跑测试网
-
-程序内「设置」填入密钥，**勾选测试网**。测试网密钥单独申请：<https://testnet.binancefuture.com>
-
-确认开仓、补仓、止盈整条链路都符合预期，再切主网。
-
-### 4. 配置第一个策略
-
-主界面输入品种（如 `BTCUSDT`）→ 添加 → **右键该行 →「配置策略...」**。
-
-配置弹窗里最该看的是底部的**层级分配预览**：
-
-```
-第1层  名义 $600   保证金 $300   预计建仓价 $95000   预计浮亏 $0
-第2层  名义 $1200  保证金 $600   预计建仓价 $89300   预计浮亏 -$36
-...
-满层合计需要 $XXXX，届时均价 $XXXXX，可扛到 $XXXXX
-```
-
-**如果「满层合计」超过你愿意投入的钱，就调小预算或层数**——这一步是开仓前唯一能看清最坏情况的地方。
-
----
-
-## 参数指南
-
-### 推荐起步配置
-
-以下组合来自 8 品种 × 8 个滚动窗口 = **64 个纯样本外测试段**（预热 4 月 / 训练 12 月 / 测试 6 月）：
-
-| 项 | 值 | 说明 |
-|---|---|---|
-| 补仓间隔 | **6%** | 6% 优于 5%/4%；3% 是净负的（已作为默认值） |
-| 曲线 / 层数 | 递增 / **10** | 10 层优于 8 层（+75192 vs +70620，61/64 vs 56/64） |
-| 追踪建仓 | 0.4% | 1.0% 在深熊里灾难性（周期数归零） |
-| 首仓 | 指标信号（跌破 1h 下轨） | 「立即开仓」跳过微观扳机，实测收益掉 14% |
-| 趋势过滤 | ✅ 开 | 深熊段值 5643U |
-| 杠杆 | **2** | 名义 ≤ 权益 ⇒ 数学上不可强平 |
-| 日线%B 拦截 | 0.60 | 0.80 太松≈没拦 |
-
-> ⚠ 所有回测数字都是历史统计。同一批 walk-forward 测出**样本外留存约 34%** —— 实盘预期应按此折价。
-
-### 两条反直觉的实测结论
-
-**调参是有害的。** 在训练段选最优参数再用到测试段（65827），**不如**全程用固定 5%（67289）。参数搜索搜到的是噪音。
-
-**满层率是那个枢纽变量。** 60 品种实测：满层时间占比 <10% 的品种 **22/22 盈利**；>75% 的 **0/6 盈利**（净利中位 −16854）。满层 = 弹药耗尽、失去摊薄能力。界面「层进度」列按这个着色。
-
-### 关键参数怎么想
-
-| 参数 | 它在回答什么 |
-|---|---|
-| **预算 / 层数 / 间隔** | 「我准备扛多深」——三者共同决定满层时的均价和总资金 |
-| **杠杆** | 名义 ≤ 权益（即杠杆 ≤ 1 相对于投入）才数学上不可强平 |
-| **保底利润** | 「至少赚多少才肯走」——太低会在中间层频繁小赚，太高会拿不住 |
-| **追踪止盈回调** | 触发止盈后从最高点回落多少才平仓。实测全区间差异仅 2.1%，不敏感 |
-| **冷却时间** | 止盈后多久允许重开。它是唯一挡住「在原价位立刻买回来」的闸门 |
-
----
-
-## 构建
-
-### Windows（GUI）
-
-依赖通过 [vcpkg](https://github.com/microsoft/vcpkg) manifest 模式自动安装（见 `vcpkg.json`）：CMake ≥ 3.20、Visual Studio（MSVC，C++20）、Qt6 Widgets、simdjson / curl / mbedtls。
+桌面版首次启动后设置测试网账户。无界面版将 `config.example.json` 复制为 `config.json` 并填写本机配置，参考 [Headless 说明](docs/HEADLESS.md)。下载文件可用同一 Release 的 `SHA256SUMS.txt` 核验。
 
 ```powershell
-git clone https://github.com/MrF-crypto/CCBot.git
-cd CCBot
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=<vcpkg根目录>/scripts/buildsystems/vcpkg.cmake
-cmake --build build --config Release
+.\ccbot_headless.exe --version
+.\TradingBot.exe --check-runtime
 ```
 
-产物：`build/Release/TradingBot.exe`
+这两个检查不会读取账户配置或提交订单。首版变化与验证范围见 [v1.0.0 发布说明](docs/releases/v1.0.0.md)。
 
-### macOS（GUI）
+## 智能模式
 
-Intel 与 Apple Silicon 都支持，API 密钥存进系统钥匙串。
+智能模式只保留**趋势跟踪**：
 
-```bash
-xcode-select --install
-brew install cmake ninja pkg-config
-
-git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
-~/vcpkg/bootstrap-vcpkg.sh
-
-git clone https://github.com/MrF-crypto/CCBot.git
-cd CCBot
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=~/vcpkg/scripts/buildsystems/vcpkg.cmake \
-    -DVCPKG_TARGET_TRIPLET=arm64-osx     # Intel Mac 用 x64-osx
-cmake --build build --config Release
-./build/TradingBot
+```text
+扫描与异动唤醒 → 候选排序 → 自身趋势许可 → 突破确认 → 组合预算 → 初始止损与追踪退出
 ```
 
-> 首次配置时 vcpkg 会从源码编译 Qt6，耗时 1~2 小时（一次性）。首次保存 API 密钥时 macOS 会弹钥匙串授权框，选「始终允许」。
+智能模板默认使用 1h 信号、EMA20/60 的方向/斜率/分离度、12 根高低价唐奇安通道收盘突破、ATR14 与 3 倍 ATR 初始/移动止损。上涨许可做多、下跌许可做空，震荡或过渡等待；历史过热与相对强弱只参与分组排序，不预测反转。另可显式选择盘中突破或固定 15m / 30m 周期作独立实验。
 
-### Linux（headless）
+常规扫描为每小时整点后 1 分钟；另每分钟轻量观察双向价格异动，最多每五分钟触发一次合并重扫。异动只唤醒扫描，不越过信号与风控。默认单笔计划风险 1U、组合 6U、同向 4U、单笔名义上限 100U，费用/滑点估算 20bps；这些是可修改的研究初值，不适配任何特定账户规模。
 
-见 [docs/HEADLESS.md](docs/HEADLESS.md)，含配置文件字段说明与 systemd 常驻部署示例。
+在途开仓计入预算；状态不明的委托保留预留，核对原订单终态与新鲜仓位后才释放。平仓不受新仓闸门限制。收盘确认模式可在加入候选后参与仍有效的已确认突破，盘中模式仍需先回到通道内上膛。持仓不会因排名下降被移除。智能模式默认关闭。
 
----
+第一版实现与边界见 [趋势跟踪 V1](docs/TREND_FOLLOWING_V1.zh-CN.md)。单元/场景测试不构成盈利验证；历史回放、交易成本及样本外验证尚待开展。
 
-## 数据与备份
+原智能裸K埋伏、波动顺势及其设置、调度和执行分支已移除。**手动 bot 的趋势跟踪、抛物线 SAR、纯裸K继续保留**；手动纯裸K与已移除的智能埋伏是不同功能。
 
-**便携模式**：所有数据存在**程序目录的 `data/` 子目录**——整个文件夹拷走就是完整备份。
+## 框架
 
-```
-data/
-├── ccg_creds.dat      API 凭证（Windows DPAPI / macOS 钥匙串加密，换机需重新输入）
-├── ccg_bots.json      策略配置 + 持仓跟踪状态
-├── ccg_trades.json    成交明细
-├── ccg_settings.json  全局设置
-├── ccg_funding.json   资金费账本
-└── logs/              按天分文件的运行日志
-```
+| 模块 | 职责 |
+| --- | --- |
+| `src/core/smart_mode.*` | 特征、评分、分段、候选池与智能配置 |
+| `src/app/smart_runner.*` | 市场扫描、执行候选池计划、同步自动 bot 参数 |
+| `src/core/trend_following.h`、`market_wake.h` | 因果趋势状态、突破确认、异动去重与限频 |
+| `src/core/trend_decision.h` | 入场、出场、止损与反手的纯决策 |
+| `src/core/trend_engine.*` | 仓位、风控闸门、异步执行、成交和对账 |
+| `src/net/trading_client.*` | Binance REST、签名、限流与订单确认 |
+| `src/net/rest_price_feed.*` | REST 行情、新鲜度保护与备用价格 |
+| `src/gui/`、`src/headless/` | 两种运行入口、界面与状态恢复 |
+| `src/core/journal.*` | 交易、扫描、候选池和过滤记录 |
 
-**升级时只替换可执行文件与 dll，保留 `data/` 目录。**
+行情采用 REST 轮询。网络失败与“没有仓位 / 标的不合格”分开处理。本地止损只向有利方向移动；交易所灾难止损保留开仓时的初始保护位置，自动 bot 强制开启。
 
-程序目录不可写时自动回退到系统 AppData；老版本的 AppData 数据首次启动会自动迁移。
+## 构建与测试
 
----
+需要 C++20 编译器、CMake 3.20+、vcpkg。核心依赖为 simdjson、curl、MbedTLS 和线程库，GUI 另需 Qt6 Widgets。
 
-## 测试
-
-14 套单元测试，约 870 条断言（其中 `ccg_trend_tests` 与 `ccg_indicator_tests` 只打一行汇总，
-它们的断言数按源码计），覆盖引擎、网络、持久化、并发，以及 GUI 与 headless 共用的应用层判定。
-全部测的是**生产路径上在跑的代码** —— v5.9.9 之前还有一套 128 条断言测的是已下线的
-WebSocket 行情，它让总数虚高了约 16%，已随被测代码一并删除。
-
-⚠ GUI 本身（`main_window.cpp` / `trend_panel.cpp`）仍然没有直接的自动化测试。其中最危险的
-几条判定已抽到 `src/core/app_logic.h` 由 `ccg_app_logic_tests` 覆盖，其余仍靠实盘日志把关。
+Windows 桌面版示例：
 
 ```powershell
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows -DCCBOT_WERROR=ON
 cmake --build build --config Release
-for %t in (ccg_indicator_tests ccg_key_store_tests ccg_funding_tests ^
-           ccg_rate_tests ccg_order_tests ccg_config_tests ^
-           ccg_timesync_tests ccg_pool_tests ccg_rest_feed_tests ^
-           ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests ^
-           ccg_trend_stress_tests ccg_app_logic_tests) do ^
-    build\Release\%t.exe
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-重点覆盖的是**会静默出错**的部分：
+仅构建 headless 与测试时，同时关闭 CMake GUI 目标和 vcpkg 默认 GUI 特性：
 
-| 测试 | 守住什么 |
-|---|---|
-| `ccg_rest_feed_tests` | 行情轮询：连续失败转「不健康」、切兜底通路时如实报出计价基准变了、陈旧价不得流入引擎 |
-| `ccg_app_logic_tests` | GUI 与 headless 共用的应用层判定：老配置的迁移不得静默改变语义；对账在拉取失败或快照过旧时必须跳过，不得清掉真实持仓 |
-| `ccg_order_tests` | 超时恢复 / 部分成交 / 零成交 / -1111 重试 |
-| `ccg_trend_stress_tests` | **并发状态撕裂**（真线程池，三个策略同时在跑，多线程同时 tick / 喂信号 / 读快照 / 对账 / 停开，交易所返回随机化）；闪崩、天地针、非法价格、ATR 缺失、连环反手。判据是**不变量**——`pos==Flat` 与 `qty==0` 必须同真同假，撕裂了就是"引擎以为空仓而交易所有仓"，下一个信号会再开一笔让净敞口翻倍 |
-| `ccg_timesync_tests` | 往返过长的测量必须丢弃；时间戳锚定单调钟 |
-| `ccg_trend_tests` | 三个策略的决策核心。止损线棘轮绝不回退；盈利出场不反手（**② SAR 是唯一的例外，且必须是例外**）；② 的 AF **只在刷新极值点时**递增、Wilder 夹逼必须生效；③ 两种入场模式与「每根K线最多开一次」护栏（平仓**不得**清掉判据，否则护栏等于没有）；连续反手上限与冷却按K线计；唐奇安必须排除当前K线 |
-| `ccg_trend_engine_tests` | **平仓失败时绝不开反向仓**（反手唯一的致命失败模式）；零成交/状态不明/-2022/取整归零；硬止损 13 次重试阶梯 → 标红 → 兜底平仓 → 熔断；**② 与 ③ 在完全没有 ATR 的情况下必须能正常反手**（反手路径上曾有一道只为海龟写的 `atr<=0` 闸门，它会让这两个策略永远反不了手，而日志与界面一切正常） |
-| `ccg_trend_state_tests` | 止损线逐位无损往返（它就是出场价）；② 的 AF 与 ③ 的「本根已开过」判据必须跨重启存活；半截状态当空仓丢弃；本地空仓而交易所有仓必须停 bot |
+```powershell
+cmake -S . -B build/headless -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake -DCCBOT_BUILD_GUI=OFF -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON -DCCBOT_WERROR=ON
+cmake --build build/headless --config Release
+ctest --test-dir build/headless -C Release --output-on-failure
+```
 
-三平台（Windows / Linux / macOS）CI 全量跑，发布包另有**泄漏检查硬门禁**（白名单校验 + 内嵌版本号核对）。
+Linux 默认不构建 GUI；macOS 按对应 vcpkg triplet 构建。Qt 关闭默认特性，只启用 Widgets、线程、正则表达式和 PNG，避免默认引入未使用的 Qt Network、SQL、测试库等模块。所有测试已注册到 CTest，原有测试可执行文件和 sanitizer 流水线继续保留。
 
-### v4.7.0 起新增两道门禁
+```text
+python tools/check_suite_coverage.py
+```
 
-**编译警告。** 此前项目里一个警告开关都没开 —— 三个编译器只兑现了"能编过"，而默认等级恰好放过未初始化读取、符号比较、窄化转换这类会亏钱的东西。现在 MSVC `/W4 /permissive-`、GCC/Clang `-Wall -Wextra -Wshadow -Wnon-virtual-dtor -Wdouble-promotion` 等，只作用于自有目标（不污染 vcpkg 依赖与 Qt moc）。`-DCCBOT_WERROR=ON` 升级为错误。
+## 配置与迁移
 
-**Sanitizer**（`sanitize.yml`，只跑 Linux）。ASan+UBSan 跑全部；TSan 跑真正并发的那几套。理由：`sar_engine.cpp` 有 27 处 mutex/atomic，行情层还多一个看门狗线程，而**并发缺陷是唯一会"测试全绿直到某天对不上账"的一类** —— 单元测试证明不了它不存在，TSan 能。用 `-DCCBOT_SANITIZE=address+undefined` 或 `=thread` 本地复现（两者互斥，必须分两次构建）。
+复制 `config.example.json` 为本机 `config.json`，填写测试网凭证，再选择启用智能模式或配置手动 bot。字段见 [Headless 说明](docs/HEADLESS.md)。
 
----
+- 新配置使用 `"strategy": "trend_following"`；旧 `"turtle"` 名称作为输入别名兼容。
+- 智能 `"strategy": "bare"`、`"vol"` 明确拒绝，不会自动改成趋势跟踪；手动 `bare_k` 继续有效。
+- 旧状态若仍有已移除智能策略的持仓，程序拒绝恢复和启动交易，保留原状态文件。请使用旧版管理至平仓后再升级。
+- GUI 数据位于可执行文件旁的 `data/`，headless 使用配置中的状态路径。凭证、配置、持仓、成交和日志不得随源码或发布包上传。
 
-## 文档
+本程序连接真实合约订单接口。首次运行请使用测试网验证；交易所止损与本地风控不保证避免滑点或损失。
 
-| | |
-|---|---|
-| ~~docs/GUIDE.md~~ | **已删除（v5.0.0）。** 整篇是网格 DCA 的界面说明，而且早已过时好几个版本（还在讲动态W、出场价记忆这些 v4.6.0 就移除的东西）。过时的指南比没有指南更有害——参数说明现在以 [HEADLESS.md](docs/HEADLESS.md) 的字段表为准，GUI 的每一项都有对应的 tooltip |
-| [docs/HEADLESS.md](docs/HEADLESS.md) | 无界面版配置字段与 systemd 部署 |
-| [docs/NEGATIVE_RESULTS.md](docs/NEGATIVE_RESULTS.md) | **已移除的方向与实测结论**（分三类：实测证伪 / 从未验证 / 论证成立但按取向移除）。加功能前先翻这里 |
-| [docs/BACKTEST.md](docs/BACKTEST.md) | 历史回测结论存档（工具本身已移出仓库） |
-| [docs/DYNAMIC_W.md](docs/DYNAMIC_W.md) | 动态W模式的推导与实测（网格DCA 时代的方向，v4.6.0 已移除，历史存档） |
+## 文档与发布
 
-## 工具
+- [框架与升级基线](docs/ARCHITECTURE_BASELINE.zh-CN.md)
+- [Headless 配置、运行与部署](docs/HEADLESS.md)
+- `.github/workflows/`：Windows、macOS、Linux 构建检查与 sanitizer；标签构建保留 CI 产物，正式 Release 附件在核验后单独发布。
+- `tools/leak_check.py`：发布包白名单和内嵌版本核验。
+- `docs/BACKTEST.md`、`docs/NEGATIVE_RESULTS.md`、`docs/DYNAMIC_W.md` 为上游历史研究记录，不代表当前可执行功能。
 
-| | |
-|---|---|
-| [`tools/tradingview/bar_swing_stop.pine`](tools/tradingview/bar_swing_stop.pine) | **③ 纯裸K · 等收盘突破**的 TradingView 镜像（另一种入场模式「盘中即时」是 tick 级的，历史K线上没有可复现的对应物，刻意不镜像）。用来**肉眼核对机器人算出的止损线**：鼠标移到任意一根K线，状态栏显示那根当时生效的止损价，图上画红色虚线。两处与引擎必然存在的差异（3 秒采样 vs 整根极值、下单延迟）在文件注释里写明了 |
-
----
-
-## License
-
-[MIT](LICENSE)
+许可证为 [MIT](LICENSE)，保留上游版权与许可声明。

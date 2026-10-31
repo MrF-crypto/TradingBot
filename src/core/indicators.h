@@ -82,7 +82,7 @@ inline DonchianResult donchian(const std::vector<Ohlc>& bars, int period,
 }
 
 // 量比：vols[idx] ÷ 它之前 window 根的平均量（不含 idx 自己）。
-// 海龟拿【当前未收盘根的已成交量】去比（idx = 最后一根），裸K拿【刚收盘那根】去比
+// 趋势跟踪拿【当前未收盘根的已成交量】去比（idx = 最后一根），裸K拿【刚收盘那根】去比
 // （idx = 倒数第二根）。数据不足或均量为 0 时返回 0（= 拿不到）
 inline double volume_ratio(const std::vector<double>& vols, int idx, int window) {
     if (window <= 0 || idx < window || idx >= (int)vols.size()) return 0;

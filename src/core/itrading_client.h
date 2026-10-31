@@ -13,6 +13,7 @@ struct OrderOutcome {
     double      avg_price    = 0;
     double      executed_qty = 0;
     bool        uncertain    = false;   // 状态不明（超时且查单失败）
+    std::string client_order_id{};
 };
 
 class ITradingClient {
@@ -21,6 +22,9 @@ public:
 
     virtual OrderOutcome place_market_order(const std::string& symbol, const std::string& side,
                                             double qty, bool reduce_only) = 0;
+    // True only after a successful query proves the opening order terminal.
+    // Unknown / unsupported is false, never inferred from an empty position snapshot.
+    virtual bool opening_order_terminal(const std::string&, const std::string&) { return false; }
     virtual double round_qty(const std::string& symbol, double qty) = 0;
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;
     virtual bool   is_dual_mode() const = 0;

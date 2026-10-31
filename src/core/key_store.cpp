@@ -67,7 +67,7 @@ static std::string dpapi_dec(const std::vector<uint8_t>& data) {
 static bool write_blob(const std::string& path, const std::vector<uint8_t>& enc) {
     const std::string tmp = path + ".tmp";
     {
-        std::ofstream f(utf8_to_wide(tmp), std::ios::binary | std::ios::trunc);
+        std::ofstream f(std::filesystem::path(utf8_to_wide(tmp)), std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write((const char*)enc.data(), (std::streamsize)enc.size());
         f.flush();
@@ -84,7 +84,7 @@ static bool write_blob(const std::string& path, const std::vector<uint8_t>& enc)
 }
 
 static bool read_blob(const std::string& path, std::vector<uint8_t>& enc) {
-    std::ifstream f(utf8_to_wide(path), std::ios::binary);
+    std::ifstream f(std::filesystem::path(utf8_to_wide(path)), std::ios::binary);
     if (!f) return false;
     enc.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     return !enc.empty();

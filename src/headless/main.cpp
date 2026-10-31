@@ -140,58 +140,6 @@ static int run_scan_only(const std::string& config_path) {
     tc.testnet = false;
     TradingClient client(tc);
     const auto t0 = std::chrono::steady_clock::now();
-    if (sc.strategy == smart::Strategy::BareK) {
-        const auto bs = scan_ambush(client, sc, RestPriceFeed::now_ms());
-        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                              std::chrono::steady_clock::now() - t0).count();
-        if (!bs.ok) {
-            std::cout << "扫描失败：" << bs.error << std::endl;
-            return 1;
-        }
-        const auto pool = smart::select_ambush(bs.feats, sc.bare);
-        int gate_ok = 0;
-        for (const auto& kv : bs.feats)
-            if (smart::ambush_gate(kv.second, sc.bare).empty()) ++gate_ok;
-        std::cout << "智能裸K（埋伏点火）：USDT 永续 " << bs.universe << " 个，过门槛 " << bs.passed_gate
-                  << "，拉到K线 " << bs.fetched << "，结构合格 " << gate_ok << "，埋伏池 " << pool.size()
-                  << "/" << sc.bare.pool_n << "，用时 " << secs << " 秒\n"
-                  << "  #  品种              分数     κ   箱体位置  1hATR%  ATR压缩  低点抬高 上涨量占比  离上沿%\n";
-        int i = 0;
-        for (const auto& a : pool) {
-            const auto& f = a.f;
-            char line[256];
-            std::snprintf(line, sizeof(line), "%3d  %-16s %5.1f %5.2f %8.2f %7.2f %8.2f %6s %9.2f %9.2f\n",
-                          ++i, a.symbol.c_str(), a.score, f.kappa, f.pos, f.atr_pct, f.atr_ratio,
-                          f.higher_low ? "是" : "", f.up_vol_share, (f.box_hi - f.close) / f.close * 100.0);
-            std::cout << line;
-        }
-        return 0;
-    }
-    if (sc.strategy == smart::Strategy::VolFollow) {
-        const auto vs = scan_vol(client, sc, {}, RestPriceFeed::now_ms());
-        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                              std::chrono::steady_clock::now() - t0).count();
-        if (!vs.ok) {
-            std::cout << "扫描失败：" << vs.error << std::endl;
-            return 1;
-        }
-        const auto picked = smart::select_vol(vs.feats, sc.vol);
-        int qualified = 0;
-        for (const auto& kv : vs.feats)
-            if (smart::vol_qualifies(kv.second, sc.vol)) ++qualified;
-        std::cout << "智能波动顺势（" << sc.vol.interval << "）：USDT 永续 " << vs.universe << " 个，过门槛 "
-                  << vs.passed_gate << "，拉到K线 " << vs.fetched << "，波动合格 " << qualified
-                  << "，名单 " << picked.size() << "/" << sc.vol.pool_n << "，用时 " << secs << " 秒\n"
-                  << "  #  品种              波动斜率   ATR%\n";
-        int i = 0;
-        for (const auto& s : picked) {
-            const auto& f = vs.feats.at(s);
-            char line[160];
-            std::snprintf(line, sizeof(line), "%3d  %-16s %8.2f %7.2f\n", ++i, s.c_str(), f.slope, f.atr_pct);
-            std::cout << line;
-        }
-        return 0;
-    }
     const auto scan = scan_market(client, sc, {}, RestPriceFeed::now_ms());
     const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
                           std::chrono::steady_clock::now() - t0).count();
@@ -225,6 +173,10 @@ static int run_scan_only(const std::string& config_path) {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--version") {
+        std::cout << "TradingBot headless " << ccbot::kVersion << std::endl;
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--scan")
         return run_scan_only(argc > 2 ? argv[2] : "");
 
@@ -308,7 +260,7 @@ int main(int argc, char** argv) {
         if (f) f << "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\n";
     }
 
-    // ── 趋势引擎（海龟 / 抛物线SAR / 纯裸K，本版起是唯一的引擎）──────────────
+    // ── 趋势引擎（趋势跟踪 / 抛物线SAR / 纯裸K，本版起是唯一的引擎）──────────────
     // 数据记录层：状态文件同目录下的 journal/（见 core/journal.h）
     const auto journal = std::make_shared<Journal>(
         (std::filesystem::path(cfg.state_path).parent_path() / "journal").string());
@@ -348,13 +300,14 @@ int main(int argc, char** argv) {
         // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
         // 引擎以为自己空仓而交易所上的仓位还在
         // 自动 bot 不在配置里，用智能模式模板恢复参数（关着时空仓的自动 bot 会被丢弃）
-        // 智能裸K 的 bot（名单代码 K）用裸K 参数恢复；它不看开关——关着时持仓中的也要按裸K 参数管完
-        const TrendConfig bare_tmpl = smart::make_bare_bot_config(cfg.smart, "");
-        // 波动顺势的 bot（名单代码 V）同理：关着时持仓中的也按波动顺势参数管完
-        const TrendConfig vol_tmpl = smart::make_vol_bot_config(cfg.smart, "");
-        auto trend_saved = load_trend_state(trend_state_path, cfg.trend_bots,
-                                            cfg.smart.enabled ? &cfg.smart.tmpl : nullptr,
-                                            &bare_tmpl, &vol_tmpl);
+        std::vector<TrendBot> trend_saved;
+        try {
+            trend_saved = load_trend_state(trend_state_path, cfg.trend_bots,
+                                          cfg.smart.enabled ? &cfg.smart.tmpl : nullptr);
+        } catch (const std::exception& e) {
+            log_line(e.what(), "ERR");
+            return 1;
+        }
         std::set<std::string> trend_restored;
         for (auto& b : trend_saved) {
             auto id = trend_engine->restore_bot(b);
@@ -435,9 +388,6 @@ int main(int argc, char** argv) {
     std::mutex sym_q_mtx;
     std::set<std::string> sym_add_q, sym_del_q;
     std::atomic<bool> smart_busy{false};
-    std::atomic<bool> bare_busy{false};   // 必须在 fetch_pool 之前声明（池先析构，见下）
-    // headless 的配置只在启动时读一次，策略不会中途变
-    const bool smart_bare = cfg.smart.enabled && cfg.smart.strategy == smart::Strategy::BareK;
     auto smart = std::make_shared<SmartRunner>(
         client, trend_engine, cfg.state_path + ".smart",
         [webhook](const std::string& m, bool warn) {
@@ -456,31 +406,12 @@ int main(int argc, char** argv) {
         sym_del_q.insert(s);
         sym_add_q.erase(s);
     };
-    // 智能裸K 的埋伏池进 / 出：只订阅价格，走同一个队列
-    smart->on_watch = [&](const std::string& s, bool on) {
-        std::lock_guard<std::mutex> lk(sym_q_mtx);
-        if (on) { sym_add_q.insert(s); sym_del_q.erase(s); }
-        else    { sym_del_q.insert(s); sym_add_q.erase(s); }
-    };
     smart->set_journal(journal);
     smart->load();
     // 状态文件里没有今天的数（升级后第一次运行）：用成交 CSV 补，亏损限额不从 0 算
     smart->seed_day_from_history(load_trades_csv(trades_csv));
     smart->set_config(cfg.smart);
-    if (smart_bare) {
-        const auto& bc = cfg.smart.bare;
-        log_line("智能裸K（埋伏点火，只做多）已启用：埋伏池 " + std::to_string(bc.pool_n) +
-                 "，点火量比 ≥ " + std::to_string(bc.vol_ratio).substr(0, 4) +
-                 "，同时持仓上限 " + std::to_string(bc.max_positions) +
-                 (cfg.smart.daily_loss_limit > 0
-                      ? "，当日亏损限额 " + std::to_string((int)cfg.smart.daily_loss_limit) + "U" : ""));
-    } else if (cfg.smart.enabled && cfg.smart.strategy == smart::Strategy::VolFollow) {
-        const auto& vc = cfg.smart.vol;
-        log_line("智能波动顺势已启用：周期 " + vc.interval + "，名单上限 " + std::to_string(vc.pool_n) +
-                 "，同时持仓上限 " + std::to_string(vc.max_positions) +
-                 (cfg.smart.daily_loss_limit > 0
-                      ? "，当日亏损限额 " + std::to_string((int)cfg.smart.daily_loss_limit) + "U" : ""));
-    } else if (cfg.smart.enabled) {
+    if (cfg.smart.enabled) {
         const auto& sc = cfg.smart;
         log_line(std::string("智能模式已启用：") + (sc.dir_long ? "做多" : "") +
                  (sc.dir_long && sc.dir_short ? "+" : "") + (sc.dir_short ? "做空" : "") +
@@ -553,7 +484,6 @@ int main(int argc, char** argv) {
                 for (const auto& b : trend_engine->get_bots()) in_use.insert(b.cfg.symbol);
                 for (const auto& s : del) {
                     if (in_use.count(s)) continue;
-                    if (smart->watching(s)) continue;   // 裸K 埋伏池还在盯它
                     symbols.erase(s);
                     ticker.unsubscribe(s);
                     stall_ticks.erase(s);
@@ -683,8 +613,7 @@ int main(int argc, char** argv) {
                 // 4h 每 60 秒一次就够。tick 是 3 秒一拍
                 const int ticks = std::max(1,
                     TrendEngine::signal_period_sec(b.cfg.interval) / 3);
-                // 波动顺势看的是正在走的这根：K线一交接就补拉，不等下一个周期
-                if ((tick_n % ticks) == 1 || TrendEngine::vf_bar_stale(b, RestPriceFeed::now_ms()))
+                if ((tick_n % ticks) == 1)
                     need.push_back(b);
             }
             if (!need.empty()) {
@@ -697,8 +626,7 @@ int main(int argc, char** argv) {
                         // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
                         // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
                         // 像 v5.1.0 之前那样成对调用两个接口
-                        if (b.cfg.rule.strategy != trend::Strategy::Turtle &&
-                            b.cfg.rule.strategy != trend::Strategy::VolFollow) {
+                        if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) {
                             auto bp = client->fetch_bar_pattern(
                                 b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
                             if (!bp.ok) return;
@@ -726,7 +654,7 @@ int main(int argc, char** argv) {
                         }
                         auto snap = client->fetch_trend_signal(
                             b.cfg.symbol, b.cfg.interval,
-                            b.cfg.rule.donchian_period, b.cfg.rule.atr_period);
+                            b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.cfg.rule.following);
                         if (!snap.ok) return;
                         // 量比：开了 vol_paced 的用按已走时间折算的那个
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
@@ -735,7 +663,7 @@ int main(int argc, char** argv) {
                                                   b.cfg.rule.vol_paced ? snap.vol_ratio_paced
                                                                        : snap.vol_ratio,
                                                   snap.er_ok, snap.er, snap.prev_close,
-                                                  snap.taker_ratio, snap.range_pace, snap.bar_open);
+                                                  snap.taker_ratio, snap.range_pace, snap.following);
                       } catch (...) {}   // 跨线程的异常会直接 terminate
                     });
                     trend_sig_busy.store(false);
@@ -767,17 +695,6 @@ int main(int argc, char** argv) {
                 });
             } else if (tick_n % 20 == 0 && !smart_busy.load()) {
                 smart->housekeep(now_ms);
-            }
-            // 智能裸K 的点火判定：每拍一次（每根 5m 收盘后判池里的币，点火就建 bot 开仓）
-            if (smart_bare && !bare_busy.exchange(true)) {
-                fetch_pool->submit([smart, now_ms, &bare_busy, &ticker]() {
-                    try {
-                        smart->bare_tick(now_ms, [&ticker](const std::string& s) {
-                            return ticker.mark_price(s);
-                        });
-                    } catch (...) {}
-                    bare_busy.store(false);
-                });
             }
         }
 
