@@ -57,6 +57,16 @@ jobs:
           done
           [ "$ok" = "1" ] || { echo "apt 三次均失败"; exit 1; }
 
+      - name: Install pinned CMake on ARM64
+        if: matrix.arch == 'arm64'
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/Kitware/CMake/releases/download/v4.4.5/cmake-4.4.5-linux-aarch64.tar.gz \
+            --output "$RUNNER_TEMP/cmake-arm64.tar.gz"
+          echo "301d5063ab259577c1b57ce5490b1aab9ea5c56dc4c822f73499553dab94925f  $RUNNER_TEMP/cmake-arm64.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/cmake-arm64.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/cmake-4.4.5-linux-aarch64/bin" >> "$GITHUB_PATH"
+
       - name: Set up vcpkg
         run: |
           git clone --depth 1 --branch "$VCPKG_TAG" https://github.com/microsoft/vcpkg.git "$RUNNER_TEMP/vcpkg"

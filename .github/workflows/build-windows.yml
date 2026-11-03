@@ -95,6 +95,16 @@ jobs:
           cd ../..
           ls -la pkg | head -30
 
+      - name: Include Microsoft C++ runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $redist = Get-ChildItem "$vsInstall/VC/Redist/MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $runtimeFiles = Get-ChildItem "$($redist.FullName)/x64/Microsoft.VC*.CRT/*.dll"
+          if (-not $runtimeFiles) { throw "Microsoft C++ runtime was not found" }
+          $runtimeFiles | Copy-Item -Destination pkg
+
       # 硬门禁：白名单校验 + 内嵌版本号核对。
       # 不通过则整个 job 失败，没有任何产物产生 —— data/ 里的 API 凭证、持仓状态、
       # 交易记录不可能被打进公开 Release
