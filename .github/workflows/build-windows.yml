@@ -110,9 +110,16 @@ jobs:
         run: |
           $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
           $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $redist = Get-ChildItem "$vsInstall/VC/Redist/MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $runtimeFiles = Get-ChildItem "$($redist.FullName)/x64/Microsoft.VC*.CRT/*.dll"
-          if (-not $runtimeFiles) { throw "Microsoft C++ runtime was not found" }
+          # VS also has v143/v145 installer folders; find the actual x64 CRT,
+          # then select by DLL version instead of sorting directory labels.
+          $crt = Get-ChildItem "$vsInstall/VC/Redist/MSVC" -Directory -Filter 'Microsoft.VC*.CRT' -Recurse |
+            Where-Object { $_.Parent.Name -eq 'x64' -and $_.FullName -notmatch '[\\/](onecore|debug_nonredist)[\\/]' } |
+            Where-Object { (Test-Path "$($_.FullName)/vcruntime140.dll") -and (Test-Path "$($_.FullName)/msvcp140.dll") } |
+            Sort-Object { $v = [System.Diagnostics.FileVersionInfo]::GetVersionInfo("$($_.FullName)/vcruntime140.dll"); [version]::new($v.FileMajorPart, $v.FileMinorPart, $v.FileBuildPart, $v.FilePrivatePart) } -Descending |
+            Select-Object -First 1
+          if (-not $crt) { throw "Microsoft x64 C++ runtime was not found" }
+          Write-Output "Including runtime from $($crt.FullName)"
+          $runtimeFiles = Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File
           $runtimeFiles | Copy-Item -Destination pkg
 
       # 硬门禁：白名单校验 + 内嵌版本号核对。
