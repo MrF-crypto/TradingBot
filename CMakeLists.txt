@@ -421,19 +421,24 @@ if(TARGET TradingBot)
         target_compile_options(tradingbot_monitor_smoke PRIVATE /utf-8)
     endif()
     add_test(NAME tradingbot_monitor_smoke COMMAND tradingbot_monitor_smoke)
+    set_tests_properties(tradingbot_monitor_smoke PROPERTIES TIMEOUT 60)
     if(APPLE)
         # The static macOS package includes Cocoa, not the optional offscreen plugin.
         # GitHub's macOS runners provide a desktop session, so exercise the native backend.
         set_tests_properties(tradingbot_monitor_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=cocoa")
+    elseif(WIN32)
+        # Exercise the shipped backend. Some Qt distributions omit offscreen;
+        # a missing platform can otherwise leave a modal startup error in CI.
+        set_tests_properties(tradingbot_monitor_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=windows")
     else()
         set_tests_properties(tradingbot_monitor_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
     endif()
-    if(WIN32 AND TARGET Qt6::QOffscreenIntegrationPlugin)
-        get_target_property(_offscreen_type Qt6::QOffscreenIntegrationPlugin TYPE)
-        if(_offscreen_type STREQUAL "MODULE_LIBRARY")
+    if(WIN32 AND TARGET Qt6::QWindowsIntegrationPlugin)
+        get_target_property(_windows_plugin_type Qt6::QWindowsIntegrationPlugin TYPE)
+        if(_windows_plugin_type STREQUAL "MODULE_LIBRARY")
             add_custom_command(TARGET tradingbot_monitor_smoke POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:tradingbot_monitor_smoke>/platforms"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Qt6::QWindowsIntegrationPlugin>"
                     "$<TARGET_FILE_DIR:tradingbot_monitor_smoke>/platforms/")
         endif()
     endif()

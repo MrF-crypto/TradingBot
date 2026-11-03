@@ -82,7 +82,17 @@ jobs:
       # 凭证存储五套都没跑过——那等于测试写了却没人守着
 
       - name: Run all test suites
-        run: ctest --test-dir build -C Release --output-on-failure --parallel 2
+        env:
+          QT_DEBUG_PLUGINS: '1'
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 2 --timeout 180
+
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: test-diagnostics-windows
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
 
       - name: Package
         shell: bash
