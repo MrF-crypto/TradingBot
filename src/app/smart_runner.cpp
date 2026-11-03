@@ -1,3 +1,4 @@
+#include "core/atomic_file.h"
 #include "app/smart_runner.h"
 #include "core/parallel.h"
 #include "net/trading_client.h"
@@ -41,73 +42,15 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
     return s;
 }
 
-// 名单 / 分段代码 → 日志里的简称
-std::string list_name(char c) {
-    switch (c) {
-    case smart::kListLong:   return "多";
-    case smart::kListShort:  return "空";
-    case smart::kSegStrong:  return "强";
-    case smart::kSegWeak:    return "弱";
-    case smart::kSegMid:     return "中";
-    case smart::kSegHot:     return "过热";
-    default:                 return "?";
-    }
-}
-
 } // namespace
 
-std::vector<SmartRunner::Group> SmartRunner::build_groups(const smart::Ranking& rk,
-                                                          const smart::Segmented& sg,
-                                                          const smart::Config& cfg,
-                                                          const std::set<std::string>& with_bot) {
-    std::vector<Group> out;
-    auto make = [&](const std::string& title, char code, const std::vector<std::string>& list,
-                    int quota, auto score_of) {
-        Group g;
-        g.title = title;
-        g.code  = code;
-        g.quota = quota;
-        for (int i = 0; i < (int)list.size() && i < quota; ++i) {
-            const auto& s = rk.rows.at(list[i]);
-            Row r;
-            r.symbol    = list[i];
-            r.list      = code;
-            r.rank      = i + 1;
-            r.score     = score_of(s);
-            r.atr_pct   = s.f.atr_pct;
-            r.box12_atr = s.f.box12_atr;
-            r.vol_lift  = s.f.vol_lift;
-            r.rs        = s.f.rs;
-            r.max_up24  = s.f.max_up24;
-            r.has_bot   = with_bot.count(list[i]) > 0;
-            g.rows.push_back(std::move(r));
-        }
-        out.push_back(std::move(g));
-    };
-    if (cfg.dir_mode == smart::DirMode::Mixed) {
-        using smart::Scored;
-        const auto mid_dir = cfg.dir_long && cfg.dir_short ? "多空" : (cfg.dir_long ? "仅多" : "仅空");
-        if (smart::seg_quota(smart::kSegStrong, cfg) > 0)
-            make("强势候选", smart::kSegStrong, sg.strong, cfg.strong_n,
-                 [](const Scored& s) { return s.long_score; });
-        if (smart::seg_quota(smart::kSegWeak, cfg) > 0)
-            make("弱势候选", smart::kSegWeak, sg.weak, cfg.weak_n,
-                 [](const Scored& s) { return s.short_score; });
-        if (smart::seg_quota(smart::kSegMid, cfg) > 0)
-            make(std::string("中间（") + mid_dir + "）", smart::kSegMid, sg.mid, cfg.mid_n,
-                 [](const Scored& s) { return s.squeeze_score; });
-        if (smart::seg_quota(smart::kSegHot, cfg) > 0)
-            make("异动候选", smart::kSegHot, sg.hot, cfg.hot_n,
-                 [](const Scored& s) { return s.short_score; });
-    } else {
-        if (cfg.dir_long)
-            make("做多", smart::kListLong, rk.longs, cfg.long_n,
-                 [](const smart::Scored& s) { return s.long_score; });
-        if (cfg.dir_short)
-            make("做空", smart::kListShort, rk.shorts, cfg.short_n,
-                 [](const smart::Scored& s) { return s.short_score; });
-    }
-    return out;
+std::vector<SmartRunner::Row> SmartRunner::candidate_rows(
+        const std::map<std::string, smart::Features>& candidates,
+        const std::set<std::string>& with_bot) {
+    std::vector<Row> rows;
+    for (const auto& [symbol, f] : candidates)
+        rows.push_back({symbol, f.atr_pct, f.close, with_bot.count(symbol) > 0});
+    return rows; // 按品种稳定显示；没有评分、方向分榜或候选数量截断
 }
 
 // ── 全市场扫描 ──────────────────────────────────────────────────────────────
@@ -149,7 +92,7 @@ bool gate_universe(TradingClient& c, const smart::Config& cfg,
         ++r.universe;
         seen.insert(m.symbol);
         const bool member = pool_syms.count(m.symbol) > 0;
-        // 池里已有的（升级前选进来的）记成不合格，空仓时移出；不记的话它只会慢慢掉出名单
+        // 池里已有的（升级前选进来的）明确标为不合格，暂停新仓并在空仓时移出。
         if (((!m.underlying_type.empty() && m.underlying_type != "COIN") ||
                           smart::excluded_asset_base(m.base))) {
             if (member) out.hard_fail[m.symbol] = "非加密币标的（股票 / 大宗商品 / 指数）";
@@ -191,8 +134,7 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
     std::vector<std::string> cand;
     if (!gate_universe(c, cfg, pool_syms, now_ms, r, cand)) return r;
 
-    // 201 根 1h：去掉未收盘那根剩 200，够 7 天相对强弱（168）与 ATR100。权重 2
-    const auto btc = closed_bars(c.fetch_klines("BTCUSDT", "1h", 201));
+    // 保留 200 根已收盘 1h K线用于 ATR14 的稳定预热。无需 BTC 基准或相对强弱。
 
     std::vector<smart::Features> feats(cand.size());
     std::vector<char> got(cand.size(), 0);
@@ -200,7 +142,7 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
         try {
             const auto bars = closed_bars(c.fetch_klines(cand[i], "1h", 201));
             if ((int)bars.size() < smart::kMinBars) return;
-            feats[i] = smart::compute_features(bars, btc);
+            feats[i] = smart::compute_features(bars);
             got[i] = 1;
         } catch (...) {}
     });
@@ -222,27 +164,21 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
         }
         eligible[s] = feats[i];
     }
-    // K线大面积拉不到：百分位是在一个残缺的集合上算的，名单不可信，整轮作废
+    // K线大面积拉不到：按数据故障处理，不据此批量移除已有候选。
     if (!cand.empty() && fetched * 10 < (int)cand.size() * 7) {
         r.error = "K线拉取失败过多（" + std::to_string(fetched) + "/" +
                   std::to_string(cand.size()) + "）";
         return r;
     }
     r.eligible = (int)eligible.size();
-    // 全市场一个合格的都没有：正常行情不会这样，多半是某个字段解析成了 0
-    // （交易所改了格式）。当成数据异常，而不是"今天没有好币"去淘汰整个池子
-    if (r.universe > 0 && r.eligible == 0) {
-        r.error = "全市场合格品种为 0（门槛通过 " + std::to_string(r.passed_gate) +
-                  "），疑似数据异常";
-        return r;
-    }
-    out.ranking = smart::rank(eligible, cfg);
+    // 成功拿到数据但无人通过过滤是合法的空候选池；明确不合格的旧 bot 仍要暂停新仓。
+    out.candidates = std::move(eligible);
     out.ok = true;
 
     // 持仓量：只给合格的币拉，只写进扫描记录、不参与任何决策。
     // 拉不到的币就不在 r.oi 里（记录里留空），不影响这一轮
     std::vector<std::string> syms;
-    for (const auto& kv : eligible) syms.push_back(kv.first);
+    for (const auto& kv : out.candidates) syms.push_back(kv.first);
     std::vector<smart::OiStat> oi(syms.size());
     parallel_for((int)syms.size(), parallel, [&](int i) {
         try {
@@ -300,9 +236,6 @@ void SmartRunner::set_config(const smart::Config& cfg) {
         }
         apply_engine_gates_locked();
     }
-    if (cfg.enabled && engine_)
-        for (const auto& b : engine_->get_bots())
-            if (b.is_auto && b.retiring) engine_->set_retiring(b.bot_id, false);
     sync_exit_params(cfg);
 }
 
@@ -314,7 +247,7 @@ int SmartRunner::sync_exit_params(const smart::Config& cfg) {
     for (const auto& b : engine_->get_bots()) {
         if (!b.is_auto || b.state == TrendBot::State::Stopped) continue;
         if (b.st.pos == trend::Pos::Flat && b.qty <= 0) continue;
-        const auto want = smart::make_bot_config(cfg, b.cfg.symbol, b.cfg.rule.direction, b.smart_list);
+        const auto want = smart::make_bot_config(cfg, b.cfg.symbol, b.cfg.rule.direction);
         if (engine_->update_exit_params(b.bot_id, want.rule)) names.push_back(b.cfg.symbol);
     }
     if (!names.empty() && log_)
@@ -332,19 +265,18 @@ void SmartRunner::apply_engine_gates_locked() {
     if (!engine_) return;
     // 暂停开新仓是全局应急开关，智能模式关着也照样生效
     engine_->set_pause_new(cfg_.pause_new);
+    engine_->set_rotation_enabled(cfg_.enabled && cfg_.rotate_when_full);
     if (cfg_.enabled) {
         engine_->set_risk_limits(cfg_.max_total_risk_usdt, cfg_.max_direction_risk_usdt, cfg_.risk_cost_bps);
         engine_->set_max_open_positions(cfg_.max_positions);
         engine_->set_daily_loss_limit(cfg_.daily_loss_limit);
         engine_->set_float_loss_limit(cfg_.float_loss_limit);
-        engine_->set_priority_reserve(cfg_.prio_reserve, cfg_.prio_min_score);
     } else {
         // 关闭时撤掉智能模式的闸门。同时持仓上限交还应用层自己的设置
         // （应用层在 set_config 之后会重新设一次）
         engine_->set_risk_limits(0, 0, 0);
         engine_->set_daily_loss_limit(0);
         engine_->set_float_loss_limit(0);
-        engine_->set_priority_reserve(0, 0);
     }
 }
 
@@ -468,7 +400,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     }
 
     wake_atr_pct_.clear();
-    for (const auto& [sym, row] : scan.outcome.ranking.rows) wake_atr_pct_[sym] = row.f.atr_pct;
+    for (const auto& [sym, row] : scan.outcome.candidates) wake_atr_pct_[sym] = row.atr_pct;
 
     smart::Plan plan;
     {
@@ -477,7 +409,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         else {
             auto scratch = pool_;
             plan = scratch.plan(scan.outcome, views, cfg, now_ms);
-            plan.remove.clear(); // Same closed bars must not advance hourly eviction counters.
+            plan.remove.clear(); // 异动重扫更新准入状态；移除操作留给常规扫描。
         }
     }
 
@@ -494,29 +426,26 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         }
         ++rep.removed;
         rm_desc.push_back(r.symbol + "（" + r.why + "）");
-        if (journal_) journal_->pool(now_ms, r.symbol, "移出", 0, 0, 0, r.why);
+        if (journal_) journal_->pool(now_ms, r.symbol, "移出", r.why);
         if (on_symbol_removed) on_symbol_removed(r.symbol);
     }
 
-    // ── 名单信息 ──
-    for (const auto& m : plan.meta)
-        if (!gone_ids.count(m.bot_id)) engine_->set_smart_meta(m.bot_id, m.score, m.rank, m.list);
-
-    // ── 参数同步：方向（混合模式下随分段变）或模板改了，空仓的自动 bot 换上新参数 ──
-    // 方向取本轮决策给的；这一轮没拿到数据（没有 meta）的不动
-    // 段也要带上：过热段的参数和模板不同（不要求量比）
-    std::map<std::string, std::pair<trend::Direction, char>> want_dir;
-    for (const auto& m : plan.meta)
-        if (m.has_dir) want_dir[m.bot_id] = {m.dir, m.list};
+    // 明确不合格但仍持仓/在途/被批量保护保留的 bot 继续管理，只暂停新仓。
+    // 未知数据不会出现在 meta 中，保持原状态；重新合格时解除这项暂停。
+    std::set<std::string> eligible_ids;
+    for (const auto& m : plan.meta) {
+        if (gone_ids.count(m.bot_id)) continue;
+        engine_->set_retiring(m.bot_id, !m.eligible);
+        if (m.eligible) eligible_ids.insert(m.bot_id);
+    }
+    // 空仓候选更新方向权限与模板，实际多空仍由自身趋势和突破信号决定。
     int resynced = 0, redirected = 0;
     for (const auto& b : bots) {
         if (!b.is_auto || gone_ids.count(b.bot_id)) continue;
         if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending) continue;
         if (b.state == TrendBot::State::Stopped) continue;
-        const auto wd = want_dir.find(b.bot_id);
-        if (wd == want_dir.end()) continue;
-        const auto want = smart::make_bot_config(cfg, b.cfg.symbol, wd->second.first,
-                                                 wd->second.second);
+        if (!eligible_ids.count(b.bot_id)) continue;
+        const auto want = smart::make_bot_config(cfg, b.cfg.symbol);
         if (same_params(b.cfg, want)) continue;
         // ⚠ replace_bot 在 id 不存在时会【新建】——上面已排除本轮删掉的；
         //   它自己会拒绝有持仓/在途订单的
@@ -525,7 +454,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (b.cfg.rule.direction != want.rule.direction) {
             ++redirected;
             if (journal_)
-                journal_->pool(now_ms, b.cfg.symbol, "换方向", wd->second.second, 0, 0,
+                journal_->pool(now_ms, b.cfg.symbol, "方向权限变化",
                                std::string(trend::direction_name(b.cfg.rule.direction)) + " → " +
                                trend::direction_name(want.rule.direction));
         }
@@ -534,19 +463,15 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     // ── 补位 ──
     std::vector<std::string> add_desc;
     for (const auto& a : plan.add) {
-        const auto id = engine_->add_bot(smart::make_bot_config(cfg, a.symbol, a.dir, a.list), true);
+        const auto id = engine_->add_bot(smart::make_bot_config(cfg, a.symbol, a.dir), true);
         if (id.empty()) continue;   // 同品种已有 bot（扫描期间被手动加了）
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            pool_.on_added(a.symbol, now_ms, a.list);
+            pool_.on_added(a.symbol, now_ms);
         }
-        engine_->set_smart_meta(id, a.score, a.rank, a.list);
         ++rep.added;
-        add_desc.push_back(a.symbol + "（" + list_name(a.list) + " #" +
-                           std::to_string(a.rank) + " " + fmt(a.score, 0) + "分）");
-        if (journal_)
-            journal_->pool(now_ms, a.symbol, "加入", a.list, a.rank, a.score,
-                           trend::direction_name(a.dir));
+        add_desc.push_back(a.symbol);
+        if (journal_) journal_->pool(now_ms, a.symbol, "加入", trend::direction_name(a.dir));
         if (on_symbol_added) on_symbol_added(a.symbol);
     }
 
@@ -561,17 +486,10 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         ++rep.monitored;
         if (b.qty > 0) ++rep.holding;
     }
-    rep.groups = build_groups(scan.outcome.ranking, plan.seg, cfg, with_bot);
-    // 数据记录层：完整名单快照（全部合格币，不只是进名单的）
-    if (journal_) journal_->scan(now_ms, scan.outcome.ranking, plan.seg, with_bot, scan.oi);
+    rep.candidates = candidate_rows(scan.outcome.candidates, with_bot);
+    if (journal_) journal_->scan(now_ms, scan.outcome.candidates, with_bot, scan.oi);
     rep.ok = true;
-    std::string lists;
-    for (const auto& g : rep.groups) {
-        std::string name = g.title.substr(0, g.title.find("（"));
-        lists += "，" + name + " " + std::to_string(g.rows.size());
-    }
-    rep.summary = "智能模式：合格 " + std::to_string(rep.eligible) + "/" + std::to_string(rep.universe) +
-                  lists +
+    rep.summary = "智能模式：统一候选 " + std::to_string(rep.eligible) + "/" + std::to_string(rep.universe) +
                   "；+" + std::to_string(rep.added) + " −" + std::to_string(rep.removed) +
                   "，监控 " + std::to_string(rep.monitored) + "（持仓 " + std::to_string(rep.holding) + "）";
     if (log_) {
@@ -580,7 +498,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (!rm_desc.empty())  log_("  移出：" + join(rm_desc, "、"), false);
         if (resynced > 0)
             log_("  " + std::to_string(resynced) + " 个空仓自动 bot 已换上新参数" +
-                 (redirected > 0 ? "（其中 " + std::to_string(redirected) + " 个随分段换了方向）"
+                 (redirected > 0 ? "（其中 " + std::to_string(redirected) + " 个更新了方向权限）"
                                  : std::string()), false);
         const auto fs = engine_->take_filter_summary();
         if (!fs.empty())       log_("  上一轮以来自动 bot：" + fs, false);
@@ -598,11 +516,11 @@ void SmartRunner::housekeep(int64_t now_ms) {
     // 重启恢复的持仓带的是落盘时的参数：每分钟对一次设置
     sync_exit_params(config());
     if (!enabled) {
-        // 关闭后：空仓的自动 bot 移除；持仓中的标待移出（管到平仓、不再开新仓），
-        // 走完后下一次维护再移除。已停止的（你或对账停的）不替你删
+        // 关闭后：普通空仓自动 bot 移除；持仓、在途和等待再次入场的记录保留并禁开。
+        // 等待记录需留到重新启用时继续检查；已停止的（你或对账停的）不替你删。
         for (const auto& b : engine_->get_bots()) {
             if (!b.is_auto || b.state == TrendBot::State::Stopped) continue;
-            if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending) {
+            if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending || b.waiting_reentry()) {
                 if (!b.retiring) engine_->set_retiring(b.bot_id);
                 continue;
             }
@@ -624,26 +542,12 @@ void SmartRunner::save_locked() const {
     o << std::setprecision(std::numeric_limits<double>::max_digits10);
     const auto d = engine_ ? engine_->day_pnl() : TrendEngine::DayPnl{};
     o << "{\"pool\":" << pool_.to_json() << ",\"day\":{\"d\":" << d.day << ",\"r\":" << d.realized << "}}";
-    // 原子写：先写临时文件再改名
-    const std::string tmp = state_path_ + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return;
-        f << o.str();
-        f.flush();
-        if (!f.good()) return;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, state_path_, ec);
-    if (ec) {
-        std::ofstream f(state_path_, std::ios::binary | std::ios::trunc);
-        if (f) f << o.str();
-        std::filesystem::remove(tmp, ec);
-    }
+    const auto result = write_atomic_file(state_path_, o.str());
+    if (engine_) engine_->set_persistence_error("智能状态", result.error);
 }
 
 void SmartRunner::load() {
-    std::ifstream f(state_path_, std::ios::binary);
+    std::ifstream f(std::filesystem::path(std::u8string(state_path_.begin(), state_path_.end())), std::ios::binary);
     if (!f) return;
     std::ostringstream buf;
     buf << f.rdbuf();

@@ -43,6 +43,7 @@ public:
     bool   fail_next    = false;    // 下一笔直接失败
     bool   uncertain_next = false;  // 下一笔状态不明
     bool   zero_fill_next = false;  // 下一笔零成交（r.ok 但 executedQty=0）
+    double fill_fraction_next = 1.0; // 下一笔部分成交比例
     std::string error_next;         // 自定义错误串（如 -2022）
     double qty_step     = 0.001;    // 取整步长
     int    leverage_calls = 0;
@@ -65,7 +66,8 @@ public:
         o.ok = true;
         o.order_id = "M" + std::to_string(calls.size());
         o.avg_price = fill_price;
-        o.executed_qty = zero_fill_next ? 0.0 : qty;
+        o.executed_qty = zero_fill_next ? 0.0 : qty * fill_fraction_next;
+        fill_fraction_next = 1.0;
         zero_fill_next = false;
         return o;
     }
@@ -98,18 +100,6 @@ public:
         stop_log.push_back({"cancel", 0, id});
         return true;
     }
-    // 硬止损单是否还在活跃委托里。三种状态都要能构造：
-    //   ds_live_known=false              → 查不到（必须走保守路径）
-    //   ds_live_known=true,  live=true   → 还挂着（不是它平的）
-    //   ds_live_known=true,  live=false  → 已经不在了（它触发了）
-    bool ds_live_known = false;
-    bool ds_live       = true;
-    int  ds_live_calls = 0;
-    bool is_disaster_stop_live(const std::string&, const std::string&, bool* ok) override {
-        ++ds_live_calls;
-        if (ok) *ok = ds_live_known;
-        return ds_live;
-    }
     int ds_count(const std::string& kind) const {
         int n = 0;
         for (const auto& c : stop_log) if (c.kind == kind) ++n;
@@ -125,6 +115,12 @@ public:
         return leverage_ok;
     }
     bool is_dual_mode() const override { return false; }
+    CloseVerification close_verification;
+    int close_checks = 0;
+    CloseVerification verify_close(const std::string&, const std::string&, const std::string&) override {
+        ++close_checks;
+        return close_verification;
+    }
 };
 
 // 内联执行器 + 固定时钟，结果完全确定可复现
@@ -209,9 +205,17 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 }
 
 #include "risk_budget_scenarios.h"
+#include "reentry_scenarios.h"
+#include "rotation_scenarios.h"
+#include "resume_scenarios.h"
+#include "audit_engine_scenarios.h"
 
 int main() {
+    test_audit_engine_scenarios();
     test_risk_budget_scenarios();
+    test_reentry_scenarios();
+    test_rotation_scenarios();
+    test_resume_scenarios();
     // 关掉 stdout 缓冲。管道里 printf 是全缓冲的，进程崩溃时整段输出会一起丢掉——
     // 于是"崩在哪一条用例"这个唯一有用的信息就没了
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -397,9 +401,8 @@ int main() {
         eng.tick("TESTUSDT", 111.0);
         check(cli->calls.size() == 1, "  上膛后再突破：开仓");
 
-        eng.set_smart_meta(eng.get_bots()[0].bot_id, 80, 3, 'L');
         eng.release_auto(eng.get_bots()[0].bot_id);
-        check(!eng.get_bots()[0].is_auto && eng.get_bots()[0].smart_rank == 0,
+        check(!eng.get_bots()[0].is_auto,
               "  release_auto：转为手动 bot，名单信息清掉");
 
         auto cli2 = std::make_shared<FakeClient>();
@@ -412,7 +415,7 @@ int main() {
         check(cli2->calls.size() == 1, "  手动 bot 照常突破即开");
     }
 
-    // ── 数据记录层：成交带上开仓时的段/分数/入场离边沿；过滤事件每根K线一次 ──────
+    // ── 数据记录层：成交带上入场离边沿；过滤事件每根K线一次 ──────
     {
         auto cli = std::make_shared<FakeClient>();
         TrendEngine eng(cli, inline_host());
@@ -424,7 +427,6 @@ int main() {
         cfg.rule.reverse = trend::ReverseMode::None;
         cfg.rule.breakout_vol_ratio = 1.5;
         auto id = eng.add_bot(cfg, /*is_auto*/ true);
-        eng.set_smart_meta(id, 77, 4, 'U');
         eng.update_signal(id, 2.0, 2.0, true, 110, 90, 1, 3.0, 1.0);
         eng.tick("TESTUSDT", 100.0);            // 上膛
         eng.tick("TESTUSDT", 111.0);            // 突破，量比 1.0 不够
@@ -436,14 +438,12 @@ int main() {
         cli->fill_price = 111.0;
         eng.tick("TESTUSDT", 111.0);            // 放量，开多 @111
         const auto b = eng.get_bots()[0];
-        check(b.open_seg == 'U' && b.open_rank == 4 && b.open_score == 77,
-              "开仓时记下所在段、名次、分数");
         check(std::fabs(b.open_dist_atr - 0.5) < 1e-9, "  入场离通道上沿 (111−110)÷2 = 0.5 ATR");
         advance(10);
         eng.update_signal(id, 2.0, 2.0, true, 110, 90, 2, 3.0, 2.0);
         cli->fill_price = 104.0;
         eng.tick("TESTUSDT", 104.0);            // 止损出场
-        check(trades.size() == 1 && trades[0].seg == 'U' && trades[0].rank == 4 &&
+        check(trades.size() == 1 &&
               std::fabs(trades[0].entry_dist_atr - 0.5) < 1e-9 && trades[0].is_auto &&
               trades[0].open_time.time_since_epoch().count() != 0 && trades[0].interval == cfg.interval,
               "  平仓的成交记录带上这些信息");
@@ -712,6 +712,21 @@ int main() {
     {
         auto cli = std::make_shared<FakeClient>();
         TrendEngine eng(cli, inline_host());
+        TrendBot snap;
+        snap.cfg = mk_cfg(); snap.is_auto = true;
+        const auto id = eng.restore_bot(snap);
+        feed(eng, id, 2.0, 110, 90);
+        cli->fill_price = 111;
+        eng.tick("TESTUSDT", 100); eng.tick("TESTUSDT", 111);
+        check(cli->calls.empty() && eng.get_bots()[0].retiring,
+              "重启的自动 bot 即使出现突破，也等待候选过滤通过");
+        eng.set_retiring(id, false);
+        eng.tick("TESTUSDT", 111);
+        check(cli->calls.size() == 1, "通过候选过滤后可正常响应突破");
+    }
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine eng(cli, inline_host());
         auto cfg = mk_cfg();
         cfg.rule.reverse = trend::ReverseMode::None;
         auto id = eng.add_bot(cfg);
@@ -788,7 +803,7 @@ int main() {
               "空单：最高 +2×数量，最低 −4.5×数量");
     }
 
-    // ── 暂停中：硬止损丢了要补挂；它触发后对账确认时按挂单价记账 ──────────────
+    // ── 暂停中补挂保护，已成交保护单按实际执行结果记账 ──────────────────────
     {
         auto cli = std::make_shared<FakeClient>();
         TrendEngine eng(cli, inline_host());
@@ -816,17 +831,21 @@ int main() {
         check(cli->ds_count("place") == 2, "  已挂上就不重复挂");
 
         // 交易所侧仓位没了（硬止损触发）：对账两轮确认
+        cli->close_verification.position_known = true;
+        cli->close_verification.protective_fill.ok = true;
+        cli->close_verification.protective_fill.executed_qty = q;
+        cli->close_verification.protective_fill.avg_price = dsp - .25;
         advance(10);
         reconcile(eng, {});
         check(trades.empty(), "  第 1 轮存疑：先不记账");
         advance(70);
         reconcile(eng, {});
         const auto b = eng.get_bots()[0];
-        const double want = (dsp - 110.0) * q;
+        const double want = (dsp - .25 - 110.0) * q;
         check(trades.size() == 1 && trades[0].reason.find("硬止损") != std::string::npos,
               "第 2 轮确认：按硬止损记一笔成交（不再是'外部已平'、一笔都不记）");
         check(std::fabs(b.realized_pnl - want) < 1e-9 && b.trade_count == 1,
-              "  按挂单价估算盈亏，进 bot 统计");
+              "  按实际成交价记账，不能用触发价代替");
         check(eng.day_pnl().realized < want + 1e-9, "  进当日亏损（含估算手续费）");
         check(b.st.pos == trend::Pos::Flat && b.qty == 0, "  本地状态清空");
     }
@@ -951,28 +970,20 @@ int main() {
         check(cli->calls.size() == 3, "  解除暂停后照常开");
     }
 
-    // ── 名额紧张时只留给高分的自动 bot；手动 bot 不受影响 ─────────────────────
+    // 同时持仓上限以内，最后一个名额也能由自动候选正常申请，不设分数门槛。
     {
         auto cli = std::make_shared<FakeClient>();
-        TrendEngine eng(cli, inline_host());
-        eng.set_max_open_positions(3);
-        eng.set_priority_reserve(2, 70);
-        auto m = eng.add_bot(mk_cfg("MANUSDT"));
-        auto x = eng.add_bot(mk_cfg("AUTOUSDT"), true);
-        feed(eng, m, 2.0, 110, 90);
-        feed(eng, x, 2.0, 110, 90);
-        cli->fill_price = 111.0;
-        eng.tick("MANUSDT", 111.0);                // 手动 bot 开，持仓 1/3 ⇒ 进入紧张区
-        check(cli->calls.size() == 1, "手动 bot 不受名额优先规则影响");
-        eng.set_smart_meta(x, 55, 12, 'L');
-        eng.tick("AUTOUSDT", 100.0);               // 上膛
-        eng.tick("AUTOUSDT", 111.0);
-        check(cli->calls.size() == 1, "名额紧张：55 分的自动 bot 不开");
-        check(bot_of(eng, "AUTOUSDT").last_decision.find("名额紧张") != std::string::npos,
-              "  状态写明名额紧张");
-        eng.set_smart_meta(x, 82, 2, 'L');
-        eng.tick("AUTOUSDT", 111.0);
-        check(cli->calls.size() == 2, "  82 分 ⇒ 开");
+        TrendEngine eng(cli, inline_host()); eng.set_max_open_positions(2);
+        const auto m = eng.add_bot(mk_cfg("MANUSDT"));
+        const auto x = eng.add_bot(mk_cfg("AUTOUSDT"), true);
+        const auto y = eng.add_bot(mk_cfg("LATERUSDT"), true);
+        feed(eng, m, 2, 110, 90); feed(eng, x, 2, 110, 90); feed(eng, y, 2, 110, 90);
+        cli->fill_price = 111;
+        eng.tick("MANUSDT", 111);
+        eng.tick("AUTOUSDT", 100); eng.tick("AUTOUSDT", 111);
+        check(cli->calls.size() == 2, "自动候选可使用剩余最后一个持仓名额，无高分预留");
+        eng.tick("LATERUSDT", 100); eng.tick("LATERUSDT", 111);
+        check(cli->calls.size() == 2, "持仓总上限继续阻止新增仓位");
     }
 
     // ── 自动 bot 的过滤与闸门只计数、汇总，不逐条打日志 ───────────────────────
@@ -1174,119 +1185,7 @@ int main() {
         check(eng.get_bots()[0].st.pos == trend::Pos::Short, "重试成功后应已反手");
     }
 
-    // ── reduceOnly 被拒(-2022)：交易所侧已无仓位 → 清本地并停止 ──────────────
-    {
-        auto cli = std::make_shared<FakeClient>();
-        TrendEngine eng(cli, inline_host());
-        auto id = eng.add_bot(mk_cfg());
-        feed(eng, id, 2.0, 110, 90);
-        cli->fill_price = 110.0;
-        eng.tick("TESTUSDT", 110.0);
-
-        cli->fail_next = true;
-        cli->error_next = "order would not reduce position [-2022]";
-        eng.tick("TESTUSDT", 104.0);
-
-        auto b = eng.get_bots()[0];
-        check(b.st.pos == trend::Pos::Flat, "-2022 应清空本地仓位");
-        check(b.qty == 0, "-2022 应清空数量");
-        check(b.state == TrendBot::State::Stopped, "-2022 应停止该bot待人工核对");
-        check(cli->calls.size() == 2, "-2022 之后绝不能反手");
-    }
-
-    // ── -2022 但是【我们自己的硬止损触发了】⇒ 计划内出场，bot 必须继续跑 ─────
-    //
-    // 这是实盘最劝退的一处（2026-10-01）：
-    //   08:50:17 QNTUSDT 开空 @288.69 止损线=292.36
-    //   08:50:17 硬止损已挂 @292.9447          ← 只高出 0.20%
-    //   08:56:07 平仓被拒(-2022) ⇒ 清空本地状态并【停止该bot】
-    // 交易所那张单用【标记价】连续触发，本地止损线是 3 秒采样 —— 价格快速穿过时
-    // 交易所几乎必然抢先。于是一次完全正常的止损出场，变成了要人工点"继续"。
-    {
-        auto cli = std::make_shared<FakeClient>();
-        TrendEngine eng(cli, inline_host());
-        auto cfg = mk_cfg();
-        cfg.use_disaster_stop = true;
-        cfg.rule.reverse = trend::ReverseMode::None;   // 只看出场，不看反手
-        auto id = eng.add_bot(cfg);
-        std::vector<TrendTrade> trades;
-        eng.set_trade_cb([&](const TrendTrade& t) { trades.push_back(t); });
-        feed(eng, id, 2.0, 110, 90);
-        cli->fill_price = 110.0;
-        eng.tick("TESTUSDT", 110.0);                   // 开多，止损线 104
-        check(cli->ds_count("place") == 1, "硬止损已挂（前提成立）");
-
-        // 交易所那张单已经不在活跃委托里 ⇒ 它触发了
-        cli->ds_live_known = true;
-        cli->ds_live       = false;
-        cli->fail_next  = true;
-        cli->error_next = "order would not reduce position [-2022]";
-        eng.tick("TESTUSDT", 104.0);
-
-        auto b = eng.get_bots()[0];
-        check(cli->ds_live_calls >= 1, "必须去核对那张单还在不在");
-        check(b.st.pos == trend::Pos::Flat && b.qty == 0, "仓位状态应清空（它确实没了）");
-        check(b.state == TrendBot::State::Running,
-              "⚠ bot 必须【继续运行】—— 这是计划内的止损出场，和本地止损线触发"
-              "没有任何区别，唯一差别是谁先动手。停掉等于让用户去点「继续」");
-        check(b.trade_count == 1, "  必须记成一笔交易，不能把这次出场漏掉账");
-        // 2026-10-16 实盘：MMTUSDT / RSRUSDT 硬止损先触发，计数记了，trades.csv 里却没有
-        check(trades.size() == 1 && trades[0].reason.find("交易所硬止损") != std::string::npos,
-              "  成交回调也要发出（成交记录 / trades.csv 靠它）");
-        // 触发价 = 104 × (1 − 0.2%) = 103.792；用它当成交价的近似
-        check(b.realized_pnl < 0, "  多头在 103.792 出场是亏的，盈亏要记进去");
-        check(cli->ds_count("cancel") == 0,
-              "  不得去撤那张单 —— 它已经成交了，撤它只会白报一个错");
-    }
-
-    // ── -2022 且那张单【还挂着】⇒ 不是它平的，仍须停下来让人核对 ─────────────
-    {
-        auto cli = std::make_shared<FakeClient>();
-        TrendEngine eng(cli, inline_host());
-        auto cfg = mk_cfg();
-        cfg.use_disaster_stop = true;
-        auto id = eng.add_bot(cfg);
-        feed(eng, id, 2.0, 110, 90);
-        cli->fill_price = 110.0;
-        eng.tick("TESTUSDT", 110.0);
-
-        cli->ds_live_known = true;
-        cli->ds_live       = true;    // 还挂着 ⇒ 平仓的不是它
-        cli->fail_next  = true;
-        cli->error_next = "order would not reduce position [-2022]";
-        eng.tick("TESTUSDT", 104.0);
-
-        auto b = eng.get_bots()[0];
-        check(b.state == TrendBot::State::Stopped,
-              "那张单还在 ⇒ 是人工平的或被强平，必须停下来让人核对");
-        check(b.trade_count == 0, "  成因不明，不该凭空记一笔盈亏");
-    }
-
-    // ── -2022 且【查不到】活跃委托 ⇒ 不敢认，走保守路径 ──────────────────────
-    // 拉取失败时活跃列表是空的，"这张单不在里面"会成立 —— 若不判 ok，
-    // 任何一次 -2022 都会被认成"我们的止损触发了"，真正的强平就被放过去了。
-    // 又是"没拿到当成没有"那个老毛病，这里钉住它
-    {
-        auto cli = std::make_shared<FakeClient>();
-        TrendEngine eng(cli, inline_host());
-        auto cfg = mk_cfg();
-        cfg.use_disaster_stop = true;
-        auto id = eng.add_bot(cfg);
-        feed(eng, id, 2.0, 110, 90);
-        cli->fill_price = 110.0;
-        eng.tick("TESTUSDT", 110.0);
-
-        cli->ds_live_known = false;   // 查不到
-        cli->ds_live       = false;   // 返回值故意是"不在了"，但 ok=false
-        cli->fail_next  = true;
-        cli->error_next = "order would not reduce position [-2022]";
-        eng.tick("TESTUSDT", 104.0);
-
-        auto b = eng.get_bots()[0];
-        check(b.state == TrendBot::State::Stopped,
-              "⚠ 查不到就不许认成「我们的止损触发了」—— 否则强平会被当成计划内出场");
-        check(b.trade_count == 0, "  同样不该记账");
-    }
+    // Rejection/verified-stop regressions are in audit_engine_scenarios.h.
 
     // ── 残量取整后归零：不得无限空转发0数量单 ────────────────────────────────
     {
@@ -1835,7 +1734,9 @@ int main() {
         // 第二轮仍然查不到 ⇒ 确认，这才清
         auto second = reconcile(eng,{});
         check(second.size() == 1, "第二轮应报确认");
-        check(second[0].find("外部已平") != std::string::npos, "  应判为外部已平");
+        check(second[0].find("确认交易所无仓位") != std::string::npos &&
+              second[0].find("盈亏待核对") != std::string::npos,
+              "  明确确认无仓位，并提示未知成交盈亏待核对");
         check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "  这时才清空本地仓位");
         check(eng.get_bots()[0].qty == 0, "  数量应归零");
         check(eng.get_bots()[0].state == TrendBot::State::Stopped,

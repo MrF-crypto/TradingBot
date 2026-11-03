@@ -8,6 +8,7 @@
 // 它要等的是"没有在途任务"，而不是"队列空"——一笔下单的 HTTP 可能已经出队、
 // 正在网络上跑，而队列是空的。这两者的区别正是这套测试的核心。
 #include "core/thread_pool.h"
+#include "core/shutdown.h"
 
 #include <atomic>
 #include <chrono>
@@ -24,6 +25,22 @@ static void check(bool ok, const std::string& what) {
 }
 
 int main() {
+    {
+        ccbot::ThreadPool fetch(1), orders(1);
+        std::promise<void> started, release;
+        auto allowed = release.get_future().share();
+        std::atomic<int> completed{0};
+        fetch.submit([&] { started.set_value(); allowed.wait(); orders.submit([&] { ++completed; }); });
+        started.get_future().wait();
+        check(!ccbot::shutdown_pools(&fetch, &orders, 20),
+              "shutdown cannot succeed while a fetch task still borrows application objects");
+        bool rejected = false;
+        try { fetch.submit([] {}); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "shutdown rejects new producer tasks");
+        release.set_value();
+        check(ccbot::shutdown_pools(&fetch, &orders, 5000) && completed.load() == 1,
+              "drain producers before orders, including orders submitted by an in-flight producer");
+    }
     // ── ① 核心：队列已空但任务还在跑时，wait_idle 必须继续等 ────────────────
     // 如果实现只看 tasks_.empty()，这条会失败——而那正是 UAF 的入口
     {

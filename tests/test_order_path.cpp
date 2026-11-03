@@ -48,7 +48,13 @@ static const char* kExchangeInfo =
     R"({"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001"},)"
     R"({"filterType":"PRICE_FILTER","tickSize":"0.10"}]}]})";
 
+#include "backfill_scenarios.h"
+#include "unicode_symbol_scenarios.h"
+#include "audit_order_scenarios.h"
 int main() {
+    test_audit_order_scenarios();
+    test_backfill_scenarios();
+    test_unicode_symbol_scenarios();
     for (const auto mode : {TradingClient::AccountMode::Futures, TradingClient::AccountMode::PortfolioMargin}) {
         auto cfg = test_cfg(); cfg.account_mode = mode;
         TradingClient tc(cfg);
@@ -807,7 +813,7 @@ int main() {
     //   留着它是纯防御：开仓不幂等，万一将来有别的路径同时置上这两者，
     //   重发会变成双倍仓位。不为一个构造不出的场景写假用例。
 
-    std::printf("── 网络层：失败原因说得出来；杠杆设过一次不再重复设 ──\n");
+    std::printf("── 网络层：每次入场重新确认杠杆，失败原因可见 ──\n");
     {
         TradingClient tc(test_cfg());
         int lev_posts = 0;
@@ -833,14 +839,14 @@ int main() {
               "账户接口拿到网页：错误里写明「返回的不是 JSON」并附开头（实际：" + acc.error + "）");
 
         check(tc.set_leverage("FLOCKUSDT", 2) && lev_posts == 1, "设杠杆成功");
-        check(tc.set_leverage("FLOCKUSDT", 2) && lev_posts == 1, "  同一品种同样的杠杆：不再发请求");
-        check(tc.set_leverage("FLOCKUSDT", 3) && lev_posts == 2, "  换了杠杆：照常发");
+        check(tc.set_leverage("FLOCKUSDT", 2) && lev_posts == 2, "  同一品种仍重新确认，不能信任可能被外部修改的旧缓存");
+        check(!tc.set_leverage("FLOCKUSDT", 3) && lev_posts == 3, "  回执杠杆与目标不符：不得放行");
         mode = "reject";
         const bool rej = !tc.set_leverage("ABCUSDT", 99);
         const std::string why = tc.last_error();
         check(rej && why.find("-4028") != std::string::npos,
               "  交易所拒绝：last_error 带错误码（实际：" + why + "）");
-        check(!tc.set_leverage("ABCUSDT", 99) && lev_posts == 4, "  失败的不缓存，下次照样再试");
+        check(!tc.set_leverage("ABCUSDT", 99) && lev_posts == 5, "  失败后继续等待交易所确认");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

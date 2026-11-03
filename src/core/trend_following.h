@@ -1,5 +1,6 @@
 #pragma once
 #include "core/indicators.h"
+#include <cstdint>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -30,7 +31,7 @@ inline bool valid(const Config& c) {
 }
 
 enum class Regime { Unknown, Range, Up, Down };
-struct Signal {
+struct SignalData {
     Config settings;
     bool ready = false;
     Regime regime = Regime::Unknown;
@@ -39,6 +40,17 @@ struct Signal {
     double atr = 0, upper = 0, lower = 0, box_atr = 0, volume_ratio = 0;
     double er = 0;
     bool er_ok = false;
+    double range_atr = 0; // completed signal candle's range / pre-breakout ATR
+    double close_location = 0; // (completed close - low) / (high - low); data display only
+};
+struct Signal : SignalData {
+    // Independent closed-candle evidence, also available when initial entry is intrabar.
+    SignalData closed_entry;
+};
+struct Observation {
+    int64_t bar_ms = 0; // close time of the observation / open time of the following candle
+    double close = 0;
+    SignalData signal;
 };
 
 inline std::vector<double> ema(const std::vector<indicators::Ohlc>& b, int period) {
@@ -59,10 +71,10 @@ inline std::vector<double> ema(const std::vector<indicators::Ohlc>& b, int perio
 // Input includes the current unclosed candle. It never participates in regime,
 // ATR or confirmed breakout. For close-confirmed entry the channel/ATR exclude
 // BOTH the current candle and the signal candle, freezing pre-breakout risk.
-inline Signal compute(const std::vector<indicators::Ohlc>& bars,
+inline SignalData compute_model(const std::vector<indicators::Ohlc>& bars,
                       const std::vector<double>& volumes, const Config& cfg,
                       int channel_period, int atr_period) {
-    Signal s;
+    SignalData s;
     if (!valid(cfg) || channel_period < 2 || atr_period < 2 || volumes.size() != bars.size() ||
         bars.size() < static_cast<size_t>(std::max({cfg.slow_period * 3 + cfg.slope_bars,
                                                    channel_period + 2, atr_period + 3}))) return s;
@@ -101,13 +113,36 @@ inline Signal compute(const std::vector<indicators::Ohlc>& bars,
     s.er_ok = er.ok; s.er = er.er;
     const auto& b = closed.back();
     const double span = b.high - b.low;
+    s.range_atr = span / s.atr;
     if (span > 0) {
         const double loc = (b.close - b.low) / span;
+        s.close_location = loc;
         s.long_confirmed = b.close > s.upper + cfg.breakout_buffer_atr * s.atr && loc >= cfg.min_close_location;
         s.short_confirmed = b.close < s.lower - cfg.breakout_buffer_atr * s.atr && 1 - loc >= cfg.min_close_location;
     }
     s.settings = cfg;
     s.ready = true;
+    return s;
+}
+
+inline Signal compute(const std::vector<indicators::Ohlc>& bars,
+                      const std::vector<double>& volumes, const Config& cfg,
+                      int channel_period, int atr_period) {
+    Signal s;
+    static_cast<SignalData&>(s) = compute_model(bars, volumes, cfg, channel_period, atr_period);
+    auto confirmed = cfg;
+    confirmed.close_confirm = true;
+    s.closed_entry = cfg.close_confirm ? static_cast<const SignalData&>(s)
+        : compute_model(bars, volumes, confirmed, channel_period, atr_period);
+    return s;
+}
+
+inline Signal closed_signal(const Signal& source) {
+    Signal s;
+    static_cast<SignalData&>(s) = source.settings.close_confirm
+        ? static_cast<const SignalData&>(source) : source.closed_entry;
+    // Invalid network snapshots cannot become valid through the secondary model.
+    s.ready = s.ready && source.ready;
     return s;
 }
 } // namespace ccbot::following

@@ -5,6 +5,7 @@
 #include "core/app_logic.h"
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
+#include "core/shutdown.h"
 #include "core/parallel.h"
 #include "core/smart_mode.h"
 #include "app/smart_runner.h"
@@ -111,7 +112,7 @@ bool acquire_instance_lock(const std::string& lock_path) {
 
 // ccbot_headless --scan [config.json]
 // 智能模式的只读预览：只调公开行情接口（不需要 API Key、不下单、不碰状态文件），
-// 按配置里的 smart_mode 段（没有就用默认值）扫一遍全市场，打印两份名单后退出。
+// 按配置里的 smart_mode 段（没有就用默认值）扫一遍全市场，打印统一候选名单后退出。
 // 启用智能模式之前先看看它会选出哪些币
 static int run_scan_only(const std::string& config_path) {
     smart::Config sc;
@@ -147,27 +148,12 @@ static int run_scan_only(const std::string& config_path) {
         std::cout << "扫描失败：" << scan.error << std::endl;
         return 1;
     }
-    const auto& rk = scan.outcome.ranking;
-    // 混合模式先分段。预览没有历史，全部按新币的进段门槛判
-    std::map<std::string, smart::SegState> no_history;
-    const auto seg = smart::segment(rk, sc, no_history);
-    const auto groups = SmartRunner::build_groups(rk, seg, sc, {});
-    std::cout << "USDT 永续 " << scan.universe << " 个，过门槛 " << scan.passed_gate
-              << "，特征合格 " << scan.eligible << "，方向模式："
-              << (sc.dir_mode == smart::DirMode::Mixed ? "混合" : "突破定方向")
-              << "，最低 " << sc.min_score << " 分，用时 " << secs << " 秒\n";
-    for (const auto& g : groups) {
-        std::cout << "\n── " << g.title << "  " << g.rows.size() << "/" << g.quota << " ──\n"
-                  << "  #  品种              分数  强弱  7天最大单日涨 效率比  ATR%  箱体/ATR  量能\n";
-        for (const auto& r : g.rows) {
-            const auto& f = rk.rows.at(r.symbol).f;
-            char line[256];
-            std::snprintf(line, sizeof(line),
-                          "%3d  %-16s %5.1f %+5.2f %10.0f%% %+6.2f %5.2f %8.1f %5.2fx\n",
-                          r.rank, r.symbol.c_str(), r.score, f.rs, f.max_up24, f.er24,
-                          f.atr_pct, f.box12_atr, f.vol_lift);
-            std::cout << line;
-        }
+    std::cout << "USDT 永续 " << scan.universe << " 个，过硬门槛 " << scan.passed_gate
+              << "，统一候选 " << scan.eligible << "，用时 " << secs << " 秒\n"
+              << "品种              最近1h收盘价     ATR%\n";
+    for (const auto& row : SmartRunner::candidate_rows(scan.outcome.candidates, {})) {
+        std::cout << std::left << std::setw(18) << row.symbol << std::right << std::setw(16)
+                  << row.close << "  " << row.atr_pct << "\n";
     }
     return 0;
 }
@@ -339,7 +325,7 @@ int main(int argc, char** argv) {
                 auto issues = trend_engine->reconcile_positions(ex, gate.age);
                 if (!issues.empty()) {
                     for (const auto& i : issues) log_line("⚠ 对账: " + i, "WARN");
-                    save_trend_state(trend_state_path, trend_engine->get_bots());
+                    save_trend_state(trend_state_path, *trend_engine);
                     if (!cfg.alert_webhook.empty()) {
                         std::string msg = "[ccbot] 启动对账发现 " +
                                           std::to_string(issues.size()) + " 处不一致:";
@@ -415,7 +401,7 @@ int main(int argc, char** argv) {
         const auto& sc = cfg.smart;
         log_line(std::string("智能模式已启用：") + (sc.dir_long ? "做多" : "") +
                  (sc.dir_long && sc.dir_short ? "+" : "") + (sc.dir_short ? "做空" : "") +
-                 "，名单 " + std::to_string(sc.long_n) + "/" + std::to_string(sc.short_n) +
+                 "，统一候选：全部通过硬过滤的品种" +
                  "，同时持仓上限 " + std::to_string(sc.max_positions) +
                  (sc.daily_loss_limit > 0 ? "，当日亏损限额 " + std::to_string((int)sc.daily_loss_limit) + "U" : ""));
     }
@@ -463,6 +449,8 @@ int main(int argc, char** argv) {
     std::atomic<bool> hb_alerted{false};
 
     int tick_n = 0;
+    // Establish storage health before the first signal may open an order.
+    if (trend_engine) save_trend_state(trend_state_path, *trend_engine);
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         ++tick_n;
@@ -654,8 +642,13 @@ int main(int argc, char** argv) {
                         }
                         auto snap = client->fetch_trend_signal(
                             b.cfg.symbol, b.cfg.interval,
-                            b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.cfg.rule.following);
-                        if (!snap.ok) return;
+                            b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.signal_following_config(), b.resume_after_ms());
+                        if (snap.history_target_ms > 0)
+                            trend_engine->update_monitor_history(b.bot_id, snap.history, snap.history_target_ms, b.signal_following_config());
+                        if (snap.history_only) return;
+                        if (!snap.ok) {
+                            trend_engine->mark_signal_failure(b.bot_id, snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error); return;
+                        }
                         // 量比：开了 vol_paced 的用按已走时间折算的那个
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                   snap.dc_ok, snap.dc_up, snap.dc_dn,
@@ -664,7 +657,9 @@ int main(int argc, char** argv) {
                                                                        : snap.vol_ratio,
                                                   snap.er_ok, snap.er, snap.prev_close,
                                                   snap.taker_ratio, snap.range_pace, snap.following);
-                      } catch (...) {}   // 跨线程的异常会直接 terminate
+                      } catch (...) {
+                        trend_engine->mark_signal_failure(need[idx].bot_id, "网络或行情处理失败，保留断点等待重试");
+                      }
                     });
                     trend_sig_busy.store(false);
                 });
@@ -679,7 +674,7 @@ int main(int argc, char** argv) {
         //     这里【不用】脏标记：止损线的棘轮推进不产生日志（不置脏），
         //     而它正是重启后最不能丢的那个值——丢了止损线就是一笔无人看管的裸仓位
         if (trend_engine && tick_n % 20 == 0)
-            save_trend_state(trend_state_path, trend_engine->get_bots());
+            save_trend_state(trend_state_path, *trend_engine);
 
         // ── 5b) 智能模式：每分钟看一次到点没有（整点后 1 分钟扫描），
         //     扫描丢进数据线程池；不扫描时做轻量维护（关闭后清空仓自动 bot、当日盈亏落盘）
@@ -859,7 +854,7 @@ int main(int argc, char** argv) {
                     if (!sissues.empty()) {
                         for (const auto& i : sissues)
                             log_line("⚠ 对账: " + i, "WARN");
-                        save_trend_state(ssp, trend_engine->get_bots());
+                        save_trend_state(ssp, *trend_engine);
                         if (!w.empty()) {
                             std::string msg = "[ccbot] 运行中对账发现 " +
                                               std::to_string(sissues.size()) + " 处不一致:";
@@ -883,7 +878,7 @@ int main(int argc, char** argv) {
                     if (!dissues.empty()) {
                         for (const auto& i : dissues)
                             log_line("⚠ 保护单核对: " + i, "WARN");
-                        save_trend_state(ssp, trend_engine->get_bots());
+                        save_trend_state(ssp, *trend_engine);
                         if (!w.empty()) {
                             std::string msg = "[ccbot] 保护单核对发现 " +
                                               std::to_string(dissues.size()) + " 处异常:";
@@ -906,18 +901,18 @@ int main(int argc, char** argv) {
     // 预算按【单个下单任务的最坏耗时】定，不是按单次 HTTP：一次 place_market
     // 会串起 POST 超时 10s → 空响应 → 查单恢复 3×(600ms+10s) ≈ 42s，
     // 坏网络下很平常。原先取 20 秒远远不够。完整推导见 GUI 侧同一处注释
-    const bool drained = pool->wait_idle(60000);
-    fetch_pool->wait_idle(5000);
+    ticker.stop();
+    const bool drained = shutdown_pools(fetch_pool.get(), pool.get(), 60000);
 
-    if (trend_engine) save_trend_state(trend_state_path, trend_engine->get_bots());
+    if (trend_engine) save_trend_state(trend_state_path, *trend_engine);
     funding.save(funding_path);
-    smart->housekeep(RestPriceFeed::now_ms());   // 候选池与当日盈亏落盘
+    if (drained) smart->housekeep(RestPriceFeed::now_ms());
 
     // 没排空就直接结束进程，不跑析构。在途任务捏着引擎的裸指针，而引擎里 pool_
     // 的声明位置在 mtx_/bots_ 之前 —— 正常析构会先销毁那两个成员，任务一访问
     // 就是 use-after-free。状态此刻已经落盘，剩下唯一该做的就是别再碰内存
     if (!drained) {
-        log_line("仍有下单任务未完成，跳过清理直接结束进程（避免访问已释放内存）；"
+        log_line("仍有数据或订单任务未完成，跳过清理直接结束进程（避免访问已释放内存）；"
                  "在途成交由重启后的对账兜底", "WARN");
         { std::error_code ec; std::filesystem::remove(alive_path, ec); }
         { std::error_code ec; std::filesystem::remove(lock_path,  ec); }

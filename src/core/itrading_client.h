@@ -31,6 +31,14 @@ public:
     // 本线程上一次请求的失败原因（给日志用；空 = 没有或不知道）。默认实现返回空
     virtual std::string last_error() const { return {}; }
 
+    struct CloseVerification {
+        bool position_known = false;
+        double remaining_qty = 0;
+        OrderOutcome protective_fill; // Actual executed order, never the trigger price.
+    };
+    virtual CloseVerification verify_close(const std::string&, const std::string&,
+                                            const std::string&) { return {}; }
+
     // ── 交易所侧硬止损（进程外兜底，"保命单"）────────────────────────────────
     // 本地的移动止损活在进程里，程序崩溃、断电、误关窗口之后仓位就完全裸奔。
     // 这两个方法在交易所挂一张 STOP_MARKET + closePosition 的单子，
@@ -78,24 +86,7 @@ public:
     virtual bool cancel_disaster_stop(const std::string& /*symbol*/,
                                       const std::string& /*order_id*/) { return true; }
 
-    // 那张硬止损单还在交易所的【活跃委托】里吗？
-    //
-    // 用途只有一个：本地 reduceOnly 平仓被 -2022 拒掉时（交易所侧已无该仓位），
-    // 要分清是"我们自己的硬止损先触发了"还是"被人工平了/被强平了"。
-    // 前者是【计划内的止损出场】，bot 应该照常继续等下一个信号；
-    // 后者才需要停下来让人核对。混起来的后果是每一次正常的硬止损出场都要
-    // 人去点一下"继续"。
-    //
-    // ⚠ 必须判 ok，且 ok=false 时【绝不能】把返回值当成"不在了"。
-    //   拉取失败时活跃列表是空的，把空当成"我们的单已触发"会让【任何】一次
-    //   -2022 都被认成计划内出场 —— 真正的强平也就被放过去了。
-    //   这是本项目反复踩过的"没拿到当成没有"，默认实现因此返回 ok=false。
-    virtual bool is_disaster_stop_live(const std::string& /*symbol*/,
-                                      const std::string& /*order_id*/,
-                                      bool* ok) {
-        if (ok) *ok = false;   // 不支持 ⇒ 永远"不知道"，调用方走保守路径
-        return false;
-    }
+
 };
 
 } // namespace ccbot

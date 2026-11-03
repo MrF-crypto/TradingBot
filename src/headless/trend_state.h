@@ -1,5 +1,6 @@
 #pragma once
 #include "core/trend_engine.h"
+#include "core/atomic_file.h"
 #include <string>
 #include <vector>
 
@@ -20,7 +21,10 @@
 namespace ccbot {
 
 // 只存运行时状态，不存策略参数——参数每次都从配置文件重新读
-void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots);
+SaveResult save_trend_state(const std::string& path, const std::vector<TrendBot>& bots);
+// Production callers capture their snapshot inside the serialized writer, so an older
+// snapshot cannot overtake a newer one. Reports errors to the engine's entry gate.
+SaveResult save_trend_state(const std::string& path, TrendEngine& engine);
 
 // 按 symbol 匹配配置里的 bot，把落盘的运行时状态拼回一个新的 TrendBot
 // （cfg 用传入的最新配置，其余用落盘值），交给 TrendEngine::restore_bot() 用。

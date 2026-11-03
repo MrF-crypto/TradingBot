@@ -1,4 +1,4 @@
-// 智能模式纯逻辑测试：门槛、特征、打分排名、候选池增删、配置往返。不连网络。
+// 智能模式纯逻辑测试：门槛、ATR、统一候选池增删、配置往返。不连网络。
 #include "core/smart_mode.h"
 
 #include <algorithm>
@@ -102,33 +102,11 @@ static std::vector<Bar> bars_from(const std::vector<double>& closes, double vol 
 }
 
 static void test_features() {
-    check(!compute_features(bars_from(std::vector<double>(100, 100)), {}).ok, "特征：K线不足 170 根");
-
-    // 前面来回震荡，最后 12 根窄幅，最后 6 根放量
-    std::vector<double> cl;
-    for (int i = 0; i < 200; ++i) cl.push_back(100 + ((i % 2) ? 3.0 : -3.0));
-    for (int i = 0; i < 12; ++i) cl.push_back(100 + ((i % 2) ? 0.2 : -0.2));
-    auto b = bars_from(cl);
-    for (size_t i = b.size() - 6; i < b.size(); ++i) b[i].volume = 400;
-    const auto f = compute_features(b, {});
-    check(f.ok, "特征：数据足够时可算");
-    check(f.box12_atr < f.box48_atr, "  最近 12 根比 48 根窄");
-    check(f.atr_ratio > 0, "  波动率压缩比可算");
-    check(f.vol_lift > 3.5, "  最近 6 根放量约 4 倍（相对 168 根均量）");
-    check(f.pos12 >= 0 && f.pos12 <= 1, "  箱体内位置在 0~1");
-    check(std::isnan(f.taker1) && std::isnan(f.taker6), "  没有主动买入数据：主动买入占比是 NaN（不是 0）");
-    {
-        auto bt = b;
-        for (auto& x : bt) { x.quote_vol = 1000; x.taker_quote = 500; }
-        bt.back().taker_quote = 800;
-        const auto ft = compute_features(bt, {});
-        check(near(ft.taker1, 0.8) && near(ft.taker6, (500.0 * 5 + 800) / 6000.0),
-              "  主动买入占比：最后 1 根 0.8、最后 6 根按成交额加总");
-        bt[bt.size() - 3].taker_quote = 0;
-        const auto fm = compute_features(bt, {});
-        check(near(fm.taker1, 0.8) && std::isnan(fm.taker6), "  6 根里缺一根：6h 那个算拿不到");
-    }
-
+    check(!compute_features(bars_from(std::vector<double>(14, 100))).ok, "ATR14 至少需要 15 根已收盘K线");
+    const auto f = compute_features(bars_from(std::vector<double>(200, 100)));
+    check(f.ok && near(f.close, 100) && near(f.atr_pct, 1), "固定高低范围得到已知 ATR%，无需 BTC 数据");
+    auto invalid = bars_from(std::vector<double>(200, 100)); invalid.back().close = 0;
+    check(!compute_features(invalid).ok, "价格无效时不能成为候选");
     // ── 持仓量变化 ──
     {
         const int64_t h = 3600000LL, t = 100 * h;
@@ -145,384 +123,97 @@ static void test_features() {
         check(!oi_stat({}).ok, "  一个点都没有：不 ok");
     }
 
-    // 一路上涨 vs BTC 不动：相对强弱为正、效率比为正
-    std::vector<double> up, flat;
-    for (int i = 0; i < 200; ++i) { up.push_back(100 + i * 0.5 + ((i % 3) ? 0.3 : -0.3)); flat.push_back(100); }
-    const auto fu = compute_features(bars_from(up), bars_from(flat));
-    check(fu.ok && fu.rs > 0 && fu.er24 > 0.5, "特征：稳步上涨 ⇒ 相对强弱为正、效率比高");
-    std::vector<double> dn;
-    for (int i = 0; i < 200; ++i) dn.push_back(300 - i * 0.5 + ((i % 3) ? 0.3 : -0.3));
-    const auto fd = compute_features(bars_from(dn), bars_from(flat));
-    check(fd.ok && fd.rs < 0 && fd.er24 < -0.5, "特征：稳步下跌 ⇒ 相对强弱为负、效率比为负");
-}
-
-static Features feat(double rs, double er, double b12, double ar, double b48, double vl, double pos) {
-    Features f;
-    f.ok = true; f.atr_pct = 2;
-    f.rs = rs; f.er24 = er; f.box12_atr = b12; f.atr_ratio = ar; f.box48_atr = b48;
-    f.vol_lift = vl; f.pos12 = pos;
-    f.kappa12 = b12 / std::sqrt(12.0);   // κ ≈ 箱体/ATR ÷ √12（价格与下沿的差别忽略）
-    return f;
-}
-
-static void test_rank() {
-    Config c;
-    c.min_score = 0;
-    std::map<std::string, Features> e;
-    e["STRONGUSDT"] = feat( 2.0,  0.8, 3, 0.8, 8, 2.0, 0.9);   // 强势、靠上沿、放量
-    e["WEAKUSDT"]   = feat(-2.0, -0.8, 3, 0.8, 8, 2.0, 0.1);   // 弱势、靠下沿、放量
-    e["MEHUSDT"]    = feat( 0.0,  0.0, 6, 1.2, 15, 0.8, 0.5);  // 平庸、箱体宽、缩量
-    auto r = rank(e, c);
-    check(r.longs.size() == 3 && r.longs.front() == "STRONGUSDT", "排名：做多名单第一是强势币");
-    check(r.shorts.front() == "WEAKUSDT", "排名：做空名单第一是弱势币");
-    check(r.rank_long("MEHUSDT") == 3 && r.rank_short("MEHUSDT") == 3, "排名：平庸币两边都垫底");
-    check(r.rank_long("NOPEUSDT") == 0, "排名：不在名单返回 0");
-    // 12 根箱体按 κ 区间打分：STRONG / WEAK 箱体 3 ATR ⇒ κ≈0.87（0.8~1.2）满分 100；
-    // MEH 箱体 6 ATR ⇒ κ≈1.73（已扩张）0 分。
-    // 压缩/横盘/量能三项 STRONG 与 WEAK 并列第一，并列取平均名次 ⇒ 75；
-    // 强弱、效率比、位置三项独占第一 ⇒ 100。
-    // 合计 (30+15+10)×100 + 10×100 + (10+10+15)×75 = 9125
-    check(near(r.rows["STRONGUSDT"].long_score, 91.25), "  手算核对：强势币做多 91.25 分");
-    // MEH：强弱/效率比/位置居中 50，κ 0 分，其余三项垫底 0 ⇒ (30+15+10)×50 = 2750
-    check(near(r.rows["MEHUSDT"].long_score, 27.5), "  手算核对：平庸币 27.5 分");
-    check(near(r.rows["WEAKUSDT"].short_score, 91.25), "  做空对称：弱势币做空 91.25 分");
-
-    // 箱体极窄（κ < 0.5，假突破重灾区）不再因为"越窄越好"排到前面
-    std::map<std::string, Features> k;
-    k["TIGHTUSDT"] = feat(0, 0, 1.2, 1, 10, 1, 0.5);   // κ≈0.35
-    k["GOODUSDT"]  = feat(0, 0, 3.5, 1, 10, 1, 0.5);   // κ≈1.01
-    const auto rk = rank(k, c);
-    check(rk.rows.at("GOODUSDT").long_score - rk.rows.at("TIGHTUSDT").long_score > 9.9,
-          "  κ 按区间打分：κ≈1.0 比 κ≈0.35（箱体极窄）高 10 分");
-
-    Config c2; c2.min_score = 50;
-    auto r2 = rank(e, c2);
-    check(r2.longs.size() == 1 && r2.shorts.size() == 1, "最低分 50：平庸币进不了任何名单");
-
-    std::map<std::string, Features> one;
-    one["ONLYUSDT"] = feat(0, 0, 4, 1, 10, 1, 0.5);
-    check(near(rank(one, c).rows["ONLYUSDT"].long_score, 100.0), "只有一个合格币：百分位 100");
-    std::map<std::string, Features> tie;
-    tie["AUSDT"] = feat(1, 0, 4, 1, 10, 1, 0.5);
-    tie["BUSDT"] = feat(1, 0, 4, 1, 10, 1, 0.5);
-    auto rt = rank(tie, c);
-    check(near(rt.rows["AUSDT"].long_score, rt.rows["BUSDT"].long_score) && rt.longs.front() == "AUSDT",
-          "并列：分数相同、按名字排，结果确定");
-}
-
-// 造一个名单：前 n 个做多、后 m 个做空
-static ScanOutcome scan_with(const std::vector<std::string>& longs,
-                             const std::vector<std::string>& shorts) {
-    ScanOutcome s;
-    s.ok = true;
-    s.ranking.longs = longs;
-    s.ranking.shorts = shorts;
-    double sc = 99;
-    for (const auto& x : longs)  { s.ranking.rows[x].symbol = x; s.ranking.rows[x].long_score = sc; sc -= 1; }
-    sc = 98.5;
-    for (const auto& x : shorts) { s.ranking.rows[x].symbol = x; s.ranking.rows[x].short_score = sc; sc -= 1; }
-    return s;
-}
-static BotView bot(const std::string& id, const std::string& sym, bool is_auto, bool pos = false,
-                   bool stopped = false) {
-    return BotView{id, sym, is_auto, pos, stopped};
-}
-static bool removed(const Plan& p, const std::string& sym) {
-    for (const auto& r : p.remove) if (r.symbol == sym) return true;
-    return false;
-}
-static bool added(const Plan& p, const std::string& sym) {
-    for (const auto& a : p.add) if (a.symbol == sym) return true;
-    return false;
 }
 
 static void test_pool() {
     Config c;
-    c.dir_mode = DirMode::Breakout;   // 这一组测的是突破模式的两份名单；混合模式见 test_mixed
-    c.long_n = 2; c.short_n = 1;
-
-    {
-        Pool pool;
-        auto s = scan_with({"L1USDT", "L2USDT", "L3USDT"}, {"S1USDT"});
-        auto p = pool.plan(s, {bot("m1", "L2USDT", false)}, c, kNow);
-        check(added(p, "L1USDT") && added(p, "S1USDT"), "补位：两份名单的前 N 名");
-        check(!added(p, "L2USDT"), "  手动 bot 占着的品种不加");
-        check(!added(p, "L3USDT"), "  第 3 名不在前 2，不加");
-        check(p.add.size() == 2, "  容量 3 里手动 bot 不占名额，但 L2 被跳过后只剩 2 个可加");
-    }
-    {
-        Pool pool;
-        ScanOutcome bad = scan_with({"L1USDT"}, {});
-        bad.ok = false;
-        auto p = pool.plan(bad, {bot("a1", "XUSDT", true)}, c, kNow);
-        check(p.add.empty() && p.remove.empty(), "整轮扫描失败：一个都不动");
-    }
-    {
-        // 持仓中的绝不移除；下架告警
-        Pool pool;
-        auto s = scan_with({"L1USDT"}, {});
-        s.hard_fail["HOLDUSDT"] = "即将下架";
-        s.delisting.insert("HOLDUSDT");
-        auto p = pool.plan(s, {bot("a1", "HOLDUSDT", true, /*pos*/ true)}, c, kNow);
-        check(!removed(p, "HOLDUSDT"), "持仓中：不合格也不移除，等这笔走完");
-        bool meta_rank0 = false;
-        for (const auto& m : p.meta) if (m.bot_id == "a1") meta_rank0 = (m.rank == 0);
-        check(meta_rank0, "  名次清零（界面标「待移出」）");
-        check(p.alerts.size() == 1 && has(p.alerts[0], "下架"), "  持仓中即将下架：醒目告警");
-    }
-    {
-        // 硬门槛不合格：空仓立即移除，不看保护期
-        Pool pool;
-        pool.on_added("BADUSDT", kNow);
-        auto s = scan_with({"L1USDT"}, {});
-        s.hard_fail["BADUSDT"] = "24h 成交额不足";
-        auto p = pool.plan(s, {bot("a1", "BADUSDT", true)}, c, kNow + 3600000);
-        check(removed(p, "BADUSDT"), "硬门槛不合格：空仓立即移除（无视 24 小时保护期）");
-    }
-    {
-        // 没拿到数据：什么都不做
-        Pool pool;
-        pool.on_added("UNKUSDT", kNow - 10 * kDay);
-        auto s = scan_with({"L1USDT"}, {});
-        s.unknown.insert("UNKUSDT");
-        for (int i = 0; i < 5; ++i) {
-            auto p = pool.plan(s, {bot("a1", "UNKUSDT", true)}, c, kNow);
-            check(!removed(p, "UNKUSDT"), "这一轮没拿到数据：不移除（没拿到 ≠ 不合格）#" + std::to_string(i));
-        }
-        check(pool.entries().at("UNKUSDT").miss_scans == 0, "  也不累计掉出次数");
-    }
-    {
-        // 掉出名单：连续 2 轮且满 24 小时
-        Pool pool;
-        pool.on_added("OUTUSDT", kNow);
-        auto s = scan_with({"L1USDT", "L2USDT"}, {"S1USDT"});
-        auto p1 = pool.plan(s, {bot("a1", "OUTUSDT", true)}, c, kNow + 25 * 3600000LL);
-        check(!removed(p1, "OUTUSDT"), "掉出第 1 轮：不移除");
-        auto p2 = pool.plan(s, {bot("a1", "OUTUSDT", true)}, c, kNow + 26 * 3600000LL);
-        check(removed(p2, "OUTUSDT"), "掉出第 2 轮且满 24 小时：移除");
-
-        Pool young;
-        young.on_added("NEWUSDT", kNow);
-        young.plan(s, {bot("a1", "NEWUSDT", true)}, c, kNow + 3600000);
-        auto p3 = young.plan(s, {bot("a1", "NEWUSDT", true)}, c, kNow + 2 * 3600000);
-        check(!removed(p3, "NEWUSDT"), "加入不满 24 小时：掉出 2 轮也不移除");
-
-        Pool back;
-        back.on_added("BACKUSDT", kNow);
-        back.plan(s, {bot("a1", "BACKUSDT", true)}, c, kNow + 25 * 3600000LL);
-        auto sb = scan_with({"L1USDT", "BACKUSDT"}, {});
-        back.plan(sb, {bot("a1", "BACKUSDT", true)}, c, kNow + 26 * 3600000LL);
-        check(back.entries().at("BACKUSDT").miss_scans == 0, "回到名单：掉出计数清零（必须连续）");
-    }
-    {
-        // 1.5N 的缓冲区：第 3 名（N=2，1.5N=3）不算掉出
-        Pool pool;
-        pool.on_added("L3USDT", kNow);
-        auto s = scan_with({"L1USDT", "L2USDT", "L3USDT", "L4USDT"}, {});
-        pool.plan(s, {bot("a1", "L3USDT", true)}, c, kNow + 30 * 3600000LL);
-        auto p = pool.plan(s, {bot("a1", "L3USDT", true)}, c, kNow + 31 * 3600000LL);
-        check(!removed(p, "L3USDT"), "排名在 N 和 1.5N 之间：保留（不对称门槛）");
-        bool tagged = false;
-        for (const auto& m : p.meta) if (m.bot_id == "a1") tagged = (m.list == 'L' && m.rank == 3);
-        check(tagged, "  名单信息：做多第 3");
-    }
-    {
-        // 批量淘汰保护：过半同时出局 ⇒ 疑似数据异常，这一轮一个都不删
-        Pool pool;
-        std::vector<BotView> bots;
-        auto s = scan_with({"L1USDT"}, {});
-        for (int i = 0; i < 6; ++i) {
-            const std::string sym = "M" + std::to_string(i) + "USDT";
-            pool.on_added(sym, kNow - 10 * kDay);
-            bots.push_back(bot("a" + std::to_string(i), sym, true));
-            if (i < 5) s.hard_fail[sym] = "状态 ";   // 6 个里 5 个被判不合格
-        }
-        auto p = pool.plan(s, bots, c, kNow);
-        check(p.remove.empty(), "6 个里 5 个同时被判出局：疑似数据异常，一个都不删");
-        bool warned = false;
-        for (const auto& a : p.alerts) if (has(a, "疑似数据异常")) warned = true;
-        check(warned, "  告警说明原因");
-
-        Pool pool2;
-        std::vector<BotView> bots2;
-        auto s2 = scan_with({"L1USDT"}, {});
-        for (int i = 0; i < 6; ++i) {
-            const std::string sym = "N" + std::to_string(i) + "USDT";
-            pool2.on_added(sym, kNow - 10 * kDay);
-            bots2.push_back(bot("b" + std::to_string(i), sym, true));
-        }
-        s2.hard_fail["N0USDT"] = "24h 成交额不足";
-        s2.ranking.longs = {"N1USDT", "N2USDT", "N3USDT", "N4USDT", "N5USDT"};
-        for (const auto& x : s2.ranking.longs) s2.ranking.rows[x].long_score = 80;
-        Config c6 = c; c6.long_n = 6;
-        auto p2 = pool2.plan(s2, bots2, c6, kNow);
-        check(p2.remove.size() == 1 && removed(p2, "N0USDT"), "只有个别出局：照常移除");
-    }
-    {
-        // 已停止的自动 bot：不替用户删
-        Pool pool;
-        pool.on_added("STOPUSDT", kNow - 10 * kDay);
-        auto s = scan_with({"L1USDT"}, {});
-        s.hard_fail["STOPUSDT"] = "成交额不足";
-        auto p = pool.plan(s, {bot("a1", "STOPUSDT", true, false, /*stopped*/ true)}, c, kNow);
-        check(!removed(p, "STOPUSDT"), "已停止的自动 bot（你或对账停的）：不自动删");
-    }
-    {
-        // 容量满了不再加；只勾做多时不加做空名单
-        Config cl = c; cl.dir_short = false;
-        Pool pool;
-        auto s = scan_with({"L1USDT", "L2USDT"}, {"S1USDT"});
-        auto p = pool.plan(s, {bot("a1", "L1USDT", true), bot("a2", "L2USDT", true)}, cl, kNow);
-        check(p.add.empty(), "只勾做多：容量 2 已满、做空名单不看");
-        check(bot_direction(cl) == trend::Direction::LongOnly, "只勾做多：bot 方向仅多");
-        Config cb = c;
-        check(bot_direction(cb) == trend::Direction::Both, "两个都勾：bot 方向多空");
-    }
-    {
-        Pool pool;
-        pool.on_added("AUSDT", 123);
-        pool.on_added("BUSDT", 456);
-        Pool p2;
-        check(p2.from_json(pool.to_json()) && p2.entries().size() == 2 &&
-              p2.entries().at("BUSDT").added_ms == 456, "候选池 JSON 往返");
-        check(!p2.from_json("{坏的"), "  坏 JSON 返回 false");
-    }
-}
-
-// ── 混合模式：分段、覆盖规则、缓冲区、名额、方向 ─────────────────────────
-static Scored sc(double rs_pct, double rs, double er = 0, double up = 0, double dn = 0) {
-    Scored s;
-    s.rs_pct = rs_pct;
-    s.long_score = s.short_score = s.squeeze_score = 80;
-    s.f.ok = true;
-    s.f.rs = rs; s.f.er24 = er; s.f.max_up24 = up; s.f.max_dn24 = dn;
-    return s;
-}
-
-static void test_mixed() {
-    Config c;   // 默认就是混合模式
-    check(c.dir_mode == DirMode::Mixed && c.strong_n == 20 && c.weak_n == 20 &&
-          c.mid_n == 50 && c.hot_n == 10, "默认：混合模式，名额 20/20/50/10");
-
-    // ── 分段 ──
-    SegState st;
-    check(classify(sc(85, 1.2), c, st) == kSegStrong, "排名前 30% 且跑赢 BTC ⇒ 强势");
-    st = {};
-    check(classify(sc(85, -0.1), c, st) == kSegMid, "排名靠前但跑输 BTC（全市场都弱）⇒ 不算强势");
-    st = {};
-    check(classify(sc(10, -1.0), c, st) == kSegWeak, "排名后 30% 且跑输 BTC ⇒ 弱势");
-    st = {};
-    check(classify(sc(50, 0.1), c, st) == kSegMid, "中间 ⇒ 中间段");
-    st = {};
-    check(classify(sc(95, 3.0, 0.5, 90), c, st) == kSegHot, "7 天内单日涨 90% ⇒ 过热（不管排名多高）");
-    st = {};
-    check(classify(sc(5, -3.0, -0.5, 0, 60), c, st) == kSegMid, "7 天内单日跌 60% ⇒ 中间段，不进弱势");
-    st = {};
-    check(classify(sc(85, 1.2, -0.5), c, st) == kSegMid, "强势但 24 根效率比 −0.5（掉头）⇒ 降为中间段");
-    check(st.base == kSegStrong, "  掉头只改这一轮的方向，底段仍是强势（缓冲区照常）");
-    st = {};
-    check(classify(sc(10, -1.0, 0.5), c, st) == kSegMid, "弱势但在反弹 ⇒ 降为中间段");
-
-    // ── 缓冲区：进 30%、出 40%、连续 2 轮 ──
-    st = {};
-    classify(sc(80, 1.0), c, st);
-    check(classify(sc(65, 0.8), c, st) == kSegStrong, "已在强势、掉到 65%（仍在前 40%）⇒ 留在强势");
-    check(classify(sc(55, 0.5), c, st) == kSegStrong, "掉出前 40% 第 1 轮 ⇒ 还留着");
-    check(classify(sc(55, 0.5), c, st) == kSegMid, "连续第 2 轮 ⇒ 离开强势");
-    st = {};
-    check(classify(sc(65, 0.8), c, st) == kSegMid, "新币在 65%：没进前 30%，不进强势（进出门槛不对称）");
-    st = {};
-    classify(sc(80, 1.0), c, st);
-    classify(sc(55, 0.5), c, st);                     // 出段第 1 轮
-    classify(sc(70, 0.9), c, st);                     // 回来了，计数清零
-    check(classify(sc(55, 0.5), c, st) == kSegStrong, "出段要【连续】2 轮，中间回来过就重新数");
-    st = {};
-    classify(sc(80, 1.0), c, st);
-    check(classify(sc(80, -0.2), c, st) == kSegStrong, "强势币跑输 BTC 第 1 轮 ⇒ 还留着");
-    check(classify(sc(80, -0.2), c, st) == kSegMid, "  第 2 轮 ⇒ 离开");
-
-    // ── 方向与勾选 ──
-    bool ok = false;
-    check(seg_direction(kSegStrong, c, &ok) == trend::Direction::Both && ok, "强势候选允许多空，方向由趋势判定");
-    check(seg_direction(kSegWeak, c, &ok) == trend::Direction::Both && ok, "弱势候选允许多空，方向由趋势判定");
-    check(seg_direction(kSegHot, c, &ok) == trend::Direction::Both && ok, "历史过热不限制做多");
-    check(seg_direction(kSegMid, c, &ok) == trend::Direction::Both && ok, "中间 ⇒ 多空，谁突破做谁");
-    Config cl = c; cl.dir_short = false;
-    seg_direction(kSegWeak, cl, &ok);
-    check(ok && seg_quota(kSegWeak, cl) == cl.weak_n && seg_quota(kSegHot, cl) == cl.hot_n,
-          "只勾做多：各段都可入候选，仅允许上涨趋势做多");
-    check(seg_direction(kSegMid, cl, &ok) == trend::Direction::LongOnly && ok, "只勾做多：中间段只做多");
-
-    // ── 名单：每段按名额补、方向跟段 ──
-    Ranking r;
-    auto put = [&](const std::string& s, Scored x) { x.symbol = s; r.rows[s] = x; };
-    put("STRONGUSDT", sc(90, 1.5));
-    put("WEAKUSDT",   sc(5, -1.5));
-    put("MIDUSDT",    sc(50, 0.0));
-    put("HOTUSDT",    sc(99, 4.0, 0, 120));
-    Config c1 = c; c1.strong_n = c1.weak_n = c1.mid_n = c1.hot_n = 1;
     Pool pool;
-    ScanOutcome s; s.ok = true; s.ranking = r;
-    auto p = pool.plan(s, {}, c1, kNow);
-    auto dir_of = [&](const std::string& sym) {
-        for (const auto& a : p.add) if (a.symbol == sym) return std::make_pair(a.list, a.dir);
-        return std::make_pair(char(0), trend::Direction::Both);
-    };
-    check(p.add.size() == 4, "四段各补 1 个");
-    check(dir_of("STRONGUSDT") == std::make_pair(kSegStrong, trend::Direction::Both), "  强势候选：多空许可");
-    check(dir_of("WEAKUSDT") == std::make_pair(kSegWeak, trend::Direction::Both), "  弱势候选：多空许可");
-    check(dir_of("MIDUSDT") == std::make_pair(kSegMid, trend::Direction::Both), "  中间币：多空");
-    check(dir_of("HOTUSDT") == std::make_pair(kSegHot, trend::Direction::Both), "  异动候选：多空许可");
+    ScanOutcome scan; scan.ok = true;
+    // 超过旧榜单容量，所有合格币仍应进入同一观察池。
+    for (int i = 0; i < 250; ++i) scan.candidates["COIN" + std::to_string(i) + "USDT"] = {true, "", 2, 100};
+    auto p = pool.plan(scan, {}, c, kNow);
+    check(p.add.size() == 250, "250 个合格币全部进入候选，容量不由旧多空榜单限制");
+    check(std::all_of(p.add.begin(), p.add.end(), [](const auto& a) { return a.dir == trend::Direction::Both; }),
+          "全部候选允许多空，由突破信号决定实际方向");
+    c.dir_long = false;
+    p = pool.plan(scan, {}, c, kNow);
+    check(p.add.size() == 250 && p.add[0].dir == trend::Direction::ShortOnly, "方向权限不改变候选品种范围");
+    c.dir_short = false;
+    check(pool.plan(scan, {}, c, kNow).add.empty(), "方向均禁用时不创建新候选");
+    c.dir_long = c.dir_short = true;
 
-    // 池里的币换了段：给出新方向（空仓时由执行层切换）
-    for (const auto& a : p.add) pool.on_added(a.symbol, kNow - 10 * kDay, a.list);
-    Ranking r2 = r;
-    r2.rows["STRONGUSDT"].f.er24 = -0.6;   // 强势币开始掉头
-    ScanOutcome s2; s2.ok = true; s2.ranking = r2;
-    auto p2 = pool.plan(s2, {bot("a1", "STRONGUSDT", true)}, c1, kNow);
-    bool switched = false;
-    for (const auto& m : p2.meta)
-        if (m.bot_id == "a1") switched = m.has_dir && m.dir == trend::Direction::Both && m.list == kSegMid;
-    check(switched, "强势币掉头：本轮分到中间段，方向改为多空");
+    std::vector<BotView> bots{{"manual", "COIN0USDT", false}, {"held", "HELDUSDT", true, true},
+                              {"pending", "PENDINGUSDT", true, true}, {"stopped", "STOPUSDT", true, false, true},
+                              {"unknown", "UNKNOWNUSDT", true}, {"flat", "FLATUSDT", true}};
+    scan.hard_fail = {{"HELDUSDT", "流动性不足"}, {"PENDINGUSDT", "不合格"}, {"STOPUSDT", "不合格"}, {"FLATUSDT", "不合格"}};
+    scan.unknown.insert("UNKNOWNUSDT"); scan.delisting.insert("HELDUSDT");
+    p = pool.plan(scan, bots, c, kNow);
+    check(p.add.size() == 249, "已有手动 bot 的品种不重复添加");
+    check(p.remove.size() == 1 && p.remove[0].bot_id == "flat", "只移除明确不合格且空仓运行中的自动 bot");
+    check(p.alerts.size() == 1, "即将下架的持仓保留并告警");
+    check(std::none_of(p.meta.begin(), p.meta.end(), [](const auto& m) { return m.bot_id == "unknown"; }),
+          "数据未知不改变候选状态");
+    check(std::all_of(p.meta.begin(), p.meta.end(), [](const auto& m) { return !m.eligible; }),
+          "被保护的不合格 bot 标记为禁止新增风险");
+    auto bad_scan = scan; bad_scan.ok = false;
+    const auto no_op = pool.plan(bad_scan, bots, c, kNow);
+    check(no_op.add.empty() && no_op.remove.empty() && no_op.meta.empty(), "整轮失败不增删也不改变状态");
+    scan.hard_fail.clear(); scan.candidates["HELDUSDT"] = {true, "", 2, 100};
+    p = pool.plan(scan, bots, c, kNow + kDay);
+    check(std::any_of(p.meta.begin(), p.meta.end(), [](const auto& m) { return m.bot_id == "held" && m.eligible; }),
+          "重新合格的持仓可以恢复候选资格");
 
-    // 分段状态跨重启
-    Pool p3;
-    check(p3.from_json(pool.to_json()) && p3.entries().at("STRONGUSDT").seg.base == kSegStrong,
-          "分段状态（底段）随候选池落盘");
+    ScanOutcome mass; mass.ok = true;
+    std::vector<BotView> many;
+    for (int i = 0; i < 6; ++i) {
+        const auto sym = "B" + std::to_string(i);
+        mass.hard_fail[sym] = "不合格"; many.push_back({sym, sym, true});
+    }
+    p = pool.plan(mass, many, c, kNow);
+    check(p.remove.empty() && !p.alerts.empty() && p.meta.size() == 6,
+          "批量不合格保留供复核，同时禁止这些候选开新仓");
+
+    Pool old;
+    check(old.from_json(R"({"v":1,"entries":[{"s":"OLDUSDT","a":123,"m":99,"g":85,"o":3}]})"), "旧候选池状态可迁移");
+    check(old.entries().at("OLDUSDT").added_ms == 123 && !has(old.to_json(), "\"g\"") && !has(old.to_json(), "\"m\""),
+          "迁移保留加入时间，丢弃旧分组与掉榜计数");
+    old.on_added("NEWUSDT", kNow); old.on_removed("OLDUSDT");
+    Pool restored;
+    check(restored.from_json(old.to_json()) && restored.entries().size() == 1 && restored.entries().count("NEWUSDT"),
+          "统一候选池状态可以往返保存");
 }
 
 static void test_config_json() {
     Config c;
     c.enabled = true;
+    c.rotate_when_full = true;
     c.dir_short = false;
     c.min_quote_vol = 8e6;
     c.blacklist = {"XUSDT", "YUSDT"};
-    c.long_n = 40;
     c.daily_loss_limit = 123.5;
     c.tmpl.rule.atr_mult = 2.5;
     c.tmpl.size_mode = TrendConfig::SizeMode::RiskBased;
     c.tmpl.risk_usdt = 7;
-    c.dir_mode = DirMode::Breakout;
-    c.mid_n = 33;
-    c.hot_pct = 70;
     c.tmpl.rule.following.short_vol_ratio = 0.8;
     Config d;
     std::string err;
     check(config_from_json(config_to_json(c), d, &err), "配置 JSON 往返：能读回");
+    check(d.rotate_when_full, "满仓换仓开关往返保留");
+    check(!Config{}.rotate_when_full, "旧配置默认不启用满仓换仓");
+    const auto before_rotation = config_to_json(d);
+    for (const auto bad : {R"({"rotate_when_full":1})", R"({"rotate_when_full":"true"})", R"({"rotate_when_full":null})"})
+        check(!config_from_json(bad, d, &err) && config_to_json(d) == before_rotation,
+              "换仓开关类型错误拒绝，原配置不变");
     check(d.enabled && !d.dir_short && near(d.min_quote_vol, 8e6) && d.blacklist.size() == 2 &&
-          d.long_n == 40 && near(d.daily_loss_limit, 123.5), "  各项一致");
+          near(d.daily_loss_limit, 123.5), "  各项一致");
     check(near(d.tmpl.rule.atr_mult, 2.5) && d.tmpl.size_mode == TrendConfig::SizeMode::RiskBased &&
           near(d.tmpl.risk_usdt, 7), "  模板一致");
-    check(d.dir_mode == DirMode::Breakout && d.mid_n == 33 && near(d.hot_pct, 70) &&
-          near(d.tmpl.rule.following.short_vol_ratio, 0.8), "  混合模式相关设置一致");
-    Config g;
-    check(!config_from_json("{\"dir_mode\":\"sideways\"}", g, &err), "方向模式拼错：拒绝");
-    check(!config_from_json("{\"seg_enter_pct\":45,\"seg_exit_pct\":40}", g, &err),
-          "进段门槛大于出段门槛：拒绝（缓冲区反了）");
-
-    Config e;
-    check(config_from_json("{\"long_n\":10}", e, &err) && e.long_n == 10 && e.short_n == 50,
-          "缺的键保持默认值");
+    check(near(d.tmpl.rule.following.short_vol_ratio, 0.8), "空头量比配置保留");
+    Config legacy;
+    std::string previous = config_to_json(legacy);
+    check(config_from_json(R"({"dir_mode":"mixed","long_n":1,"short_n":1,"strong_n":0,"mid_n":0,"min_score":100,"prio_reserve":999,"prio_min_score":100,"drop_rank_factor":9})", legacy, &err) &&
+          config_to_json(legacy) == previous, "旧评分和分榜字段不再改变配置或隐藏限制候选");
+    check(!has(previous, "min_score") && !has(previous, "dir_mode") && !has(previous, "long_n"), "新配置不写出已移除字段");
     Config f;
     check(!config_from_json("{\"atr_pct_min\":5,\"atr_pct_max\":2}", f, &err) && has(err, "ATR%"),
           "非法值整份拒绝");
@@ -654,8 +345,6 @@ static void test_single_strategy_config() {
     }
     check(!config_from_json("{\"enabled\":true,\"dir_long\":false,\"dir_short\":false}", c, &err),
           "启用趋势跟踪必须允许至少一个方向");
-    check(near(kappa_score(1), 1) && near(kappa_score(0.5), 0) && near(kappa_score(1.5), 0),
-          "保留趋势评分共用的 κ 区间逻辑");
     check(excluded_asset_base("PAXG") && excluded_asset_base("XAUT") &&
           !excluded_asset_base("SOL"), "保留趋势选币共用的黄金代币排除");
 }
@@ -664,9 +353,7 @@ int main() {
     test_single_strategy_config();
     test_gates();
     test_features();
-    test_rank();
     test_pool();
-    test_mixed();
     test_config_json();
     if (g_fail == 0) {
         std::printf("OK: 智能模式测试全部通过\n");

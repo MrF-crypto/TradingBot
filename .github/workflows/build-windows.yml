@@ -80,20 +80,9 @@ jobs:
 
       # 全部测试套件。历史上 CI 只跑了指标那一套，风控闸门/资金费/限流/订单路径/
       # 凭证存储五套都没跑过——那等于测试写了却没人守着
+
       - name: Run all test suites
-        shell: bash
-        run: |
-          set -e
-          for t in ccg_indicator_tests ccg_key_store_tests \
-                   ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests \
-                   ccg_trend_stress_tests \
-                   ccg_config_tests ccg_timesync_tests ccg_pool_tests \
-                   ccg_rest_feed_tests ccg_app_logic_tests \
-                   ccg_smart_tests ccg_smart_runner_tests ccg_journal_tests; do
-            echo "── $t ──"
-            ./build/Release/$t.exe
-          done
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 2
 
       - name: Package
         shell: bash
@@ -112,13 +101,10 @@ jobs:
       - name: Leak check (hard gate)
         shell: bash
         run: |
-          VER=""
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
-          if [ -n "$VER" ]; then
-            python tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot.exe
-          else
-            python tools/leak_check.py pkg
-          fi
+          VER="$(python tools/release_metadata.py --version)"
+          python tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot.exe
+          python tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless.exe
+          python tools/check_windows_package.py pkg "$VER"
 
       - name: Include documentation and dependency licenses
         shell: bash
@@ -134,17 +120,18 @@ jobs:
             cp "$notice" "pkg/licenses/$dep/"
           done
 
+      - name: Record source and dependencies
+        run: python tools/release_metadata.py --package pkg --triplet x64-windows
+
       - name: Zip
         shell: bash
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
-          [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
+          VER="$(python tools/release_metadata.py --version)"
           cd pkg && 7z a "../tradingbot-$VER-win64.zip" . >/dev/null
           cd .. && ls -la tradingbot-*.zip
 
       # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-win64

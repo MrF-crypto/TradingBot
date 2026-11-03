@@ -2,6 +2,7 @@
 // 规则与执行都在 core/smart_mode + app/smart_runner（GUI 与 headless 共用），
 // 这里只负责"什么时候调"和"怎么显示"。
 #include "gui/main_window.h"
+#include "gui/candidate_monitor.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -340,12 +341,12 @@ void MainWindow::openSmartDialog() {
     sAtrLo->setToolTip("低波动仍可能有趋势；需评估手续费与资金费占比。");
     fTGate->addRow("1h ATR% 区间", atrRow);
 
-    auto* fList = group(tv, "方向与名单");
-    auto* cbLong  = new QCheckBox("做多（扫强势 + 靠近上沿）");
-    auto* cbShort = new QCheckBox("做空（扫弱势 + 靠近下沿）");
+    auto* fList = group(tv, "交易方向权限");
+    auto* cbLong  = new QCheckBox("允许向上突破做多");
+    auto* cbShort = new QCheckBox("允许向下突破做空");
     cbLong->setChecked(c0.dir_long);
     cbShort->setChecked(c0.dir_short);
-    cbLong->setToolTip("两个都勾：bot 是多空——向上突破做多、向下突破做空，不看它从哪份名单进来。\n"
+    cbLong->setToolTip("两个都勾：统一候选可做多也可做空，由自身趋势与突破信号决定方向。\n"
                        "只勾一个：bot 只做那个方向。");
     cbShort->setToolTip(cbLong->toolTip());
     auto* dirRow = new QHBoxLayout();
@@ -353,75 +354,9 @@ void MainWindow::openSmartDialog() {
     dirRow->addWidget(cbShort);
     dirRow->addStretch();
     fList->addRow("方向", dirRow);
-    auto* cbMode = new QComboBox();
-    cbMode->addItem("分组候选：强势 / 弱势 / 中间 / 异动（方向由趋势决定）", (int)smart::DirMode::Mixed);
-    cbMode->addItem("突破定方向：全部多空，谁突破做谁", (int)smart::DirMode::Breakout);
-    cbMode->setCurrentIndex(c0.dir_mode == smart::DirMode::Mixed ? 0 : 1);
-    cbMode->setToolTip("分组只影响候选排序；两个方向都允许时，所有分组都按自身趋势做多或做空。过热不是做空信号。");
-    fList->addRow("方向模式", cbMode);
-
-    // 混合模式的名额与门槛
-    auto* sSn_ = ispin(0, 200, c0.strong_n, " 个");
-    auto* sWn  = ispin(0, 200, c0.weak_n, " 个");
-    auto* sMn  = ispin(0, 200, c0.mid_n, " 个");
-    auto* sHn  = ispin(0, 200, c0.hot_n, " 个");
-    auto* quotaRow = new QHBoxLayout();
-    quotaRow->addWidget(new QLabel("强"));  quotaRow->addWidget(sSn_);
-    quotaRow->addWidget(new QLabel("弱"));  quotaRow->addWidget(sWn);
-    quotaRow->addWidget(new QLabel("中"));  quotaRow->addWidget(sMn);
-    quotaRow->addWidget(new QLabel("过热")); quotaRow->addWidget(sHn);
-    quotaRow->addStretch();
-    fList->addRow("各段名额", quotaRow);
-    auto* sEnter = dspin(1, 49, 5, 0, c0.seg_enter_pct, " %");
-    auto* sExit  = dspin(1, 49, 5, 0, c0.seg_exit_pct, " %");
-    sEnter->setToolTip("强势：相对强弱排名前这么多、且跑赢 BTC 才进；弱势对称（后这么多、跑输 BTC）。");
-    sExit->setToolTip("掉出这个范围、或强弱翻了符号，连续 2 轮才离开——排名在边界附近浮动时方向不来回变。");
-    auto* segRow = new QHBoxLayout();
-    segRow->addWidget(new QLabel("进"));  segRow->addWidget(sEnter);
-    segRow->addWidget(new QLabel("出"));  segRow->addWidget(sExit);
-    segRow->addStretch();
-    fList->addRow("强弱段门槛", segRow);
-    auto* sTurn  = dspin(0, 1, 0.05, 2, c0.turn_er);
-    sTurn->setToolTip("强势段里 24 根效率比低于 −这个值（在掉头）⇒ 这一轮降为多空；弱势段对称。");
-    fList->addRow("掉头 效率比", sTurn);
-    auto* sHot   = dspin(1, 1000, 5, 0, c0.hot_pct, " %");
-    auto* sCrash = dspin(1, 100, 5, 0, c0.crash_pct, " %");
-    sHot->setToolTip("历史急涨用于分组观察，不产生反向交易许可。");
-    sCrash->setToolTip("历史急跌归入中间候选；当前方向仍由自身趋势判断。");
-    auto* hotRow = new QHBoxLayout();
-    hotRow->addWidget(new QLabel("过热 ≥")); hotRow->addWidget(sHot);
-    hotRow->addWidget(new QLabel("暴跌 ≥")); hotRow->addWidget(sCrash);
-    hotRow->addStretch();
-    fList->addRow("单日涨跌", hotRow);
-    // 突破模式的名额
-    auto* sLn = ispin(0, 200, c0.long_n, " 个");
-    auto* sSn = ispin(0, 200, c0.short_n, " 个");
-    auto* lsRow = new QHBoxLayout();
-    lsRow->addWidget(new QLabel("做多")); lsRow->addWidget(sLn);
-    lsRow->addWidget(new QLabel("做空")); lsRow->addWidget(sSn);
-    lsRow->addStretch();
-    fList->addRow("名单名额", lsRow);
-    // 只启用当前方向模式用得上的那些
-    {
-        auto sync = [=]() {
-            const bool mixed = (smart::DirMode)cbMode->currentData().toInt() == smart::DirMode::Mixed;
-            for (QWidget* w : std::initializer_list<QWidget*>{sSn_, sWn, sMn, sHn, sEnter, sExit,
-                                                               sTurn, sHot, sCrash})
-                w->setEnabled(mixed);
-            sLn->setEnabled(!mixed);
-            sSn->setEnabled(!mixed);
-        };
-        sync();
-        connect(cbMode, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg,
-                [sync](int) { sync(); });
-    }
-    auto* sMin = dspin(0, 100, 5, 0, c0.min_score, " 分");
-    sMin->setToolTip("排名是相对的，行情清淡时前几名也可能很平庸——低于这个分不进名单。");
-    fList->addRow("最低综合分", sMin);
-    fList->addRow(hint("淘汰：空仓时掉出前 1.5N 且连续 2 轮、加入满 24 小时才移除；"
-                       "硬门槛不合格立即移除；持仓中绝不移除，等这笔走完。"
-                       "一笔走完后 bot 保留，继续等下一次突破。"
-                       "名单换组不会改变趋势判定；持仓继续按止损和反转退出。"));
+    fList->addRow(hint("通过硬过滤的品种全部进入统一候选池，不评分、不分多空榜、不限制候选数量。"
+                       "向上突破做多、向下突破做空，仍需通过趋势确认和账户风控。"
+                       "明确不合格时暂停新仓，空仓 bot 可移除；持仓和在途委托继续管理。"));
 
     auto* fTpl = group(tv, "趋势跟踪参数（不反手、硬止损强制开）");
     auto* cbIv = new QComboBox();
@@ -432,7 +367,10 @@ void MainWindow::openSmartDialog() {
     auto* cbTrend = new QCheckBox("启用绝对趋势过滤（已收盘 EMA）");
     cbTrend->setChecked(t0.rule.following.enabled);
     auto* cbClose = new QCheckBox("收盘确认突破（取消勾选为盘中突破）");
+    cbClose->setToolTip("首次入场可选择盘中触发；止盈或止损完全平仓后，始终等待下一根完整K线收盘，确认新的突破再入场。");
     cbClose->setChecked(t0.rule.following.close_confirm);
+    fTrend->addRow(hint("平仓后继续监控，等下一根完整K线收盘形成新突破才可再入场。"
+                        "例如 1h 周期 13:20 平仓，最早 15:00 检查新信号；无突破继续等待。"));
     auto* cbReversal = new QCheckBox("确认相反趋势时离场；不立即反手");
     cbReversal->setChecked(t0.rule.following.reversal_exit);
     auto* sFast = ispin(2, 199, t0.rule.following.fast_period);
@@ -548,23 +486,25 @@ void MainWindow::openSmartDialog() {
     fTpl->addRow("保本", beRow);
     fTpl->addRow(hint("改参数后，空仓的自动 bot 在下一轮扫描时换上新参数；持仓中的立即换出场参数，周期、杠杆、仓位等走完再换。"));
 
-    auto* fTSize = group(tv, "仓位（与裸K 共用）");
+    auto* fTSize = group(tv, "仓位");
     addSizeRows(fTSize, sT);
 
     auto* fTRisk = group(tv, "风控（全部 bot 生效）");
     auto* sMaxPos = ispin(0, 500, c0.max_positions, " 个", "不限");
     fTRisk->addRow("同时持仓上限", sMaxPos);
+    auto* cbRotate = new QCheckBox("满仓换仓");
+    cbRotate->setChecked(c0.rotate_when_full);
+    cbRotate->setToolTip("满仓且有新的收盘突破时，评估旧的智能持仓。\n"
+                        "旧仓至少持有6根完整K线、连续3根失去原方向趋势许可，且最近3根没有新的有利收盘极值，才可被替换。\n"
+                        "先平后开，重新核对信号和风险预算。无每日次数或额外换仓间隔限制；任务串行执行。\n"
+                        "仅在设置了持仓上限并启用趋势过滤时生效。重启后读取断点，补齐缺失K线后继续观察。");
+    fTRisk->addRow("智能持仓", cbRotate);
+    const auto syncRotate = [=] { cbRotate->setEnabled(cbTrend->isChecked() && sMaxPos->value() > 0); };
+    connect(cbTrend, &QCheckBox::toggled, cbRotate, syncRotate);
+    connect(sMaxPos, qOverload<int>(&QSpinBox::valueChanged), cbRotate, syncRotate);
+    syncRotate();
     fTRisk->addRow("当日亏损限额", sT.day);
     fTRisk->addRow("持仓浮亏限额", sT.flt);
-    auto* sRes = ispin(0, 50, c0.prio_reserve, " 个", "关");
-    auto* sPri = dspin(0, 100, 5, 0, c0.prio_min_score, " 分");
-    auto* priRow = new QHBoxLayout();
-    priRow->addWidget(new QLabel("名额剩"));
-    priRow->addWidget(sRes);
-    priRow->addWidget(new QLabel("以内时，只接受 ≥"));
-    priRow->addWidget(sPri);
-    priRow->addStretch();
-    fTRisk->addRow("名额紧张", priRow);
     auto* sTotalRisk = dspin(0, 1e7, 1, 2, c0.max_total_risk_usdt, " U", "关");
     auto* sDirectionRisk = dspin(0, 1e7, 1, 2, c0.max_direction_risk_usdt, " U", "关");
     auto* sRiskCost = dspin(0, 1000, 1, 1, c0.risk_cost_bps, " bps");
@@ -578,36 +518,15 @@ void MainWindow::openSmartDialog() {
 
     // ── 候选名单──────────────────────────────────────
     const auto rep = smart_ ? smart_->last_report() : SmartRunner::Report{};
-    auto trendTable = [](const std::vector<SmartRunner::Row>& rows) {
-        auto* t = new QTableWidget((int)rows.size(), 9);
-        t->setHorizontalHeaderLabels({"#", "品种", "分数", "强弱", "7天最大单日涨",
-                                      "ATR%", "箱体/ATR", "量能抬升", "已开 bot"});
-        t->verticalHeader()->setVisible(false);
-        t->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        t->setSelectionBehavior(QAbstractItemView::SelectRows);
-        t->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-        for (int i = 0; i < (int)rows.size(); ++i) {
-            const auto& r = rows[i];
-            auto set = [&](int col, const QString& s) {
-                auto* it = new QTableWidgetItem(s);
-                it->setTextAlignment(Qt::AlignCenter);
-                t->setItem(i, col, it);
-            };
-            set(0, QString::number(r.rank));
-            set(1, QString::fromStdString(r.symbol));
-            set(2, QString::number(r.score, 'f', 0));
-            set(3, QString("%1%2").arg(r.rs >= 0 ? "+" : "").arg(r.rs, 0, 'f', 2));
-            set(4, QString::number(r.max_up24, 'f', 0) + "%");
-            set(5, QString::number(r.atr_pct, 'f', 2));
-            set(6, QString::number(r.box12_atr, 'f', 1));
-            set(7, QString::number(r.vol_lift, 'f', 2) + "x");
-            set(8, r.has_bot ? "✓" : "");
-        }
-        return t;
-    };
-    for (const auto& g : rep.groups)
-        tabs->addTab(trendTable(g.rows), QString("%1 %2/%3")
-            .arg(QString::fromStdString(g.title)).arg(g.rows.size()).arg(g.quota));
+    auto* candidateMonitor = make_candidate_monitor([this] {
+        if (!trend_engine_) return read_candidate_checkpoint(QString::fromStdString(trend_cfg_path()));
+        CandidateSnapshot snapshot;
+        snapshot.connected = trend_engine_ != nullptr && client_ != nullptr;
+        if (smart_) snapshot.report = smart_->last_report();
+        if (trend_engine_) snapshot.bots = trend_engine_->inspect_bots();
+        return snapshot;
+    }, &dlg);
+    tabs->addTab(candidateMonitor, "统一候选 · 监控详情");
 
     // ── 状态行 ────────────────────────────────────────────────────────────
     {
@@ -659,22 +578,8 @@ void MainWindow::openSmartDialog() {
         c.atr_pct_max = sAtrHi->value();
         c.dir_long  = cbLong->isChecked();
         c.dir_short = cbShort->isChecked();
-        c.dir_mode  = (smart::DirMode)cbMode->currentData().toInt();
-        c.strong_n  = sSn_->value();
-        c.weak_n    = sWn->value();
-        c.mid_n     = sMn->value();
-        c.hot_n     = sHn->value();
-        c.seg_enter_pct = sEnter->value();
-        c.seg_exit_pct  = sExit->value();
-        c.turn_er   = sTurn->value();
-        c.hot_pct   = sHot->value();
-        c.crash_pct = sCrash->value();
-        c.long_n    = sLn->value();
-        c.short_n   = sSn->value();
-        c.min_score = sMin->value();
         c.max_positions  = sMaxPos->value();
-        c.prio_reserve   = sRes->value();
-        c.prio_min_score = sPri->value();
+        c.rotate_when_full = cbRotate->isChecked();
         t.interval = cbIv->currentText().toStdString();
         t.rule.donchian_period    = sDc->value();
         t.rule.atr_period         = sAtrP->value();

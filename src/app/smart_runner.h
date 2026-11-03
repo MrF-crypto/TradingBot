@@ -18,7 +18,7 @@ namespace ccbot {
 
 class TradingClient;
 
-// 智能模式的执行层：拉全市场数据 → 打分 → 候选池决策 → 落到引擎上。
+// 智能模式的执行层：拉全市场数据 → 硬过滤 → 候选池决策 → 落到引擎上。
 // GUI 与 headless 共用这一份，两边只负责"什么时候调"和"界面/日志怎么显示"。
 //
 // 线程：run_once 是阻塞的（几十秒的网络请求），调用方放到后台线程跑。
@@ -58,32 +58,20 @@ public:
     bool due(int64_t now_ms) const;
     void force();
 
-    struct Row {               // 名单展示用
+    struct Row {
         std::string symbol;
-        char   list  = 0;      // 名单 / 分段代码（smart::kList* / kSeg*）
-        int    rank  = 0;
-        double score = 0;
-        double atr_pct = 0, box12_atr = 0, vol_lift = 0, rs = 0, max_up24 = 0;
-        bool   has_bot = false;
-    };
-    // 一份名单：突破模式是"做多 / 做空"两份，混合模式是"强势 / 弱势 / 中间 / 过热"四份
-    struct Group {
-        std::string title;     // 例如 "强势（仅多）"
-        char        code = 0;
-        int         quota = 0;
-        std::vector<Row> rows;
+        double atr_pct = 0, close = 0;
+        bool has_bot = false;
     };
     struct Report {
-        bool        ok = false;
-        int64_t     at_ms = 0;
-        int         universe = 0, passed_gate = 0, eligible = 0;
-        int         added = 0, removed = 0, monitored = 0, holding = 0;
-        std::string summary;          // 一行
-        std::vector<Group> groups;
+        bool ok = false;
+        int64_t at_ms = 0;
+        int universe = 0, passed_gate = 0, eligible = 0;
+        int added = 0, removed = 0, monitored = 0, holding = 0;
+        std::string summary;
+        std::vector<Row> candidates;
     };
-    // 把一次扫描整理成名单（--scan 预览与 run_once 共用）
-    static std::vector<Group> build_groups(const smart::Ranking& rk, const smart::Segmented& sg,
-                                           const smart::Config& cfg,
+    static std::vector<Row> candidate_rows(const std::map<std::string, smart::Features>& candidates,
                                            const std::set<std::string>& with_bot);
     // 扫描 + 落地。阻塞。未启用时只做清理（见 housekeep）
     Report run_once(int64_t now_ms);

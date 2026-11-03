@@ -43,6 +43,15 @@ FORBIDDEN_PAT = re.compile(
 #   拒绝整个包，而本机测试完全看不出来（Windows 的 .exe 走后缀白名单，不经过这里）
 ALLOWED_NOEXT = {"TradingBot", "ccbot_headless"}
 
+# Only the standard metadata paths of our application bundle. No wildcard JSON,
+# data directory or arbitrary resource allowance is introduced for macOS packaging.
+ALLOWED_BUNDLE_METADATA = {
+    "TradingBot.app/Contents/Info.plist",
+    "TradingBot.app/Contents/PkgInfo",
+    "TradingBot.app/Contents/_CodeSignature/CodeResources",
+    "TradingBot.app/Contents/Resources/qt.conf",
+}
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -66,6 +75,8 @@ def main() -> int:
         rel = f.relative_to(root).as_posix()
         suffix = f.suffix.lower()
 
+        if rel in ALLOWED_BUNDLE_METADATA:
+            continue
         if FORBIDDEN_PAT.search(f.name):
             problems.append(f"禁止的文件名: {rel}")
             continue

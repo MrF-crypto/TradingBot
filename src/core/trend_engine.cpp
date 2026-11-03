@@ -1,4 +1,5 @@
 #include "core/trend_engine.h"
+#include "core/monitor_state.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,9 +26,6 @@ void fill_trade_meta(TrendTrade& tr, const TrendBot& b) {
     if (b.open_ms > 0)
         tr.open_time = std::chrono::system_clock::time_point(std::chrono::milliseconds(b.open_ms));
     tr.is_auto  = b.is_auto;
-    tr.seg      = b.open_seg;
-    tr.rank     = b.open_rank;
-    tr.score    = b.open_score;
     tr.entry_dist_atr = b.open_dist_atr;
     tr.entry_vol_ratio = b.open_vol_ratio;
     tr.entry_box_atr   = b.open_box_atr;
@@ -85,7 +83,19 @@ TrendEngine::TrendEngine(std::shared_ptr<ITradingClient> client, EngineHost host
     if (!host_.submit) host_.submit = [](std::function<void()> fn) { fn(); };
 }
 
-void TrendEngine::log(const std::string& msg) const {
+void TrendEngine::log(const std::string& msg) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+        for (auto& [id, b] : bots_) {
+            const auto pos = msg.find(b.cfg.symbol);
+            const bool rotation = msg.find("换仓") != std::string::npos;
+            const bool participant = rotation && (id == rotation_.incoming || id == rotation_.outgoing);
+            if (!participant && (pos == std::string::npos || (pos > 0 && msg[pos - 1] >= 'A' && msg[pos - 1] <= 'Z'))) continue;
+            monitor_event(b, now, rotation ? "换仓" : "执行", msg);
+            if (rotation) b.monitor.rotation_reason = b.monitor.events.back().text;
+        }
+    }
     if (log_cb_) log_cb_(msg);
 }
 
@@ -155,7 +165,7 @@ std::string TrendEngine::add_bot(const TrendConfig& cfg, bool is_auto) {
     }
     if (cfg.rule.direction != trend::Direction::Both)
         params += std::string(" / ") + trend::direction_name(cfg.rule.direction);
-    // 自动 bot 不逐个打：智能模式一轮可能加几十个，它自己打一行"+XX（多 #3，82 分）"
+    // 自动 bot 不逐个打：智能模式统一汇总本轮新增品种。
     if (!is_auto)
         log(cfg.symbol + " " + trend::strategy_name(cfg.rule.strategy) +
             " bot 已创建（" + params + " / " + cfg.interval + "）");
@@ -170,7 +180,8 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
             return {};
 
     snap.bot_id  = "sar" + std::to_string(++seq_);
-    if (snap.pending && snap.st.pos == trend::Pos::Flat) snap.open_uncertain = true;
+    if (snap.pending && !snap.rotation_reserved && snap.st.pos == trend::Pos::Flat) snap.open_uncertain = true;
+    snap.rotation_reserved = false;
     if (snap.open_uncertain) snap.state = TrendBot::State::Stopped;
     snap.pending = false;              // 落盘时的在途标记一律作废
     // 信号一律作废重拉：落盘的 ATR 可能是几小时前的，而止损线的距离由它决定。
@@ -178,17 +189,26 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.uncertain_terminal = false;
     snap.uncertain_empty_seen = 0;
     snap.following = {};
+    snap.rotation_noted_bar_ms = 0;
+    snap.needs_reconcile = snap.needs_reconcile || snap.monitor.saved;
+    snap.monitor.recovering = snap.monitor.saved;
+    snap.monitor.fetch_failed = false;
+    if (snap.monitor.saved) snap.monitor.data_error = "恢复中：等待持仓核对与最新行情";
+    snap.price_time = {};
     snap.sig_ok  = false;
     snap.atr = snap.atr_pct = 0;
     snap.dc_ok = false;
     snap.box_atr = snap.vol_ratio = snap.range_pace = snap.er = 0;
     snap.er_ok = false;
     snap.sig_time = {};
-    // 冷却与"这根K线数过没有"跨重启都失去意义：bar_open_ms 对不上新拉的K线
-    snap.bar_open_ms = snap.last_counted_bar_ms = 0;
+    // Live snapshot must be refreshed; last_counted_bar_ms remains a durable idempotency cursor.
+    snap.bar_open_ms = 0;
     // 自动 bot 恢复时空仓的话重新上膛：重启这段时间里价格可能已经冲出通道，
     // 一恢复就判成突破等于追高
-    snap.armed = !(snap.is_auto && snap.st.pos == trend::Pos::Flat);
+    if (!snap.monitor.saved) snap.armed = !(snap.is_auto && snap.st.pos == trend::Pos::Flat);
+    // 恢复的自动 bot 要等新一轮硬过滤通过才允许新仓，旧名单不能代替当前准入。
+    // 已有仓位的出场与保护不受 retiring 限制。
+    if (snap.is_auto) snap.retiring = true;
     if (snap.start_time.time_since_epoch().count() == 0)
         snap.start_time = host_.now_wall();
 
@@ -210,7 +230,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
     std::unique_lock<std::recursive_mutex> lk(mtx_);
     std::vector<std::string> issues;
     // 硬止损在暂停/离线期间触发、由对账确认的那些平仓。成交回调在锁外发
-    std::vector<TrendTrade> fired;
+    std::vector<std::string> verify_ids;
 
     const auto now = host_.now_steady();
 
@@ -300,6 +320,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
         };
 
         if (!local_has && !ex) {                       // 两边都空，一致
+            if (!b.open_uncertain && snapshot_age <= std::chrono::seconds(5)) b.needs_reconcile = false;
             b.recon_noted    = TrendBot::Recon::None;
             b.ext_gone_seen  = 0;
             continue;
@@ -351,43 +372,17 @@ std::vector<std::string> TrendEngine::reconcile_positions(
                           "先不处理，下一轮再确认");
                 continue;
             }
-            // 硬止损单先前已从挂单列表里消失 ⇒ 最可能是它触发了（暂停中、或程序
-            // 离线时）。按它的触发价记一笔：否则这笔亏损不进 bot 统计、不进成交
-            // 明细，也不进当日亏损限额——风控少算一笔
-            if (b.ds_vanished_price > 0 && b.st.entry_price > 0 && b.qty > 0) {
-                const double sign = (b.st.pos == trend::Pos::Long) ? 1.0 : -1.0;
-                const double px   = b.ds_vanished_price;
-                const double pnl  = (px - b.st.entry_price) * b.qty * sign;
-                b.realized_pnl += pnl;
-                ++b.trade_count;
-                if (pnl > 0) ++b.win_count;
-                book_day(pnl, b.st.entry_price, px, b.qty);
-                TrendTrade tr;
-                tr.symbol      = b.cfg.symbol;
-                tr.side        = b.st.pos;
-                tr.entry_price = b.st.entry_price;
-                tr.exit_price  = px;
-                tr.qty         = b.qty;
-                tr.pnl         = pnl;
-                tr.reason      = "交易所硬止损触发（对账确认，按挂单价估算）";
-                tr.close_time  = host_.now_wall();
-                fill_trade_meta(tr, b);
-                fired.push_back(tr);
-                note_once(TrendBot::Recon::ExtGone,
-                          b.cfg.symbol + " 交易所硬止损已触发（对账确认）：按 $" + fmt(px) +
-                          " 估算记账 " + fmt(pnl, 2) + "U，已停止该bot");
-            } else {
-                note_once(TrendBot::Recon::ExtGone,
-                          b.cfg.symbol + " 本地有仓位但交易所没有（连续 2 轮确认：外部已平/被强平），"
-                          "已清空本地状态并停止该bot");
+            if (!b.disaster_stop_id.empty() || !b.ds_vanished_id.empty()) {
+                b.pending = true;
+                verify_ids.push_back(b.bot_id);
+                continue;
             }
+            note_once(TrendBot::Recon::ExtGone,
+                      b.cfg.symbol + " 连续两次确认交易所无仓位，已停止；实际成交与盈亏待核对");
             trend::on_closed(b.st);
+            start_reentry_wait(b);
             clear_ds_runtime(b);
-            // 这条路径【没有】撤单动作（对账在锁内，不能做 HTTP），所以要自己
-            // 把单号清掉。不清的话 try_place_hard_stop 会因为"已有单号"而永远
-            // 不再挂新单——静默失去保护。
-            // 代价是交易所那张单可能残留：但走到这里说明仓位已被外部平掉，
-            // 而 closePosition 单在仓位归零后本就不会再成交
+            // 有保护单记录的仓位已转交锁外核验；此处仅处理无记录的外部平仓。
             b.disaster_stop_id.clear();
             b.disaster_stop_price = 0;
             b.qty = 0;
@@ -435,6 +430,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
                       ")，可能有外部加仓，本地状态未改动");
         } else {
             b.recon_noted = TrendBot::Recon::None;   // 完全一致：允许将来重新报
+            if (!opp && !b.open_uncertain && snapshot_age <= std::chrono::seconds(5)) b.needs_reconcile = false;
         }
     }
 
@@ -457,10 +453,10 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             it = seen_now.count(it->first) ? std::next(it) : untracked_seen_.erase(it);
     }
 
-    // 成交回调在锁外发：回调方（界面/CSV）不该在引擎锁里跑
+    // 查仓位和成交需要 HTTP，必须在引擎锁外执行。
     lk.unlock();
-    if (trade_cb_)
-        for (const auto& tr : fired) trade_cb_(tr);
+    for (const auto& id : verify_ids)
+        host_.submit([this, id] { verify_external_close(id); });
     return issues;
 }
 
@@ -491,6 +487,7 @@ std::vector<std::string> TrendEngine::reconcile_stop_orders(
         // 记下它的触发价：消失多半是触发了，仓位对账确认"交易所已无仓位"时
         // 要按这个价记账（那时下面的清零与重挂早已发生）
         if (b.disaster_stop_price > 0) b.ds_vanished_price = b.disaster_stop_price;
+        b.ds_vanished_id = b.disaster_stop_id;
         b.disaster_stop_id.clear();
         b.disaster_stop_price = 0;
         b.ds_attempts    = 0;
@@ -613,8 +610,8 @@ bool TrendEngine::remove_if_flat(const std::string& id) {
     auto it = bots_.find(id);
     if (it == bots_.end()) return false;
     const auto& b = it->second;
-    // 在途订单同样不能删：开仓单回来时找不到 bot，成交的仓位就没人管了
-    if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending || b.open_uncertain) return false;
+    // 在途订单不能删；平仓后的等待记录也不能被候选重扫删除后重建绕过。
+    if (b.st.pos != trend::Pos::Flat || b.qty > 0 || b.pending || b.open_uncertain || b.waiting_reentry()) return false;
     bots_.erase(it);
     return true;
 }
@@ -640,15 +637,14 @@ std::string TrendEngine::replace_bot(const std::string& old_id, const TrendConfi
     const int    trades   = it->second.trade_count;
     const int    wins     = it->second.win_count;
     const auto   started  = it->second.start_time;
-    // 自动 bot 换参数（智能模式改方向/模板）仍是自动 bot，名单信息一并带上
+    // 自动 bot 换参数（智能模式改方向权限/模板）仍是自动 bot。
     const bool   is_auto  = it->second.is_auto;
-    const double score    = it->second.smart_score;
-    const int    rank     = it->second.smart_rank;
-    const char   list     = it->second.smart_list;
     // "这一根开过了"要搬：智能模式盘中重扫会重建刚平仓的 bot，不搬的话同一根里还能再开
     const int64_t entry_bar = it->second.st.last_entry_bar_ms;
+    const int64_t reentry_after = it->second.reentry_after_ms;
     // 冷却（连续反手到上限后）也要搬：换参数不该把正在冷却的 bot 放出来
     const int cooldown = it->second.st.cooldown_left;
+    const auto previous = it->second;
     bots_.erase(it);
 
     const std::string id = add_bot(cfg, is_auto);
@@ -658,11 +654,14 @@ std::string TrendEngine::replace_bot(const std::string& old_id, const TrendConfi
     b.trade_count  = trades;
     b.win_count    = wins;
     b.start_time   = started;
-    b.smart_score  = score;
-    b.smart_rank   = rank;
-    b.smart_list   = list;
     b.st.last_entry_bar_ms = entry_bar;
+    b.reentry_after_ms = reentry_after;
     b.st.cooldown_left     = cooldown;
+    b.last_counted_bar_ms = previous.last_counted_bar_ms;
+    b.rotation_attempt_bar_ms = previous.rotation_attempt_bar_ms;
+    b.monitor = previous.monitor;
+    b.needs_reconcile = previous.needs_reconcile;
+    if (monitor_model_key(cfg) == monitor_model_key(previous.cfg)) b.armed = previous.armed;
     return id;
 }
 
@@ -701,7 +700,7 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     // 两个一起换。裸K / SAR 的 prev_close 归 update_bars 管，这里不碰
     if (b.cfg.rule.strategy == trend::Strategy::TrendFollowing && prev_close > 0) b.prev_close = prev_close;
     b.following = follow;
-    if (!(follow.settings == b.cfg.rule.following)) b.following.ready = false;
+    if (!(follow.settings == b.signal_following_config())) b.following.ready = false;
     b.atr     = atr;
     b.atr_pct = atr_pct;
     b.dc_ok   = dc_ok;
@@ -723,6 +722,13 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     // 3 秒一个 tick 的话，"冷却3根4h线"会在 9 秒内走完，等于没有冷却
     if (bar_open_ms > 0 && bar_open_ms != b.bar_open_ms) {
         b.bar_open_ms = bar_open_ms;   // 实际的冷却递减在 tick 里，见 last_counted_bar_ms
+    }
+    update_rotation_health(b);
+    if (!b.cfg.rule.following.enabled && b.sig_ok) {
+        b.monitor.recovering = false;
+        b.monitor.fetch_failed = false;
+        b.monitor.data_error.clear();
+        b.monitor.updated_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
     }
 }
 
@@ -801,7 +807,8 @@ void TrendEngine::set_risk_limits(double total, double direction, double cost_bp
     risk_cost_rate_ = std::isfinite(cost_bps) && cost_bps > 0 ? cost_bps / 10000 : 0;
 }
 
-std::string TrendEngine::risk_gate_block(const TrendBot& self, trend::Pos dir, double want) const {
+std::string TrendEngine::risk_gate_block(const TrendBot& self, trend::Pos dir, double want,
+                                        const TrendBot* releasing) const {
     if (!(std::isfinite(want) && want > 0)) return "计划风险数据不合法";
     for (const auto& [key, count] : untracked_seen_)
         if (count >= 2) return "交易所有未跟踪仓位，暂停新增风险";
@@ -809,6 +816,7 @@ std::string TrendEngine::risk_gate_block(const TrendBot& self, trend::Pos dir, d
     for (const auto& [id, b] : bots_) {
         if (id == self.bot_id) continue;
         if (b.open_uncertain) return "开仓委托状态不明，暂停新增风险直到对账";
+        if (&b == releasing) continue;
         double risk = b.reserved_risk;
         auto side = b.reserved_dir;
         if (b.qty > 0 && b.st.pos != trend::Pos::Flat) {
@@ -845,6 +853,20 @@ void TrendEngine::set_float_loss_limit(double usdt) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     float_loss_limit_ = (usdt > 0 && std::isfinite(usdt)) ? usdt : 0;
 }
+void TrendEngine::set_persistence_error(const std::string& source, const std::string& error) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    const auto it = persistence_errors_.find(source);
+    if (error.empty()) {
+        if (it == persistence_errors_.end()) return;
+        persistence_errors_.erase(it);
+        log(source + " 保存已恢复，解除该项开仓限制");
+    } else {
+        if (it != persistence_errors_.end() && it->second == error) return;
+        persistence_errors_[source] = error;
+        log("⚠ " + source + " 保存失败，已暂停新开仓，已有持仓继续管理：" + error);
+    }
+}
+
 void TrendEngine::set_pause_new(bool on) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     pause_new_ = on;
@@ -853,21 +875,6 @@ bool TrendEngine::pause_new() const {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     return pause_new_;
 }
-void TrendEngine::set_priority_reserve(int reserve, double min_score) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    prio_reserve_   = (reserve > 0) ? reserve : 0;
-    prio_min_score_ = min_score;
-}
-void TrendEngine::set_smart_meta(const std::string& id, double score, int rank, char list) {
-    std::lock_guard<std::recursive_mutex> lk(mtx_);
-    auto it = bots_.find(id);
-    if (it == bots_.end()) return;
-    it->second.smart_score = score;
-    it->second.smart_rank  = rank;
-    it->second.smart_list  = list;
-}
-
-
 void TrendEngine::set_retiring(const std::string& id, bool on) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);
@@ -910,9 +917,7 @@ void TrendEngine::release_auto(const std::string& id) {
     auto& b = it->second;
     b.is_auto = false;
     b.armed   = true;
-    b.smart_score = 0;
-    b.smart_rank  = 0;
-    b.smart_list  = 0;
+    b.retiring = false;
 }
 
 int64_t TrendEngine::utc_day(std::chrono::system_clock::time_point t) {
@@ -959,10 +964,45 @@ std::string TrendEngine::take_filter_summary() {
     return out;
 }
 
-// 账户级闸门。返回空串 = 放行，否则是给人看的拦截原因。
-// ⚠ 调用方必须已持 mtx_（它要遍历 bots_）。声明在 tick 的决策循环内部调用，
-//   那里本来就持着锁
-std::string TrendEngine::open_gate_block(const TrendBot& self) const {
+// 以下等待状态与开仓检查均由持有 mtx_ 的调用方执行。
+void TrendEngine::start_reentry_wait(TrendBot& b) {
+    if (!b.is_auto || b.cfg.rule.strategy != trend::Strategy::TrendFollowing) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+    const int64_t period = static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000;
+    if (period <= 0 || now <= 0) {
+        b.reentry_after_ms = std::numeric_limits<int64_t>::max(); // 无法确定时间，禁止猜测放行。
+        return;
+    }
+    // 13:20 平仓 -> 14:00 开始的下一根完整小时K -> 15:00 才可使用其收盘信号。
+    // 以实际平仓确认时刻计算，不用可能落后的行情快照。
+    b.reentry_after_ms = std::max(b.reentry_after_ms, (now / period + 2) * period);
+}
+
+const char* TrendEngine::reentry_block(const TrendBot& b, trend::Pos direction) const {
+    if (!b.waiting_reentry()) return "";
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+    if (now < b.reentry_after_ms || b.bar_open_ms < b.reentry_after_ms)
+        return "平仓后等待下一根完整K线收盘";
+    const int64_t period = static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000;
+    const auto age = std::chrono::duration_cast<std::chrono::seconds>(host_.now_steady() - b.sig_time).count();
+    if (!b.sig_ok || !b.following.ready || !(b.following.settings == b.signal_following_config()) ||
+        period <= 0 || now < b.bar_open_ms || now - b.bar_open_ms >= period || age > b.cfg.effective_max_age_sec())
+        return "平仓后等待新的有效收盘信号";
+    const bool confirmed = direction == trend::Pos::Long ? b.following.long_confirmed :
+        direction == trend::Pos::Short ? b.following.short_confirmed :
+        (b.following.long_confirmed || b.following.short_confirmed);
+    return confirmed ? "" : "平仓后等待新的收盘突破";
+}
+
+// 账户级闸门。返回空串 = 放行，否则给出拦截原因；调用方已持 mtx_。
+std::string TrendEngine::open_gate_block(const TrendBot& self, const TrendBot* releasing) const {
+    if (!persistence_errors_.empty())
+        return "状态保存失败，暂停新开仓：" + persistence_errors_.begin()->first;
+    for (const auto& [id, bot] : bots_)
+        if (bot.needs_reconcile) return "恢复中：等待持仓与委托核对";
+    if (self.monitor.recovering && self.cfg.rule.following.enabled) return "恢复中：等待补齐行情断点";
+    if (!rotation_.incoming.empty() && (rotation_.incoming != self.bot_id || !self.pending))
+        return "满仓换仓进行中，名额已预留";
     // 账户级硬止损熔断排在最前：它的判据与保证金/品种数无关，而且一旦成立，
     // 后面两项算得再对也没有意义——开仓的前提（交易所侧有底）已经不成立了。
     //
@@ -1010,7 +1050,14 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
     if (pause_new_) return "已手动暂停开新仓";
 
     if (daily_loss_limit_ > 0) {
-        const double r = today_realized();
+        double r = today_realized();
+        if (releasing) {
+            const double px = releasing->current_price, entry = releasing->st.entry_price;
+            const double sign = releasing->st.pos == trend::Pos::Long ? 1.0 : -1.0;
+            // Project the realized loss and allow for closing costs before disturbing a holding.
+            r += (px - entry) * releasing->qty * sign -
+                 (px + entry) * releasing->qty * std::max(kEstFeeRate, risk_cost_rate_ / 2);
+        }
         if (r <= -daily_loss_limit_)
             return "今日已实现 " + fmt(r, 2) + "U（含估算手续费）已达亏损限额 " +
                    fmt(daily_loss_limit_, 2) + "U，UTC 0 点（北京 8 点）恢复";
@@ -1021,6 +1068,7 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
     for (const auto& kv : bots_) {
         const auto& b = kv.second;
         if (b.open_uncertain) return "开仓状态不明，等待对账";
+        if (&b == releasing) continue;
         if (b.qty <= 0) {
             if (b.bot_id != self.bot_id && b.pending) {
                 ++open_n;
@@ -1044,13 +1092,6 @@ std::string TrendEngine::open_gate_block(const TrendBot& self) const {
     if (max_open_positions_ > 0 && open_n >= max_open_positions_) {
         return "同时持仓品种数已达上限 " + std::to_string(open_n) + "/" +
                std::to_string(max_open_positions_);
-    }
-    // 名额紧张时只留给高分候选。只管自动 bot：手动 bot 是你亲自选的，不替你取舍
-    if (self.is_auto && max_open_positions_ > 0 && prio_reserve_ > 0 &&
-        open_n >= max_open_positions_ - prio_reserve_ && self.smart_score < prio_min_score_) {
-        return "名额紧张（" + std::to_string(open_n) + "/" + std::to_string(max_open_positions_) +
-               "），只留给 ≥" + fmt(prio_min_score_, 0) + " 分的候选（本币 " +
-               fmt(self.smart_score, 0) + " 分）";
     }
     if (max_total_margin_ > 0) {
         // 新仓占用按 budget_usdt ÷ leverage 估。等风险模式下实际名义可能更小，
@@ -1089,9 +1130,9 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             auto& b = kv.second;
             if (b.cfg.symbol != symbol)            continue;
             if (b.state != TrendBot::State::Running) continue;
-            if (b.pending)                         continue;
-
             b.current_price = price;
+            b.price_time = host_.now_steady();
+            if (b.pending)                         continue;
 
             // 信号新鲜度：过期的快照不参与【开新仓】。已持仓不受影响——
             // trend::step 在 atr<=0 时会沿用上一条止损线，保护不会因数据断流而撤销
@@ -1099,7 +1140,7 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                                  host_.now_steady() - b.sig_time).count();
             const int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
             const int64_t bar_ms = static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000;
-            const bool bar_current = !b.cfg.rule.following.enabled ||
+            const bool bar_current = !b.signal_following_config().enabled ||
                 (b.bar_open_ms > 0 && wall_ms >= b.bar_open_ms && wall_ms - b.bar_open_ms < bar_ms);
             const bool fresh = b.sig_ok && age <= b.cfg.effective_max_age_sec() && bar_current;
 
@@ -1143,12 +1184,23 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             // 直接上膛。智能模式目前只建趋势跟踪 bot
             if (!b.armed && b.st.pos == trend::Pos::Flat &&
                 (b.cfg.rule.strategy != trend::Strategy::TrendFollowing ||
-                 (b.cfg.rule.following.enabled && b.cfg.rule.following.close_confirm && in.following.ready) ||
+                 (b.signal_following_config().enabled && b.signal_following_config().close_confirm && in.following.ready) ||
                  (in.dc_ok && price < in.dc_up && price > in.dc_dn)))
                 b.armed = true;
 
-            const auto v = trend::step(b.st, b.cfg.rule, in);
+            auto v = trend::step(b.st, b.cfg.rule, in);
+            if (b.st.pos == trend::Pos::Flat && b.waiting_reentry()) {
+                const auto direction = v.action == trend::Action::OpenLong ? trend::Pos::Long :
+                    v.action == trend::Action::OpenShort ? trend::Pos::Short : trend::Pos::Flat;
+                if (const char* why = reentry_block(b, direction); *why) {
+                    v.action = trend::Action::Hold;
+                    v.reason = why;
+                    v.filtered = false;
+                }
+            }
 
+            const auto monitor_gate = b.st.pos == trend::Pos::Flat ? open_gate_block(b) : std::string();
+            monitor_event(b, wall_ms, "决策", monitor_gate.empty() ? v.reason : monitor_gate);
             // 持仓期最差价（浮亏最低）。有利极值 st.peak 由 step 更新，这里补另一头
             if (b.st.pos != trend::Pos::Flat)
                 b.trough = !(b.trough > 0) ? price
@@ -1283,6 +1335,22 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                  host_.now_steady() >= b.ds_next_try))
                 to_ds_sync = b.bot_id;
 
+            // Full-capacity replacement uses its own closed-candle model even when ordinary
+            // first entries are intrabar (whose channel already contains the signal candle).
+            if (rotation_enabled_ && b.is_auto && b.st.pos == trend::Pos::Flat &&
+                b.rotation_attempt_bar_ms != b.bar_open_ms) {
+                const auto gate = open_gate_block(b);
+                if (gate.starts_with("同时持仓品种数已达上限") || !rotation_.incoming.empty()) {
+                    for (auto side : {trend::Pos::Long, trend::Pos::Short})
+                        if (rotation_entry_block(b, side, b.bar_open_ms).empty()) {
+                            const auto queued = rotation_queue_.find(b.bot_id);
+                            if (queued == rotation_queue_.end() || queued->second.bar_ms != b.bar_open_ms)
+                                rotation_queue_[b.bot_id] = {side, b.bar_open_ms, ++rotation_arrival_};
+                            break;
+                        }
+                }
+            }
+
             switch (v.action) {
             case trend::Action::Hold:
                 break;
@@ -1347,6 +1415,7 @@ void TrendEngine::tick(const std::string& symbol, double price) {
         for (const auto& fe : filtered_events) filter_cb_(fe);
     if (!to_close.empty()) submit_close(to_close, close_reason, reverse_to);
     if (!to_open.empty())  submit_open (to_open,  open_dir, false);
+    pump_rotation();
 
     // 硬止损的挂单放在最后：要平仓/反手的那一拍不该再去挂这张单——
     // submit_close 会把它撤掉，这里再挂一张就成了孤儿单
@@ -1376,12 +1445,17 @@ void TrendEngine::clear_pending_after_throw(const std::string& id, const std::st
 }
 
 void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_reverse) {
-    host_.submit([this, id, dir, from_reverse]() {
+    host_.submit([this, id, dir, from_reverse]() { execute_open(id, dir, from_reverse); });
+}
+
+void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_reverse) {
         try {
             TrendConfig cfg;
             // 这里不再需要 atr：v4.4.0 起 plan_qty 按【真实止损线】算等风险数量，
             // 而初始止损线在下面用 trend::initial_stop 直接算好（它自己取 si.atr）
             double price = 0, init_stop = 0;
+            bool rotation_open = false;
+            double rotation_volume = 0, rotation_box = 0;
             // 开仓时的 ATR：趋势跟踪的锁定 ATR / 加速收紧以它为基准。和初始止损线
             // 同一时刻取，两者口径一致
             double entry_atr = 0;
@@ -1394,15 +1468,31 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 auto& b = it->second;
                 cfg   = b.cfg;
                 price = b.current_price;
+                rotation_open = rotation_.incoming == id;
+                trend::Inputs confirmed;
+                if (rotation_open) {
+                    const auto why = rotation_.opening ? rotation_entry_block(b, dir, rotation_.bar_ms, &confirmed)
+                                                       : "旧仓尚未确认平仓";
+                    if (!why.empty()) {
+                        b.pending = false;
+                        b.last_action = "换仓入场取消：" + why;
+                        log(b.cfg.symbol + " " + b.last_action);
+                        return;
+                    }
+                    cfg.rule.following.close_confirm = true;
+                    rotation_volume = confirmed.vol_ratio;
+                    rotation_box = confirmed.box_atr;
+                }
                 if (cfg.rule.strategy == trend::Strategy::TrendFollowing) {
-                    entry_atr = b.atr;
-                    if (b.dc_ok) { edge_up = b.dc_up; edge_dn = b.dc_dn; }
+                    entry_atr = rotation_open ? confirmed.atr : b.atr;
+                    if (rotation_open) { edge_up = confirmed.dc_up; edge_dn = confirmed.dc_dn; }
+                    else if (b.dc_ok) { edge_up = b.dc_up; edge_dn = b.dc_dn; }
                 }
                 // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
                 // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
                 trend::Inputs si;
                 si.price      = price;
-                si.atr        = b.atr;
+                si.atr        = rotation_open ? confirmed.atr : b.atr;
                 si.swing_low  = b.swing_low;
                 si.swing_high = b.swing_high;
                 si.psar_prev_high = b.psar_prev_high;
@@ -1410,13 +1500,21 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 init_stop = trend::initial_stop(dir, price, cfg.rule, si);
             }
 
-            // 杠杆失败不拦下单：敞口由 qty×价格决定，与杠杆无关，错过入场的代价
-            // 更大。但必须让人看见——本地保证金估算会与实际不符
+            // Margin limits use the configured leverage. If it cannot be confirmed,
+            // cancel this entry; an unknown exchange setting cannot satisfy that limit.
             if (!client_->set_leverage(cfg.symbol, cfg.leverage)) {
-                // 带上原因：网络问题（超时 / 连接中断）还是交易所拒绝（附错误码），修法不同
                 const std::string why = client_->last_error();
+                {
+                    std::lock_guard<std::recursive_mutex> lk(mtx_);
+                    auto it = bots_.find(id);
+                    if (it != bots_.end()) {
+                        it->second.pending = false;
+                        it->second.last_action = "开仓取消：无法确认目标杠杆";
+                    }
+                }
                 log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " + std::to_string(cfg.leverage) + "x" +
-                    (why.empty() ? std::string() : "：" + why) + "），按交易所原有杠杆开仓");
+                    (why.empty() ? std::string() : "：" + why) + "），本次不开仓，等待重新确认");
+                return;
             }
 
             bool need_ds_sync = false;   // 成交后要不要挂灾难止损（派发在锁外）
@@ -1456,8 +1554,23 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 auto it = bots_.find(id);
                 if (it == bots_.end()) return;
                 auto& b = it->second;
-                std::string why = open_gate_block(b);
-                if (why.empty() && b.cfg.rule.following.enabled) {
+                std::string why = reentry_block(b, dir);
+                if (why.empty() && rotation_open) {
+                    trend::Inputs latest;
+                    why = rotation_entry_block(b, dir, rotation_.bar_ms, &latest);
+                    if (why.empty() && (latest.price != price || latest.atr != entry_atr ||
+                        !(latest.following.settings == cfg.rule.following) ||
+                        b.cfg.budget_usdt != cfg.budget_usdt || b.cfg.risk_usdt != cfg.risk_usdt ||
+                        b.cfg.size_mode != cfg.size_mode || b.cfg.leverage != cfg.leverage ||
+                        trend::initial_stop(dir, latest.price, b.cfg.rule, latest) != init_stop))
+                        why = "换仓下单前信号或报价已改变";
+                }
+                if (why.empty()) why = open_gate_block(b);
+                const auto quote_age = host_.now_steady() - b.price_time;
+                if (why.empty() && (quote_age < std::chrono::steady_clock::duration::zero() ||
+                                    quote_age > std::chrono::seconds(15)))
+                    why = "下单前报价已过期，等待最新报价";
+                if (why.empty() && !rotation_open && b.signal_following_config().enabled) {
                     trend::Inputs si;
                     si.price = b.current_price; si.atr = b.atr; si.dc_ok = b.dc_ok;
                     si.dc_up = b.dc_up; si.dc_dn = b.dc_dn; si.following = b.following;
@@ -1475,15 +1588,19 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 }
 
                 const double risk = qty * (std::fabs(price - init_stop) + price * risk_cost_rate_);
+                if (why.empty() && rotation_open && cfg.size_mode == TrendConfig::SizeMode::RiskBased &&
+                    risk > cfg.risk_usdt + 1e-9) why = "换仓下单前成本变化，超出单笔风险预算";
                 if (why.empty()) why = risk_gate_block(b, dir, risk);
                 if (!why.empty() || b.state == TrendBot::State::Stopped || b.retiring) {
                     b.pending = false;
                     b.last_action = "开仓取消：" + why;
+                    if (rotation_open) log(b.cfg.symbol + " 换仓" + b.last_action);
                     return;
                 }
                 b.reserved_risk = risk;
                 b.reserved_margin = qty * price / std::max(1, cfg.leverage);
                 b.reserved_dir = dir;
+                b.rotation_reserved = false; // from here, persistence must treat an unfinished open as unknown
             }
             auto r = client_->place_market_order(cfg.symbol, side_of(dir, false), qty, false);
 
@@ -1530,23 +1647,26 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
                 }
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  entry_bar, entry_atr, entry_edge > 0 ? entry_edge : 0);
+                b.reentry_after_ms = 0; // 只有实际开仓成交才消费等待状态。
+                b.rotation_health = {};
                 // 假突破从哪一根的收盘开始判：这根已经走到最后 1/4 才开仓的，留到下一根
                 b.st.fail_bar_ms = entry_bar;
                 if (bar_len > 0 && entry_bar > 0 && now_ms - entry_bar >= bar_len * 3 / 4 &&
                     now_ms - entry_bar < bar_len)
                     b.st.fail_bar_ms = entry_bar + bar_len;
-                // 数据记录层：开仓那一刻的名单信息与入场位置
+                // 数据记录层：开仓时间与入场位置
                 b.open_ms    = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    host_.now_wall().time_since_epoch()).count();
-                b.open_seg   = b.smart_list;
-                b.open_rank  = b.smart_rank;
-                b.open_score = b.smart_score;
                 b.trough     = fill;
                 b.open_stop  = b.st.stop;
                 b.open_vol_ratio = (entry_atr > 0 && b.vol_ratio > 0)
                                        ? b.vol_ratio : std::numeric_limits<double>::quiet_NaN();
                 b.open_box_atr   = (entry_atr > 0 && b.box_atr > 0)
                                        ? b.box_atr : std::numeric_limits<double>::quiet_NaN();
+                if (rotation_open) {
+                    b.open_vol_ratio = rotation_volume;
+                    b.open_box_atr = rotation_box;
+                }
                 b.open_taker     = (entry_atr > 0) ? b.taker_ratio
                                                               : std::numeric_limits<double>::quiet_NaN();
                 b.open_dist_atr = std::numeric_limits<double>::quiet_NaN();
@@ -1619,7 +1739,6 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
         } catch (...) {
             clear_pending_after_throw(id, "submit_open 未知异常");
         }
-    });
 }
 // ── 交易所侧硬止损（"保命单"）─────────────────────────────────────────────────
 //
@@ -1635,6 +1754,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
 // 这是取舍，不是遗漏——它的定位是【最大风险兜底】，不是第二条移动止损。
 void TrendEngine::clear_ds_runtime(TrendBot& b) {
     b.ds_vanished_price = 0;   // 属于刚关掉的那笔仓位
+    b.ds_vanished_id.clear();
     b.ds_attempts    = 0;
     b.ds_unprotected = false;
     b.ds_next_try    = {};
@@ -1907,7 +2027,93 @@ void TrendEngine::cancel_disaster_stop(const std::string& bot_id) {
 
 void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                              trend::Pos reverse_to) {
-    host_.submit([this, id, reason, reverse_to]() {
+    host_.submit([this, id, reason, reverse_to]() { execute_close(id, reason, reverse_to); });
+}
+
+void TrendEngine::verify_external_close(const std::string& id) {
+    try {
+        TrendBot before;
+        {
+            std::lock_guard<std::recursive_mutex> lk(mtx_);
+            const auto it = bots_.find(id);
+            if (it == bots_.end()) return;
+            before = it->second;
+        }
+        auto stop_id = before.ds_vanished_id.empty() ? before.disaster_stop_id : before.ds_vanished_id;
+        auto evidence = client_->verify_close(before.cfg.symbol, side_of(before.st.pos, false), stop_id);
+        // A canceled old stop may have been replaced before the replacement filled.
+        // Check that replacement too; absence from the active list proves neither fill.
+        if (evidence.position_known && evidence.remaining_qty == 0 && !evidence.protective_fill.ok &&
+            !before.disaster_stop_id.empty() && before.disaster_stop_id != stop_id) {
+            stop_id = before.disaster_stop_id;
+            evidence = client_->verify_close(before.cfg.symbol, side_of(before.st.pos, false), stop_id);
+        }
+        TrendTrade trade;
+        bool emit = false, cancel_live_stop = false;
+        {
+            std::lock_guard<std::recursive_mutex> lk(mtx_);
+            auto it = bots_.find(id);
+            if (it == bots_.end()) return;
+            auto& b = it->second;
+            b.pending = false;
+            if (b.qty != before.qty || b.st.pos != before.st.pos) return;
+            if (!evidence.position_known || !std::isfinite(evidence.remaining_qty) || evidence.remaining_qty != 0) {
+                const auto message = evidence.position_known ?
+                    "平仓被拒，已确认仍有持仓；保留跟踪和保护单" : "平仓被拒且持仓未确认；保留跟踪和保护单";
+                if (!evidence.position_known) b.needs_reconcile = true;
+                if (b.last_action != message) log(b.cfg.symbol + " " + message);
+                b.last_action = message;
+                return;
+            }
+            const auto& fill = evidence.protective_fill;
+            const bool planned = fill.ok && !fill.uncertain && std::isfinite(fill.executed_qty) &&
+                fill.executed_qty >= b.qty - std::max(1.0, b.qty) * 1e-12 &&
+                std::isfinite(fill.avg_price) && fill.avg_price > 0;
+            if (planned) {
+                trade.symbol = b.cfg.symbol;
+                trade.side = b.st.pos;
+                trade.entry_price = b.st.entry_price;
+                trade.exit_price = fill.avg_price;
+                trade.qty = b.qty;
+                trade.pnl = (fill.avg_price - b.st.entry_price) * b.qty * (b.st.pos == trend::Pos::Long ? 1 : -1);
+                trade.reason = "交易所硬止损触发（已核对实际成交）";
+                trade.close_time = host_.now_wall();
+                fill_trade_meta(trade, b);
+                b.realized_pnl += trade.pnl;
+                ++b.trade_count;
+                if (trade.pnl > 0) ++b.win_count;
+                book_day(trade.pnl, trade.entry_price, trade.exit_price, trade.qty);
+                b.last_action = "硬止损成交已核对，等待新收盘突破";
+                emit = true;
+            } else {
+                b.state = TrendBot::State::Stopped;
+                b.last_action = "已确认交易所无仓位；实际成交与盈亏待核对";
+            }
+            // A different live stop can remain after an earlier stop fired. Cancel it only
+            // after the position query confirms zero; never cancel protection on rejection alone.
+            cancel_live_stop = !b.disaster_stop_id.empty() && (!planned || b.disaster_stop_id != stop_id);
+            if (!cancel_live_stop) { b.disaster_stop_id.clear(); b.disaster_stop_price = 0; }
+            trend::on_closed(b.st);
+            start_reentry_wait(b);
+            clear_ds_runtime(b);
+            b.ds_vanished_id.clear();
+            b.qty = 0;
+            b.needs_reconcile = false;
+            b.last_pos_change = host_.now_steady();
+            log(b.cfg.symbol + " " + b.last_action);
+        }
+        if (cancel_live_stop) cancel_disaster_stop(id);
+        if (emit && trade_cb_) trade_cb_(trade);
+    } catch (const std::exception& e) {
+        clear_pending_after_throw(id, "平仓核对失败，保留持仓: " + std::string(e.what()));
+    } catch (...) {
+        clear_pending_after_throw(id, "平仓核对失败，保留持仓");
+    }
+}
+
+void TrendEngine::execute_close(const std::string& id, const std::string& reason,
+                               trend::Pos reverse_to, bool* fully_closed) {
+    if (fully_closed) *fully_closed = false;
         try {
             TrendConfig cfg;
             double qty_have = 0, entry = 0, price = 0, atr = 0;
@@ -1946,58 +2152,36 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 return;
             }
 
+            if (fully_closed) {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto held = bots_.find(id);
+                auto next = bots_.find(rotation_.incoming);
+                if (held == bots_.end()) return;
+                // Another holding may have exited while quantity precision was being fetched.
+                if (next != bots_.end() && open_gate_block(next->second).empty()) {
+                    held->second.pending = false;
+                    *fully_closed = true; // a natural free slot; no replacement close required
+                    log("满仓换仓：已有自然空位，取消旧仓平仓");
+                    return;
+                }
+                const auto why = rotation_close_block(held->second);
+                if (!why.empty() || held->second.qty != qty_have || held->second.st.pos != pos) {
+                    held->second.pending = false;
+                    log("满仓换仓取消平仓：" + (why.empty() ? "旧仓数量或方向已改变" : why));
+                    return;
+                }
+            }
             auto r = client_->place_market_order(cfg.symbol, side_of(pos, true), qty, true);
 
             bool closed_ok = false;
             double exit_px = price, closed_qty = 0;
-            bool external_gone =
-                (!r.ok && r.error.find("[-2022]") != std::string::npos);
-
-            // ⚠ -2022 最常见的成因其实是【我们自己挂的那张硬止损被触发了】，
-            //   而那是一次【计划内的出场】，不是异常。
-            //
-            //   为什么它会先触发：交易所那张单用【标记价】连续触发，本地止损线
-            //   用的是 3 秒一次的采样价。硬止损挂在本地线之外一点点（实盘那次
-            //   只有 0.20%），价格快速穿过时，标记价往往已经走到硬止损上，
-            //   而我们这一拍才刚看到本地线被破。于是：交易所先平 ⇒ 本地再去
-            //   reduceOnly 平仓 ⇒ -2022。
-            //
-            //   实盘 2026-10-01：
-            //     08:50:17 QNTUSDT 开空 @288.69 止损线=292.36
-            //     08:50:17 硬止损已挂 @292.9447（只高出 0.20%）
-            //     08:56:07 平仓被拒(-2022) ⇒ 清空本地状态并【停止该bot】
-            //
-            //   把自己计划内的止损出场当成"需要人工核对的异常"并停掉 bot，
-            //   是这套设计里最劝退的一处：策略本该止损出场、等下一个信号，
-            //   结果变成要人去点一下"继续"。
-            //
-            //   判据：挂过硬止损，而它现在已经不在活跃委托列表里 ⇒ 它触发了。
-            //   ⚠ 必须判 ok —— 拉取失败时列表是空的，那会让【任何】一次 -2022
-            //     都被认成"我们的止损触发了"，于是真正的手动平仓/强平也被当成
-            //     计划内出场而让 bot 继续跑。又是"没拿到当成没有"那个老毛病。
-            bool own_stop_fired = false;
-            std::string ds_id_snap;
-            double ds_trigger_snap = 0;
-            if (external_gone) {
-                {
-                    std::lock_guard<std::recursive_mutex> lk(mtx_);
-                    auto it0 = bots_.find(id);
-                    if (it0 != bots_.end()) {
-                        ds_id_snap      = it0->second.disaster_stop_id;
-                        ds_trigger_snap = it0->second.disaster_stop_price;
-                    }
-                }
-                if (!ds_id_snap.empty()) {
-                    bool live_ok = false;
-                    const bool still_live =
-                        client_->is_disaster_stop_live(cfg.symbol, ds_id_snap, &live_ok);
-                    // 查到了、而且它已经不在活跃委托里 ⇒ 它触发了
-                    own_stop_fired = (live_ok && !still_live);
-                }
+            if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
+                verify_external_close(id);
+                return; // Rejection is never proof of a completed rotation close.
             }
 
-            if (r.ok) {
-                closed_qty = r.executed_qty;
+            if (r.ok && !r.uncertain) {
+                closed_qty = std::isfinite(r.executed_qty) ? std::min(qty, r.executed_qty) : 0;
                 closed_ok  = closed_qty > 0;
                 if (r.avg_price > 0) exit_px = r.avg_price;
             }
@@ -2007,79 +2191,13 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
             // 要不要撤掉交易所侧那张单。真正的撤单在锁外做——它是 HTTP，
             // 持着 mtx_ 发请求会把 tick / get_bots / 对账全卡住
             bool need_ds_cancel = false;
-            // -2022（交易所侧已无仓位）那条路本该直接 return，但撤单必须在锁外，
-            // 所以改成标记 + 跳过后续，出锁之后统一处理
-            bool ds_only_cancel = false;
+            bool partial_close = false;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
                 if (it == bots_.end()) return;
                 auto& b = it->second;
 
-                if (external_gone && own_stop_fired) {
-                    // 我们自己那张硬止损触发了 ⇒ 计划内的止损出场。
-                    // 按正常出场记一笔账，然后【让 bot 继续跑】去等下一个信号。
-                    //
-                    // 成交价拿触发价当近似：STOP_MARKET 触发后以市价成交，
-                    // 实际价会有滑点。这里不去查真实成交明细（要多一条
-                    // 算法单历史的接口），但【必须在日志和原因里标明是近似】，
-                    // 否则这笔盈亏看起来和本地平仓一样精确
-                    const double ds_entry = b.st.entry_price;
-                    const double ds_sign  = (pos == trend::Pos::Long) ? 1.0 : -1.0;
-                    const double px       = (ds_trigger_snap > 0) ? ds_trigger_snap : price;
-                    const double q        = b.qty;
-                    const double pnl      = (px - ds_entry) * q * ds_sign;
-
-                    tr.symbol      = cfg.symbol;
-                    tr.side        = pos;
-                    tr.entry_price = ds_entry;
-                    tr.exit_price  = px;
-                    tr.qty         = q;
-                    tr.pnl         = pnl;
-                    tr.reason      = "交易所硬止损触发（成交价为近似值）";
-                    tr.reversed    = false;
-                    tr.close_time  = host_.now_wall();
-                    fill_trade_meta(tr, b);
-                    emit_trade = true;
-
-                    b.realized_pnl += pnl;
-                    ++b.trade_count;
-                    if (pnl > 0) ++b.win_count;
-                    book_day(pnl, ds_entry, px, q);
-
-                    // 那张单已经成交了，不用撤（撤一张已成交的单只会白报一个错）
-                    need_ds_cancel = false;
-                    trend::on_closed(b.st);
-                    clear_ds_runtime(b);
-                    b.qty = 0;
-                    b.last_pos_change = host_.now_steady();
-                    b.pending = false;
-                    // ⚠ 关键：【不停 bot】。这是计划内的止损出场，和本地止损线
-                    //   触发平仓没有任何区别，唯一的差别是谁先动手。
-                    //   停掉等于让用户去点"继续"才能恢复交易
-                    b.last_action = "交易所硬止损出场 " + fmt(pnl, 2) + "U";
-                    // 一行即可。为什么会先触发：交易所用标记价连续触发、本地 3 秒采样
-                    log(cfg.symbol + " 交易所硬止损先触发，按止损出场记账（价格按触发价 " +
-                        fmt(px) + " 估算），bot 继续运行");
-                    ds_only_cancel = true;   // 跳过后续的常规平仓分支
-                } else if (external_gone) {
-                    // 确实解释不了：没挂过硬止损、或那张单还在挂着（说明不是它平的）、
-                    // 或者查不到活跃委托列表（拿不到就不敢认）。
-                    // 手动平过 / 被强平都落在这里 —— 分不清就停下来让人看。
-                    // 本地留着幽灵仓会每 tick 重试一次 -2022，无限循环
-                    need_ds_cancel = !b.disaster_stop_id.empty();
-                    trend::on_closed(b.st);
-                    clear_ds_runtime(b);
-                    b.qty = 0;
-                    b.last_pos_change = host_.now_steady();
-                    b.pending = false;
-                    b.state = TrendBot::State::Stopped;
-                    b.last_action = "⚠ 交易所侧已无仓位，已停止待核对";
-                    log("⚠ " + cfg.symbol + " 交易所已无该仓位，且不是硬止损触发的"
-                        "（可能是手动平仓或强平）。已停止，请核对后手动恢复");
-                    ds_only_cancel = true;   // 不能在这里 return：撤单要在锁外
-                }
-                if (!ds_only_cancel) {
                 if (!closed_ok) {
                     // 含 uncertain：reduceOnly 天然幂等，若实际已平，下个 tick
                     // 重试会被交易所拒绝并走上面的 -2022 分支。重试是安全的
@@ -2109,13 +2227,24 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 ++b.trade_count;
                 if (pnl > 0) ++b.win_count;
                 book_day(pnl, entry, exit_px, closed_qty);
+                if (closed_qty < b.qty - std::max(1.0, b.qty) * 1e-12) {
+                    // 部分平仓继续保护剩余仓位，不能开始空仓等待或反向开仓。
+                    b.qty -= closed_qty;
+                    b.pending = false;
+                    b.last_pos_change = host_.now_steady();
+                    b.last_action = "部分平仓，继续管理剩余仓位";
+                    tr.reversed = false;
+                    partial_close = true; // 发出成交记录后返回，不反手。
+                } else {
                 // 仓位已清空，撤掉交易所侧那张单。不撤的话它会留在挂单列表里，
                 // 而 closePosition 单同方向只能有一张——下一轮开仓再挂会被拒
                 need_ds_cancel = !b.disaster_stop_id.empty();
                 trend::on_closed(b.st);
+                start_reentry_wait(b);
                 clear_ds_runtime(b);
                 b.qty = 0;
                 // 平仓同样要打时间戳：旧快照里这笔仓位还在，会被报成"孤儿仓"
+                if (fully_closed && !r.uncertain) *fully_closed = true;
                 b.last_pos_change = host_.now_steady();
 
                 std::ostringstream ss;
@@ -2131,15 +2260,12 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
                 }
                 // reverse_to != Flat 时【保持 pending=true】，紧接着开反向，
                 // 整段不放开，别的 tick 插不进来
-                }   // ← if (!ds_only_cancel)
+                }   // 完全平仓
             }       // ← mtx_ 在此释放
-            // 撤单放在锁外。ds_only_cancel 时后面的反手/回调一律跳过——
-            // 仓位在交易所侧已经没了，没有可平的也没有可反的
+            // 完全平仓才撤保护；部分平仓发完成交记录后返回，不反手。
             if (need_ds_cancel) cancel_disaster_stop(id);
-            // 成交回调要在 ds_only_cancel 的 return 之前：硬止损先触发那一笔也是成交，
-            // 以前排在后面，这类出场从没进过成交记录（trades.csv / 成交历史）
             if (emit_trade && trade_cb_) trade_cb_(tr);
-            if (ds_only_cancel) return;
+            if (partial_close) return;
 
             if (reverse_to != trend::Pos::Flat) {
                 // ⚠ 这道闸原本是无条件的 atr<=0，那是只有趋势跟踪一个策略时留下的。
@@ -2166,7 +2292,6 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
         } catch (...) {
             clear_pending_after_throw(id, "submit_close 未知异常");
         }
-    });
 }
 
 } // namespace ccbot

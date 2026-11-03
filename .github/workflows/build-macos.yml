@@ -1,8 +1,4 @@
-# 云端构建 macOS 版（Apple Silicon + Intel 双架构）：手动触发 或 推送 v* 标签时自动跑。
-# 产物：tradingbot-<版本>-macos-arm64.zip / -x64.zip（各含 GUI + headless 两个可执行文件），
-# 标签构建产物供下载检查，正式 Release 附件单独核验后发布。
-# 注意：产物未做 Apple 签名/公证，下载后需要:
-#   chmod +x TradingBot ccbot_headless && xattr -dr com.apple.quarantine .
+# macOS 原生双架构构建；GUI 为 .app，headless 为命令行程序。
 name: build-macos
 
 on:
@@ -24,12 +20,13 @@ jobs:
       matrix:
         include:
           - arch: arm64            # Apple Silicon（M系列）
-            runner: macos-latest
+            runner: macos-15
             triplet: arm64-osx
           - arch: x64              # Intel Mac
             runner: macos-15-intel
             triplet: x64-osx
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -57,6 +54,7 @@ jobs:
         run: |
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.4 \
             -DCCBOT_WERROR=ON \
             -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
@@ -87,38 +85,25 @@ jobs:
 
       # 全部测试套件。此前只跑指标那一套，风控闸门/资金费/限流/订单路径/凭证存储
       # 五套都没跑过——测试写了却没人守着
+
       - name: Run all test suites
-        run: |
-          set -e
-          for t in ccg_indicator_tests ccg_key_store_tests \
-                   ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests \
-                   ccg_trend_stress_tests \
-                   ccg_config_tests ccg_timesync_tests ccg_pool_tests \
-                   ccg_rest_feed_tests ccg_app_logic_tests \
-                   ccg_smart_tests ccg_smart_runner_tests ccg_journal_tests; do
-            echo "── $t ──"
-            ./build/$t
-          done
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 2
 
       - name: Package
         run: |
           mkdir -p pkg
-          cp build/TradingBot build/ccbot_headless pkg/
+          cmake --install build --prefix "$PWD/pkg"
+          codesign --force --deep --sign - pkg/TradingBot.app
+          python3 tools/check_unix_package.py pkg --platform macos --arch ${{ matrix.arch }}
+          codesign --verify --deep --strict pkg/TradingBot.app
 
       # 硬门禁：白名单校验 + 内嵌版本号核对。mac 包此前完全没有这一步
       - name: Leak check (hard gate)
         run: |
-          VER=""
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
-          if [ -n "$VER" ]; then
-            python3 tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot
-          else
-            python3 tools/leak_check.py pkg
-          fi
+          VER="$(python3 tools/release_metadata.py --version)"
+          python3 tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot.app/Contents/MacOS/TradingBot
+          python3 tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless
 
-      # 包名带版本号，与 Windows/Linux 两条对齐。此前 mac 包叫 tradingbot-macos-arm64.zip，
-      # 下载到本地就分不清是哪一版了——Release 页面上三个包应该是同一套命名
       - name: Include documentation and dependency licenses
         shell: bash
         run: |
@@ -133,16 +118,17 @@ jobs:
             cp "$notice" "pkg/licenses/$dep/"
           done
 
+      - name: Record source and dependencies
+        run: python3 tools/release_metadata.py --package pkg --triplet ${{ matrix.triplet }}
+
       - name: Zip
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
-          [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
+          VER="$(python3 tools/release_metadata.py --version)"
           cd pkg && zip -r "../tradingbot-$VER-macos-${{ matrix.arch }}.zip" . && cd ..
           ls -la tradingbot-*.zip
 
       # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-macos-${{ matrix.arch }}

@@ -10,15 +10,8 @@
 // 数据记录层：把实盘里"事后要拿来分析"的东西写成 CSV，用来校准智能模式与过滤规则。
 // 只写不读、不参与任何交易决策；写失败就丢掉这一行，绝不影响交易。
 //
-// 目录 <数据目录>/journal 下四类文件（UTF-8 带 BOM，Excel 直接打开不乱码）：
-//   trades.csv            每笔平仓：开仓时所在的段/分数、入场离通道边沿多少 ATR、持仓时长……
-//   pool.csv              候选池事件：加入 / 移出 / 换方向，带原因
-//   scan-YYYYMMDD.csv     每轮扫描的完整名单快照（全部合格币的指标、分数、所在段、收盘价，
-//                         主动买入占比、持仓量及其 1/4/24h 变化）
-//                         ——事后拿后续快照里的价格对照，看高分币是不是真的走得更好
-// 新版本加列时老文件表头对不上：改名成 xxx-old-时间.csv 留着，另起一份
-//   filter-YYYYMMDD.csv   被过滤掉的突破（每 bot 每根K线最多一条）——事后看它后来怎么走
-// 按日的几类保留 keep_days 天（默认 60），每天第一次写时清理更早的。时间一律 UTC
+// CSV 记录交易、候选变更、扫描快照及被过滤的突破；表头改变时自动归档旧文件。
+// 扫描保留 ATR、收盘价与 OI 观察值，不包含候选排名或分数。
 namespace ccbot {
 
 class Journal {
@@ -28,9 +21,9 @@ public:
     void trade (const TrendTrade& t);
     void filter(const FilterEvent& e);
     void pool  (int64_t ms, const std::string& symbol, const std::string& event,
-                char seg, int rank, double score, const std::string& reason);
+                const std::string& reason);
     // oi：合格币的持仓量（没拿到的不在里面，那几列留空）
-    void scan  (int64_t ms, const smart::Ranking& rk, const smart::Segmented& sg,
+    void scan  (int64_t ms, const std::map<std::string, smart::Features>& candidates,
                 const std::set<std::string>& with_bot,
                 const std::map<std::string, smart::OiStat>& oi = {});
     const std::string& dir() const { return dir_; }

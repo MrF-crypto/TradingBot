@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.0.0 LANGUAGES CXX)
+project(TradingBot VERSION 1.3.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,7 +33,7 @@ option(CCBOT_WERROR "把编译警告当作错误（CI 门禁用）" OFF)
 # 为什么这是本项目最该补的一项验证：trend_engine.cpp 有 27 处 mutex/atomic、
 # rest_price_feed.cpp 还多一个轮询线程，而并发缺陷是所有缺陷里唯一会
 # "看起来一切正常，直到某天对不上账"的一类——单元测试全绿也证明不了它不存在。
-# TSan 能证明。
+# TSan 检查已执行路径中的数据竞争，不能证明所有路径都没有竞争。
 #
 # address 与 thread 互斥，必须分两次构建（编译器会直接拒绝同时给）。
 # undefined 可以搭着 address 一起。
@@ -90,12 +90,23 @@ endfunction()
 
 find_package(simdjson CONFIG REQUIRED)
 find_package(CURL REQUIRED)
-find_package(MbedTLS CONFIG REQUIRED)
+find_package(MbedTLS CONFIG QUIET)
+if(NOT TARGET MbedTLS::mbedcrypto)
+    # Some Linux distribution packages provide headers/libs without a CMake config.
+    # The framework uses only mbedcrypto (HMAC); TLS transport belongs to libcurl.
+    find_path(CCBOT_MBEDTLS_INCLUDE_DIR mbedtls/md.h REQUIRED)
+    find_library(CCBOT_MBEDCRYPTO_LIBRARY NAMES mbedcrypto REQUIRED)
+    add_library(MbedTLS::mbedcrypto UNKNOWN IMPORTED)
+    set_target_properties(MbedTLS::mbedcrypto PROPERTIES
+        IMPORTED_LOCATION "${CCBOT_MBEDCRYPTO_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${CCBOT_MBEDTLS_INCLUDE_DIR}")
+endif()
 find_package(Threads REQUIRED)
 
 # ── 核心引擎/网络代码：GUI 版和无界面(headless)版共用，不含任何 Qt/Windows 专属代码 ──
 set(CORE_SOURCES
-    src/core/trend_engine.cpp
+    src/core/monitor_checkpoint.cpp
+    src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
     src/core/funding_ledger.cpp
     src/core/smart_mode.cpp
     src/core/journal.cpp
@@ -115,7 +126,7 @@ set(CORE_LIBS
 
 # ── GUI 版（Qt Widgets，Windows / macOS）──────────────────────────────────────
 if(CCBOT_BUILD_GUI)
-    find_package(Qt6 COMPONENTS Widgets REQUIRED)
+    find_package(Qt6 6.3 COMPONENTS Widgets REQUIRED)
 
     # 图标资源。app.qrc（窗口/任务栏图标，AUTORCC 编译）两个平台都要；
     # app.rc（exe 文件本身的图标）是 Windows 资源脚本，只有 MSVC 认
@@ -128,12 +139,13 @@ if(CCBOT_BUILD_GUI)
     endif()
 
     # WIN32 关键字只在 Windows 生效（GUI 子系统，不带控制台窗口），macOS 上自动忽略
-    add_executable(TradingBot WIN32
+    qt_add_executable(TradingBot WIN32
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
         src/gui/trend_panel.cpp
         src/gui/smart_panel.cpp
+        src/gui/candidate_monitor.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
@@ -166,8 +178,20 @@ if(CCBOT_BUILD_GUI)
         # 密钥存储走系统钥匙串（key_store.cpp 的 __APPLE__ 分支）
         target_link_libraries(TradingBot PRIVATE
             "-framework Security" "-framework CoreFoundation")
-        # 本机 vcpkg 构建的 Qt 插件路径编译期已内置，构建机上直接运行即可，
-        # 无需像 Windows 那样拷贝 platform plugin
+        set_target_properties(TradingBot PROPERTIES
+            MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_GUI_IDENTIFIER "com.mrfcrypto.tradingbot"
+            MACOSX_BUNDLE_BUNDLE_NAME "TradingBot"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
+        install(TARGETS TradingBot BUNDLE DESTINATION .)
+        # vcpkg 的 macOS triplet 默认静态链接；qt_add_executable 负责静态插件导入。
+        # 使用共享 Qt 的源码构建也必须部署运行库，不能依赖构建机的插件目录。
+        get_target_property(_qt_core_type Qt6::Core TYPE)
+        if(_qt_core_type STREQUAL "SHARED_LIBRARY")
+            qt_generate_deploy_app_script(TARGET TradingBot OUTPUT_SCRIPT _deploy_script)
+            install(SCRIPT ${_deploy_script})
+        endif()
     endif()
 endif()
 
@@ -181,6 +205,7 @@ add_executable(ccbot_headless
 target_include_directories(ccbot_headless PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccbot_headless PRIVATE ${CORE_LIBS})
 target_compile_definitions(ccbot_headless PRIVATE ${CCBOT_VERSION_DEF})
+install(TARGETS ccbot_headless RUNTIME DESTINATION .)
 if(WIN32)
     target_link_libraries(ccbot_headless PRIVATE crypt32 ws2_32 wsock32)
     target_compile_definitions(ccbot_headless PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -205,7 +230,7 @@ if(MSVC)
     target_compile_options(ccg_trend_tests PRIVATE /utf-8)
 endif()
 
-add_executable(ccg_trend_engine_tests tests/test_trend_engine.cpp src/core/trend_engine.cpp)
+add_executable(ccg_trend_engine_tests tests/test_trend_engine.cpp src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp)
 target_include_directories(ccg_trend_engine_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_trend_engine_tests PRIVATE Threads::Threads)
 if(MSVC)
@@ -214,8 +239,9 @@ endif()
 
 # ── SAR 持久化与对账测试：守"引擎以为空仓而交易所有仓"这一类裸敞口 ───────────
 add_executable(ccg_trend_state_tests tests/test_trend_state.cpp
-                                   src/headless/trend_state.cpp
-                                   src/core/trend_engine.cpp)
+                                   src/core/smart_mode.cpp
+                                   src/headless/trend_state.cpp src/core/monitor_checkpoint.cpp
+                                   src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp)
 target_include_directories(ccg_trend_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_trend_state_tests PRIVATE simdjson::simdjson Threads::Threads)
 if(MSVC)
@@ -235,7 +261,7 @@ if(MSVC)
     target_compile_options(ccg_rest_feed_tests PRIVATE /utf-8)
 endif()
 
-add_executable(ccg_trend_stress_tests tests/test_trend_stress.cpp src/core/trend_engine.cpp)
+add_executable(ccg_trend_stress_tests tests/test_trend_stress.cpp src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp)
 target_include_directories(ccg_trend_stress_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_trend_stress_tests PRIVATE Threads::Threads)
 if(MSVC)
@@ -301,7 +327,7 @@ endif()
 # ── headless 配置解析测试：漏填的键必须回落到【引擎】默认值，不能各写各的 ──────
 add_executable(ccg_config_tests tests/test_config.cpp
                                 src/headless/headless_config.cpp
-                                src/core/trend_engine.cpp
+                                src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
                                 src/core/smart_mode.cpp)
 target_include_directories(ccg_config_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_config_tests PRIVATE simdjson::simdjson Threads::Threads)
@@ -331,7 +357,7 @@ endif()
 add_executable(ccg_smart_runner_tests tests/test_smart_runner.cpp
                                       src/app/smart_runner.cpp src/core/smart_mode.cpp
                                       src/core/journal.cpp
-                                      src/core/trend_engine.cpp
+                                      src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
                                       src/net/trading_client.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_smart_runner_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_smart_runner_tests PRIVATE ${CORE_LIBS})
@@ -385,6 +411,27 @@ foreach(t ${CCBOT_OWN_TARGETS})
 endforeach()
 
 enable_testing()
+if(TARGET TradingBot)
+    qt_add_executable(tradingbot_monitor_smoke tests/test_candidate_monitor.cpp src/gui/candidate_monitor.cpp
+        src/core/monitor_checkpoint.cpp src/core/smart_mode.cpp)
+    target_include_directories(tradingbot_monitor_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tradingbot_monitor_smoke PRIVATE Qt6::Widgets simdjson::simdjson)
+    ccbot_harden(tradingbot_monitor_smoke)
+    if(MSVC)
+        target_compile_options(tradingbot_monitor_smoke PRIVATE /utf-8)
+    endif()
+    add_test(NAME tradingbot_monitor_smoke COMMAND tradingbot_monitor_smoke)
+    set_tests_properties(tradingbot_monitor_smoke PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    if(WIN32 AND TARGET Qt6::QOffscreenIntegrationPlugin)
+        get_target_property(_offscreen_type Qt6::QOffscreenIntegrationPlugin TYPE)
+        if(_offscreen_type STREQUAL "MODULE_LIBRARY")
+            add_custom_command(TARGET tradingbot_monitor_smoke POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:tradingbot_monitor_smoke>/platforms"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>"
+                    "$<TARGET_FILE_DIR:tradingbot_monitor_smoke>/platforms/")
+        endif()
+    endif()
+endif()
 foreach(t ${CCBOT_OWN_TARGETS})
     if(t MATCHES "^ccg_.*_tests$")
         add_test(NAME ${t} COMMAND ${t})

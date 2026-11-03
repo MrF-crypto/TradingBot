@@ -3,7 +3,7 @@
 # 为什么值得单独一条流水线：本项目 trend_engine.cpp 有 27 处 mutex/atomic，
 # rest_price_feed.cpp 还多一个轮询线程，而并发缺陷是所有缺陷里唯一会
 # "看起来一切正常、单元测试全绿，直到某天对不上账"的一类。
-# 单元测试证明不了它不存在，TSan 能。
+# TSan 检查已执行路径的数据竞争，不能证明所有路径均安全。
 #
 # 只跑 Linux（1× 计费倍率）。本仓库是私有仓库、macOS runner 10× 倍率，
 # 每月提交预算有限——最严的那道门禁要放在最便宜的平台上。
@@ -54,7 +54,7 @@ jobs:
             #   没人提醒，正是上面那段注释担心的"降级成摆设"
             # ccg_smart_runner_tests：扫描用 parallel_for 开线程并发拉K线
             suites: ccg_trend_stress_tests ccg_pool_tests ccg_trend_engine_tests
-                    ccg_order_tests ccg_rest_feed_tests ccg_smart_runner_tests
+                    ccg_order_tests ccg_rest_feed_tests ccg_smart_runner_tests ccg_trend_state_tests
 
     name: ${{ matrix.name }}
     steps:

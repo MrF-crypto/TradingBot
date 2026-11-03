@@ -1,5 +1,6 @@
 #include "net/trading_client.h"
 #include "net/rate_gate.h"
+#include "net/url_encoding.h"
 #include "core/indicators.h"
 #include <curl/curl.h>
 #include <mbedtls/md.h>
@@ -755,12 +756,16 @@ std::vector<TradingClient::Position> TradingClient::fetch_positions(bool* ok) {
         //   也不要交出一份"少了几个仓位"的快照。下一轮会再拉一次
         double pos_amt = 0;
         bool   amt_ok  = false;
-        try { pos_amt = std::stod(std::string(amt_s)); amt_ok = true; } catch (...) {}
+        try {
+            size_t consumed = 0;
+            pos_amt = std::stod(std::string(amt_s), &consumed);
+            amt_ok = !sym.empty() && consumed == amt_s.size() && std::isfinite(pos_amt);
+        } catch (...) {}
         if (!amt_ok) {
             if (ok) *ok = false;
             continue;
         }
-        if (std::abs(pos_amt) < 1e-10) continue;
+        if (pos_amt == 0) continue;
 
         Position pos;
         pos.symbol    = std::string(sym);
@@ -814,7 +819,7 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     OrderResult r;
     r.client_order_id = client_order_id;
     auto resp = http_get(ep(Ep::Order),
-                         "symbol=" + sym + "&origClientOrderId=" + client_order_id +
+                         "symbol=" + url::encode(sym) + "&origClientOrderId=" + url::encode(client_order_id) +
                          "&recvWindow=5000");
     if (resp.empty()) { r.error = "无响应（" + net_why(last_error()) + "）"; r.uncertain = true; return r; }
 
@@ -934,12 +939,13 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         // 每次尝试用独立的 clientOrderId（-1111 重试是真正的新订单）
         const std::string coid = make_client_order_id();
         r.client_order_id = coid;
-        std::string body = "symbol=" + sym + "&side=" + side
+        std::string body = "symbol=" + url::encode(sym) + "&side=" + side
             + "&type=MARKET&quantity=" + fmt_qty(try_qty, try_step)
             + "&newClientOrderId=" + coid
             + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
-        auto resp = http_post(ep(Ep::Order), body);
+        long http_code = 0;
+        auto resp = http_post(ep(Ep::Order), body, &http_code);
 
         // -1021 就地重发：网络（尤其 TCP 隧道）的秒级停顿会让时间戳抵达时已超窗，
         // 而这类停顿是离散的、过去就好。时间戳在 http_post 内部每次重算，
@@ -952,7 +958,7 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
              ts_retry < kTimestampRetries && is_timestamp_reject(resp);
              ++ts_retry) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            resp = http_post(ep(Ep::Order), body);
+            resp = http_post(ep(Ep::Order), body, &http_code);
         }
 
         // 可疑响应统一走查单恢复：空响应（超时/断网）和"非空但不是JSON"（网关5xx
@@ -963,6 +969,16 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         simdjson::padded_string ps(resp);   // 必须活到 doc 使用结束（doc 内字符串指向此缓冲）
         bool suspicious = resp.empty();
         if (!suspicious && p.parse(ps).get(doc) != simdjson::SUCCESS) suspicious = true;
+        if (!suspicious) {
+            int64_t error_code = 0;
+            std::string_view message;
+            get_or_keep(doc["code"], error_code);
+            get_or_keep(doc["msg"], message);
+            // A valid JSON response can still mean the order was executed.
+            // Do not release reservations or submit another order until queried.
+            suspicious = error_code == -1006 || error_code == -1007 || error_code == -1000 ||
+                (http_code == 503 && message.find("Unknown error") != std::string_view::npos);
+        }
         if (suspicious) {
             for (int q = 0; q < 3; ++q) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(600));
@@ -1037,18 +1053,9 @@ bool TradingClient::fetch_position_mode(bool* ok) {
 // ——"拉取失败当成确实没有"。v5.9.3 正是用这条理由删掉了 close_position，漏了它。
 // 埋着已知缺陷的死代码比没有代码更糟：下一个要"全平"的人会找到它并继承这个 bug。
 bool TradingClient::set_leverage(const std::string& sym, int lev) {
-    // 这个品种已经成功设过同样的杠杆：不再发请求（每次开仓都设一遍是多余的 POST）。
-    // 用户在 App 上手动改了杠杆的话，本程序下一次开仓仍按缓存认为是 lev——
-    // 这和原来"设失败就按交易所原有杠杆开"的口径一样：敞口由数量决定，与杠杆无关
-    {
-        std::lock_guard<std::mutex> lk(lev_mtx_);
-        if (auto it = lev_set_.find(sym); it != lev_set_.end() && it->second == lev) {
-            tl_net_err.clear();
-            return true;
-        }
-    }
+    // Reconfirm each entry: another client may have changed leverage since the last one.
     auto resp = http_post(ep(Ep::Leverage),
-        "symbol=" + sym + "&leverage=" + std::to_string(lev));
+        "symbol=" + url::encode(sym) + "&leverage=" + std::to_string(lev));
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
@@ -1056,19 +1063,65 @@ bool TradingClient::set_leverage(const std::string& sym, int lev) {
         tl_net_err = net_why(tl_net_err);   // 网络层的原因已经在里面
         return false;
     }
-    bool ok = true;
-    int64_t code = 0;
-    if (doc["code"].get(code) == simdjson::SUCCESS && code != -4046 && code != 0) {
-        ok = false;
-        std::string msg;
-        binance_error(doc, msg);
-        tl_net_err = msg.empty() ? "[" + std::to_string(code) + "]" : msg;   // 交易所拒绝的原因
+    if (binance_error(doc, tl_net_err)) return false;
+    int64_t confirmed = 0;
+    if (doc["leverage"].get(confirmed) != simdjson::SUCCESS || confirmed != lev) {
+        tl_net_err = "交易所未确认目标杠杆";
+        return false;
     }
-    if (ok) {
-        std::lock_guard<std::mutex> lk(lev_mtx_);
-        lev_set_[sym] = lev;
-    }
-    return ok;
+    return true;
+}
+
+ITradingClient::CloseVerification TradingClient::verify_close(
+        const std::string& sym, const std::string& entry_side, const std::string& stop_id) {
+    CloseVerification result;
+    bool ok = false;
+    const auto positions = fetch_positions(&ok);
+    if (!ok) return result;
+    result.position_known = true;
+    const int direction = entry_side == "BUY" ? 1 : -1;
+    for (const auto& position : positions)
+        if (position.symbol == sym && position.direction == direction)
+            result.remaining_qty += position.qty;
+    if (result.remaining_qty > 0 || stop_id.empty()) return result;
+
+    // Query endpoints differ from the PM POST/DELETE endpoint.
+    const auto path = is_pm() ? "/papi/v1/um/algo/algoOrder" : "/fapi/v1/algoOrder";
+    const auto response = http_get(path, "algoId=" + url::encode(stop_id) + "&recvWindow=5000");
+    simdjson::dom::parser parser;
+    simdjson::dom::element algo;
+    const auto buffer = simdjson::padded_string(response);
+    if (parser.parse(buffer).get(algo) != simdjson::SUCCESS) return result;
+    std::string_view symbol, side, actual_id, algo_status;
+    int64_t algo_id = 0;
+    get_or_keep(algo["symbol"], symbol); get_or_keep(algo["side"], side);
+    get_or_keep(algo["algoId"], algo_id); get_or_keep(algo["algoStatus"], algo_status);
+    get_or_keep(algo["actualOrderId"], actual_id);
+    if (symbol != sym || side != (direction > 0 ? "SELL" : "BUY") ||
+        std::to_string(algo_id) != stop_id || actual_id.empty() ||
+        (algo_status != "FINISHED" && algo_status != "TRIGGERED")) return result;
+
+    const auto order_response = http_get(ep(Ep::Order), "symbol=" + url::encode(sym) +
+        "&orderId=" + url::encode(std::string(actual_id)) + "&recvWindow=5000");
+    simdjson::dom::parser order_parser;
+    simdjson::dom::element order;
+    const auto order_buffer = simdjson::padded_string(order_response);
+    if (order_parser.parse(order_buffer).get(order) != simdjson::SUCCESS) return result;
+    std::string_view status, order_symbol, order_side, position_side;
+    int64_t order_id = 0;
+    get_or_keep(order["status"], status); get_or_keep(order["symbol"], order_symbol);
+    get_or_keep(order["side"], order_side); get_or_keep(order["orderId"], order_id);
+    get_or_keep(order["positionSide"], position_side);
+    const double qty = parse_dbl_str(order, "executedQty"), price = parse_dbl_str(order, "avgPrice");
+    if (status != "FILLED" || order_symbol != sym || order_side != side ||
+        std::to_string(order_id) != actual_id ||
+        (position_side != "BOTH" && position_side != (direction > 0 ? "LONG" : "SHORT")) ||
+        !std::isfinite(qty) || qty <= 0 || !std::isfinite(price) || price <= 0) return result;
+    result.protective_fill.ok = true;
+    result.protective_fill.order_id = std::to_string(order_id);
+    result.protective_fill.avg_price = price;
+    result.protective_fill.executed_qty = qty;
+    return result;
 }
 
 // unsigned HTTP 三件套（http_post/put/del_unsigned）与 ListenKey 三件套
@@ -1096,7 +1149,7 @@ TradingClient::SymbolInfo TradingClient::get_symbol_info(const std::string& sym)
     }
 
     SymbolInfo info;
-    auto resp = http_get_public("/fapi/v1/exchangeInfo?symbol=" + sym);
+    auto resp = http_get_public("/fapi/v1/exchangeInfo?symbol=" + url::encode(sym));
     // 先按"没查成"起算，只有真的解析出了币安的应答才把它放下来。
     // 空响应、非 JSON（网关 HTML 页、被代理截断）都属于没查成 ——
     // 而"查成了但币安说没有这个品种"是另一回事，那是合法 JSON（-1121）
@@ -1310,7 +1363,7 @@ TradingClient::place_disaster_stop(const std::string& sym, double stop_price,
 
     std::ostringstream oss;
     oss << "algoType=CONDITIONAL"          // 必填，且只支持这一个值
-        << "&symbol=" << sym
+        << "&symbol=" << url::encode(sym)
         << "&side=" << close_side
         << "&type=STOP_MARKET"
         << "&triggerPrice=" << std::fixed << std::setprecision(price_dp) << stop_price
@@ -1437,7 +1490,7 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     //   于是【下一次开仓永远挂不上硬止损】，而本地只看到"挂单失败"。
     //   freqtrade 那边同期也踩到这个（"leaves orphaned conditional orders"）
     auto resp = http_del(ep(Ep::AlgoOrder),
-        "symbol=" + sym + "&algoId=" + order_id +
+        "symbol=" + url::encode(sym) + "&algoId=" + order_id +
         "&recvWindow=5000");
     if (resp.empty()) return false;
     simdjson::dom::parser p;
@@ -1453,38 +1506,36 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     return true;
 }
 
-bool TradingClient::is_disaster_stop_live(const std::string& /*sym*/,
-                                         const std::string& order_id, bool* ok) {
-    if (ok) *ok = false;
-    if (order_id.empty()) return false;
-    bool list_ok = false;
-    const auto live = fetch_open_algo_ids(&list_ok);
-    // ⚠ 拉取失败就老老实实说"不知道"。活跃列表在失败时是空的，而空集合会让
-    //   "这张单不在里面"成立 —— 调用方据此会把一次强平认成"我们的止损触发了"
-    if (!list_ok) return false;
-    if (ok) *ok = true;
-    return live.find(order_id) != live.end();
-}
-
 // ── K线拉取+解析（统一入口）─────────────────────────────────────────────────
 // 原先 fetch_indicators / fetch_trend 等几处各自拼一遍
 // URL、各自解析一遍数组，四份几乎相同的代码。改动 K 线口径时漏掉一处就会出现
 // "指标和趋势用的不是同一批数据"这种极难查的问题，所以合成一处。
 // 只要收盘价的调用方多解析 4 个字段，几百根 K 线的开销可以忽略。
 std::vector<TradingClient::Bar> TradingClient::fetch_klines(
-        const std::string& sym, const std::string& interval, int limit) {
+        const std::string& sym, const std::string& interval, int limit, int64_t end_ms) {
     std::vector<Bar> out;
-    std::string path = "/fapi/v1/klines?symbol=" + sym +
+    std::string path = "/fapi/v1/klines?symbol=" + url::encode(sym) +
                        "&interval=" + interval +
                        "&limit=" + std::to_string(std::min(std::max(limit, 1), 1500));
-    auto resp = http_get_public(path);
+    if (end_ms > 0) path += "&endTime=" + std::to_string(end_ms);
+    long http_code = 0;
+    auto resp = http_get_public(path, false, false, &http_code);
     if (resp.empty()) return out;
 
     simdjson::dom::parser p;
-    simdjson::dom::array arr;
+    simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
-
+    if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
+        if (tl_net_err.empty()) tl_net_err = "K线响应不是有效JSON";
+        return out;
+    }
+    if (doc.is_object() && binance_error(doc, tl_net_err)) return out;
+    simdjson::dom::array arr;
+    if (http_code != 200 || doc.get_array().get(arr) != simdjson::SUCCESS) {
+        if (tl_net_err.empty()) tl_net_err = "K线响应格式无效（HTTP " + std::to_string(http_code) + "）";
+        return out;
+    }
+    if (arr.size() == 0) { tl_net_err = "交易所未返回K线"; return out; }
     out.reserve(arr.size());
     for (auto kline : arr) {
         simdjson::dom::array ka;
@@ -1553,16 +1604,56 @@ static int interval_seconds(const std::string& iv) {
 // ── 趋势信号快照（ATR + 唐奇安通道）──────────────────────────────────────────
 TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         const std::string& sym, const std::string& interval,
-        int donchian_period, int atr_period, const following::Config& follow) {
+        int donchian_period, int atr_period, const following::Config& follow, int64_t resume_after_ms) {
     TrendSnapshot out;
-    if (donchian_period <= 0 || atr_period <= 0) return out;
+    const auto fail = [](std::string reason) {
+        TrendSnapshot failed; failed.error = std::move(reason); return failed;
+    };
+    if (donchian_period <= 0 || atr_period <= 0) return fail("通道或ATR周期参数无效");
 
     // 通道要 period+1 根（+1 是被排除的当前根）；ATR 的 Wilder 平滑要预热，
     // 只喂 period+1 根拿到的是 seed 而不是稳定值，所以额外多给 3 倍周期
     const int need = std::max({donchian_period + 1, atr_period * 4,
                                follow.enabled ? follow.slow_period * 3 + follow.slope_bars : 0}) + 5;
-    auto bars = fetch_klines(sym, interval, need);
-    if (bars.empty()) return out;
+    const int64_t period = static_cast<int64_t>(interval_seconds(interval)) * 1000;
+    const int64_t current_bar = period > 0 ? ts_ms() / period * period : 0;
+    int extra = follow.enabled ? 32 : 0;
+    int64_t target_bar = current_bar;
+    if (follow.enabled && resume_after_ms > 0 && period > 0) {
+        if (resume_after_ms > current_bar || resume_after_ms % period != 0)
+            return fail("监控断点与当前K线周期/时间不一致，等待核对");
+        extra = static_cast<int>(std::min<int64_t>(256, (current_bar - resume_after_ms) / period));
+        target_bar = resume_after_ms + extra * period;
+    }
+    auto bars = fetch_klines(sym, interval, need + extra,
+                            target_bar < current_bar ? target_bar + period - 1 : 0);
+    if (bars.empty()) return fail("K线请求失败：" + net_why(last_error()));
+    if (follow.enabled) {
+        if (period <= 0 || bars.back().open_ms != target_bar)
+            return fail("交易所返回的K线未到目标时间，等待更新");
+        if (bars.size() < static_cast<size_t>(need))
+            return fail("K线数据不足：返回" + std::to_string(bars.size()) + "根，指标预热需" + std::to_string(need) + "根");
+        for (size_t i = 1; i < bars.size(); ++i)
+            if (bars[i].open_ms - bars[i - 1].open_ms != period)
+                return fail("K线时间不连续，保留断点等待补齐");
+        for (size_t i = static_cast<size_t>(need - 1); i < bars.size(); ++i) {
+            if (resume_after_ms > 0 && bars[i].open_ms <= resume_after_ms) continue;
+            std::vector<indicators::Ohlc> window;
+            std::vector<double> vols;
+            for (size_t j = i + 1 - need; j <= i; ++j) {
+                const auto& bar = bars[j];
+                window.push_back({bar.high, bar.low, bar.close, bar.open}); vols.push_back(bar.volume);
+            }
+            const auto signal = following::compute_model(window, vols, follow, donchian_period, atr_period);
+            if (!signal.ready) return fail("历史K线无法计算EMA/ATR：数据无效或波动不足，保留断点");
+            out.history.push_back({bars[i].open_ms, bars[i - 1].close, signal});
+        }
+        out.history_target_ms = current_bar;
+        out.history_only = target_bar < current_bar;
+        if (out.history_only) return out;
+        // Keep exactly the same indicator horizon online and during backfill.
+        if (bars.size() > static_cast<size_t>(need)) bars.erase(bars.begin(), bars.end() - need);
+    }
 
     out.price       = bars.back().close;
     out.bar_open_ms = bars.back().open_ms;
@@ -1630,6 +1721,7 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
                 out.following.ready = out.dc_ok = false;
     }
     out.ok = (out.atr > 0 && out.dc_ok && out.price > 0);
+    if (!out.ok) out.error = "当前K线指标未就绪或已跨周期，等待下一次刷新";
     return out;
 }
 
@@ -1827,7 +1919,7 @@ std::vector<TradingClient::OiPoint> TradingClient::fetch_oi_hist(
     std::vector<OiPoint> out;
     if (wall_now_ms() < data_api_cool_until_ms_.load()) return out;
     long code = 0;
-    auto resp = http_get_public("/futures/data/openInterestHist?symbol=" + sym + "&period=" + period +
+    auto resp = http_get_public("/futures/data/openInterestHist?symbol=" + url::encode(sym) + "&period=" + period +
                                 "&limit=" + std::to_string(std::min(std::max(limit, 1), 500)),
                                 false, /*own_limit*/ true, &code);
     // 这组接口单独限流：超了就整组停 5 分钟（窗口就是 5 分钟），其余请求不受影响
@@ -1857,7 +1949,7 @@ std::vector<TradingClient::OiPoint> TradingClient::fetch_oi_hist(
 
 TradingClient::PremiumInfo TradingClient::fetch_premium(const std::string& sym) {
     PremiumInfo info;
-    auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + sym);
+    auto resp = http_get_public("/fapi/v1/premiumIndex?symbol=" + url::encode(sym));
     if (resp.empty()) return info;
     simdjson::dom::parser p;
     simdjson::dom::element doc;
@@ -1966,7 +2058,7 @@ TradingClient::fetch_funding_income(int64_t start_ms, int64_t end_ms,
                                      const std::string& sym) {
     std::vector<FundingRecord> out;
     std::string params = "incomeType=FUNDING_FEE&limit=1000";
-    if (!sym.empty())   params += "&symbol=" + sym;
+    if (!sym.empty())   params += "&symbol=" + url::encode(sym);
     if (start_ms > 0)   params += "&startTime=" + std::to_string(start_ms);
     if (end_ms   > 0)   params += "&endTime="   + std::to_string(end_ms);
     params += "&recvWindow=5000";

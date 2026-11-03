@@ -1,6 +1,6 @@
 # 趋势跟踪框架与升级基线
 
-> 后续升级：当前趋势算法与风险预算见 [趋势跟踪 V1](TREND_FOLLOWING_V1.zh-CN.md)，本文保留框架清理阶段的结构说明。
+> 历史基线：本文保留框架清理阶段的结构与参数，不代表当前运行行为。当前趋势算法、风险预算及 v1.1.0 统一候选池见 [趋势跟踪 V1](TREND_FOLLOWING_V1.zh-CN.md)；当前已移除本文所述的评分、Mixed / Breakout 分榜与排名淘汰。
 
 更新日期：2026-10-31。上游基线为 CCBot v5.11.0，提交 `f740fd8f6851bc5fbac100dcde1a6e9faa2d1c15`。本次整理与升级作为独立项目 [TradingBot](https://github.com/MrF-crypto/TradingBot) 的 v1.0.0 发布；保留上游提交历史与 MIT 许可。
 

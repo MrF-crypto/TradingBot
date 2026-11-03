@@ -4,6 +4,7 @@
 // 一旦发生，下一个突破信号会再开一笔，净敞口翻倍，且原来那笔没有任何止损线
 // 守着。DCA 版丢状态只是少了摊薄记录，SAR 版丢状态是直接的裸敞口。
 #include "headless/trend_state.h"
+#include "core/monitor_state.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,8 +69,16 @@ static std::vector<std::string> reconcile(
     return e.reconcile_positions(ex, std::chrono::milliseconds(0));
 }
 
+#include "audit_state_scenarios.h"
 int main() {
+    test_audit_state_scenarios();
     const std::string path = "trend_state_test.json";
+    {
+        write_file(path, R"([{"symbol":"LEGACYUSDT","pos":0,"qty":0}])");
+        const auto migrated = load_trend_state(path, {mk_cfg("LEGACYUSDT")});
+        check(migrated.size() == 1 && migrated[0].needs_reconcile,
+              "legacy files also require exchange reconciliation before new entries");
+    }
 
     // ── 往返精度：止损线【就是】出场价，截断等于每次重启挪一次出场价 ─────────
     {
@@ -173,7 +182,7 @@ int main() {
     // ── 数据记录层的开仓信息跨重启；NaN 不能写坏 JSON ─────────────────────────
     {
         auto a = mk_bot("AAAUSDT", trend::Pos::Long, 100, 100, 94, 1);
-        a.open_ms = 1791619200000LL; a.open_seg = 'U'; a.open_rank = 3; a.open_score = 72.5;
+        a.open_ms = 1791619200000LL;
         a.open_dist_atr = 0.75;
         a.trough = 96.125; a.open_stop = 94.5;
         auto b = mk_bot("BBBUSDT", trend::Pos::Long, 100, 100, 94, 1);   // open_dist_atr 默认 NaN
@@ -182,8 +191,7 @@ int main() {
         check(got.size() == 2, "开仓信息：两个 bot 都能读回（NaN 没把 JSON 写坏）");
         for (const auto& g : got) {
             if (g.cfg.symbol == "AAAUSDT")
-                check(g.open_ms == a.open_ms && g.open_seg == 'U' && g.open_rank == 3 &&
-                      std::fabs(g.open_score - 72.5) < 1e-9 && std::fabs(g.open_dist_atr - 0.75) < 1e-6,
+                check(g.open_ms == a.open_ms && std::fabs(g.open_dist_atr - 0.75) < 1e-6,
                       "  开仓时的段、名次、分数、入场离边沿 ATR 都接得上");
             if (g.cfg.symbol == "AAAUSDT")
                 check(g.trough == 96.125 && g.open_stop == 94.5,
@@ -223,8 +231,8 @@ int main() {
         for (const auto& g : got)
             if (g.is_auto) {
                 ++autos;
-                check(std::fabs(g.cfg.rule.atr_mult - 2.5) < 1e-12 && !g.cfg.symbol.empty(),
-                      "  自动 bot 用模板参数、保留自己的品种名");
+                check(std::fabs(g.cfg.rule.atr_mult - 3.0) < 1e-12 && !g.cfg.symbol.empty(),
+                      "自动 bot 恢复保存的策略参数，重启不会隐式替换模板");
             }
         check(got.size() == 3 && autos == 2, "有模板：两个自动 bot 都恢复，手动 bot 照常");
 
@@ -238,20 +246,55 @@ int main() {
         check(!flat_back, "没有模板：空仓的自动 bot 丢弃");
     }
 
+    // 平仓后等待新收盘信号必须跨重启和关闭智能模式保留。
+    {
+        auto cfg = mk_cfg("WAITUSDT");
+        auto waiting = mk_bot("WAITUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        waiting.is_auto = true; waiting.reentry_after_ms = 1'800'007'200'000LL;
+        save_trend_state(path, {waiting});
+        const auto loaded = load_trend_state(path, {}, &cfg);
+        check(loaded.size() == 1 && loaded[0].reentry_after_ms == waiting.reentry_after_ms,
+              "平仓后等待时间戳无损往返");
+        const auto disabled = load_trend_state(path, {}, nullptr);
+        check(disabled.size() == 1 && disabled[0].waiting_reentry(),
+              "智能模式关闭时仍恢复等待记录，不能通过重启忘掉等待");
+        for (const auto& value : {"-1", "1.5", "\"broken\"", "null"}) {
+            write_file(path, "[{\"symbol\":\"WAITUSDT\",\"auto\":true,\"reentry_after_ms\":" + std::string(value) + "}]");
+            bool rejected = false;
+            try { load_trend_state(path, {}, &cfg); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected, "损坏的等待字段拒绝恢复，不默认为无需等待");
+        }
+        write_file(path, "[{\"symbol\":\"WAITUSDT\",\"auto\":true}]");
+        const auto old = load_trend_state(path, {}, &cfg);
+        check(old.size() == 1 && old[0].reentry_after_ms == 0, "旧存档缺少等待字段仍可加载");
+    }
+
     // 已移除策略的旧持仓必须拒绝启动，不能改套趋势跟踪参数。
     for (const char list : {'K', 'V'}) {
         TrendConfig tmpl;
         TrendBot legacy = mk_bot("OLDUSDT", trend::Pos::Long, 100, 100, 95, 1);
-        legacy.is_auto = true; legacy.smart_list = list;
+        legacy.is_auto = true;
         legacy.st.pos = trend::Pos::Long;
         legacy.st.entry_price = 100; legacy.st.stop = 95; legacy.qty = 1;
         save_trend_state(path, {legacy});
+        { // 构造原版的已移除策略标记，继续验证迁移不能接管旧策略持仓。
+            std::ifstream in(path); std::string raw((std::istreambuf_iterator<char>(in)), {}); in.close();
+            raw.insert(raw.find('{') + 1,
+                       "\"smart_list\":" + std::to_string((int)list) + ",");
+            write_file(path, raw);
+        }
         bool rejected = false;
         try { load_trend_state(path, {}, &tmpl); }
         catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("OLDUSDT") != std::string::npos; }
         check(rejected, "旧智能策略持仓拒绝恢复，并指出品种");
         legacy.st.pos = trend::Pos::Flat; legacy.qty = 0;
         save_trend_state(path, {legacy});
+        { // 构造原版的已移除策略标记，继续验证迁移不能接管旧策略持仓。
+            std::ifstream in(path); std::string raw((std::istreambuf_iterator<char>(in)), {}); in.close();
+            raw.insert(raw.find('{') + 1,
+                       "\"smart_list\":" + std::to_string((int)list) + ",");
+            write_file(path, raw);
+        }
         check(load_trend_state(path, {}, &tmpl).empty(), "旧智能策略空仓条目可安全移除");
     }
 
@@ -303,9 +346,13 @@ int main() {
     // ── 损坏/缺失文件不崩溃 ──────────────────────────────────────────────────
     {
         write_file(path, "{ 这不是 json");
-        check(load_trend_state(path, {mk_cfg("BTCUSDT")}).empty(), "损坏 JSON 返回空");
+        bool corrupt_rejected = false;
+        try { (void)load_trend_state(path, {mk_cfg("BTCUSDT")}); } catch (const std::exception&) { corrupt_rejected = true; }
+        check(corrupt_rejected, "损坏JSON停止恢复，避免被空状态覆盖");
         write_file(path, "");
-        check(load_trend_state(path, {mk_cfg("BTCUSDT")}).empty(), "空文件返回空");
+        bool empty_rejected = false;
+        try { (void)load_trend_state(path, {mk_cfg("BTCUSDT")}); } catch (const std::exception&) { empty_rejected = true; }
+        check(empty_rejected, "意外空文件停止恢复");
         std::remove(path.c_str());
         check(load_trend_state(path, {mk_cfg("BTCUSDT")}).empty(), "文件不存在返回空");
     }
@@ -408,8 +455,8 @@ int main() {
         check(std::fabs(g.st.stop - 104.0) < 1e-12,
               "止损线必须保留——它是重启后唯一还护着仓位的东西");
         check(!g.pending, "落盘的在途标记必须作废，否则该bot永久冻结");
-        check(g.bar_open_ms == 0 && g.last_counted_bar_ms == 0,
-              "K线计数跨重启失去意义，应清零");
+        check(g.bar_open_ms == 0 && g.last_counted_bar_ms == 12345,
+              "行情需重新拉取，已处理K线游标跨重启保留，避免重复扣冷却");
     }
 
     // ── restore_bot 同品种重复应被拒 ─────────────────────────────────────────
@@ -441,6 +488,68 @@ int main() {
         }
     }
 
+    {
+        auto reserved = mk_bot("ROTATEUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        reserved.is_auto = true; reserved.pending = true; reserved.rotation_reserved = true;
+        save_trend_state(path, {reserved});
+        auto loaded = load_trend_state(path, {}, &reserved.cfg);
+        check(loaded.size() == 1 && !loaded[0].open_uncertain,
+              "仅预留换仓名额时保存状态，不伪造未知开仓委托");
+        reserved.rotation_reserved = false;
+        reserved.reserved_risk = 3; reserved.reserved_dir = trend::Pos::Long;
+        save_trend_state(path, {reserved});
+        loaded = load_trend_state(path, {}, &reserved.cfg);
+        check(loaded.size() == 1 && loaded[0].open_uncertain && loaded[0].reserved_risk == 3,
+              "换仓订单真正发送后，重启继续保留未知委托风险预算");
+    }
+    {
+        auto saved = mk_bot("CHECKPOINTUSDT", trend::Pos::Long, 100, 120.123456789, 110.987654321, 2);
+        saved.cfg.rule.following.enabled = true; saved.cfg.rule.following.slow_period = 80;
+        saved.cfg.rule.following.reversal_exit = false;
+        saved.is_auto = true; saved.armed = true; saved.open_ms = 1800000000000LL;
+        saved.monitor.model_key = monitor_model_key(saved.cfg);
+        saved.monitor.cursor_ms = saved.monitor.target_ms = saved.open_ms + 6 * 14400000LL;
+        saved.monitor.trend_since_ms = saved.open_ms; saved.monitor.trend_bars = 6;
+        saved.monitor.regime = following::Regime::Range; saved.monitor.last_close = 117.34567890123;
+        saved.monitor.last_signal.atr = 3.14159265358979;
+        saved.monitor.events.push_back({saved.open_ms, "恢复", "状态含引号\"、换行\n与中文"});
+        saved.rotation_health.open_ms = saved.open_ms;
+        saved.rotation_health.last_bar_ms = saved.monitor.cursor_ms;
+        saved.rotation_health.last_favorable_ms = saved.open_ms + 14400000;
+        saved.rotation_health.samples = 6; saved.rotation_health.weak_bars = 3;
+        saved.rotation_health.best_close = 119.876543210987;
+        saved.st.cooldown_left = 2; saved.last_counted_bar_ms = saved.monitor.cursor_ms;
+        saved.rotation_attempt_bar_ms = saved.monitor.cursor_ms;
+        save_trend_state(path, {saved});
+        auto changed_template = mk_cfg(""); changed_template.rule.following.slow_period = 60;
+        const auto loaded = load_trend_state(path, {}, &changed_template);
+        check(loaded.size() == 1, "checkpoint with strategy snapshot and Unicode events loads");
+        if (!loaded.empty()) {
+            const auto& restored = loaded.front();
+            check(restored.rotation_health.samples == 6 && restored.rotation_health.weak_bars == 3 &&
+                  restored.rotation_health.best_close == saved.rotation_health.best_close &&
+                  restored.monitor.last_signal.atr == saved.monitor.last_signal.atr && restored.monitor.cursor_ms == saved.monitor.cursor_ms,
+                  "checkpoint preserves exact candle progress and floating-point extrema");
+            check(restored.armed && restored.last_counted_bar_ms == saved.last_counted_bar_ms &&
+                  restored.rotation_attempt_bar_ms == saved.rotation_attempt_bar_ms && restored.st.cooldown_left == 2 &&
+                  restored.cfg.rule.following.slow_period == 80 && !restored.cfg.rule.following.reversal_exit,
+                  "arming, cooldown, same-bar rotation guard and actual strategy survive restart");
+            check(restored.monitor.events.front().text == saved.monitor.events.front().text,
+                  "event timeline survives escaped JSON round trip");
+        }
+        auto invalid = saved; invalid.rotation_health.weak_bars = 7;
+        auto destination = saved; std::string error;
+        check(!restore_monitor_checkpoint(monitor_checkpoint_json(invalid), destination, error) &&
+              destination.rotation_health.weak_bars == 3 && !error.empty(),
+              "corrupt counter ordering is rejected without partial mutation");
+        save_trend_state(path, {invalid});
+        bool rejected = false;
+        try { (void)load_trend_state(path, {}, &changed_template); } catch (const std::exception&) { rejected = true; }
+        check(rejected, "corrupt persisted checkpoint fails closed instead of starting from zero");
+        save_trend_state(path, {saved});
+        check(load_trend_state(path, {}, &changed_template).size() == 1,
+              "atomic save replaces an existing Windows checkpoint successfully");
+    }
     std::remove(path.c_str());
     if (g_fail == 0) {
         std::printf("\nOK: SAR 持久化与对账测试全部通过\n");

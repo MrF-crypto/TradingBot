@@ -17,6 +17,15 @@ static void test_following_scenarios() {
     const auto a = tf::compute(up, volume, f, 12, 14);
     const auto d = tf::compute(down, volume, f, 12, 14);
     const auto r = tf::compute(flat, volume, f, 12, 14);
+    auto intrabar_cfg = f; intrabar_cfg.close_confirm = false;
+    const auto intrabar = tf::compute(up, volume, intrabar_cfg, 12, 14);
+    const auto confirmed = tf::closed_signal(intrabar);
+    CHECK(confirmed.ready && confirmed.long_confirmed == a.long_confirmed &&
+          near(confirmed.atr, a.atr) && near(confirmed.upper, a.upper) &&
+          near(confirmed.volume_ratio, a.volume_ratio) && confirmed.settings.close_confirm,
+          "intrabar mode supplies independent pre-breakout closed-candle evidence for rotation");
+    auto stale = intrabar; stale.ready = false;
+    CHECK(!tf::closed_signal(stale).ready, "secondary evidence cannot bypass a rejected network snapshot");
     CHECK(a.ready && a.regime == tf::Regime::Up && a.long_confirmed && !a.short_confirmed,
           "persistent rise permits a confirmed long");
     CHECK(d.ready && d.regime == tf::Regime::Down && d.short_confirmed && !d.long_confirmed,

@@ -1,13 +1,4 @@
-# Linux 构建（ccbot_headless）。
-#
-# 两个目的：
-#   ① 可移植性门禁 —— 第三个编译器（GCC）。v3.9.0 那次就是 MSVC 放行、Clang 拒绝；
-#      GCC 又有自己的严格之处，多一个编译器就多一层保险
-#   ② 产出预编译的 Linux 二进制 —— headless 要跑在 VPS 上，而此前只能自己 clone 编，
-#      需要在服务器上装 vcpkg、编一堆依赖，门槛不低
-#
-# GUI 在 Linux 不构建（CMakeLists 是 `if(WIN32 OR APPLE)`），这里只编 headless
-# 与全部测试。vcpkg.json 把 Qt 标了 platform:windows，所以 Linux 上不会去装 Qt。
+# Linux 原生 x64 / ARM64 headless 构建与测试。
 name: build-linux
 
 on:
@@ -26,7 +17,17 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+            triplet: x64-linux
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            triplet: arm64-linux
+    runs-on: ${{ matrix.runner }}
     # 兜底：GitHub 默认允许一个 job 跑 6 小时。首次编依赖（缓存未命中）约 30 分钟，
     # 90 分钟足够宽松；卡住的任务不该白烧六小时才被发现
     timeout-minutes: 90
@@ -65,8 +66,8 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-linux-
+          key: vcpkg-linux-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-linux-${{ matrix.arch }}-
 
       - name: Configure
         run: |
@@ -74,7 +75,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCCBOT_WERROR=ON \
             -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=x64-linux
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DCCBOT_BUILD_GUI=OFF -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON
 
       # -k 0 = 一个目标失败也把其余编完。-Werror 开了之后这很要紧：
       # 默认行为是首个 TU 报错就停，于是一轮 CI 只能暴露一个错误，修一个再推一轮。
@@ -113,53 +115,35 @@ jobs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-linux-${{ matrix.arch }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
 
       - name: Upload vcpkg failure logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: vcpkg-failure-logs-linux
+          name: vcpkg-failure-logs-linux-${{ matrix.arch }}
           path: |
             build/vcpkg-manifest-install.log
             ${{ runner.temp }}/vcpkg/buildtrees/*/*.log
           if-no-files-found: ignore
 
       - name: Run all test suites
-        run: |
-          set -e
-          for t in ccg_indicator_tests ccg_key_store_tests \
-                   ccg_funding_tests ccg_rate_tests ccg_order_tests \
-                   ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests \
-                   ccg_trend_stress_tests \
-                   ccg_config_tests ccg_timesync_tests ccg_pool_tests \
-                   ccg_rest_feed_tests ccg_app_logic_tests \
-                   ccg_smart_tests ccg_smart_runner_tests ccg_journal_tests; do
-            echo "── $t ──"
-            ./build/$t
-          done
+        run: ctest --test-dir build -C Release --output-on-failure --parallel 2
 
       - name: Package
         run: |
           set -e
           mkdir -p pkg
           cp build/ccbot_headless pkg/
-          cp config.example.json pkg/
           chmod +x pkg/ccbot_headless
+          python3 tools/check_unix_package.py pkg --platform linux --arch ${{ matrix.arch }}
 
       # 泄漏检查同样是硬门禁。config.example.json 是模板（不含真凭证），但白名单
       # 只放行可执行文件，所以要在检查【之后】再放进 zip
       - name: Leak check (hard gate)
         run: |
-          rm -f pkg/config.example.json
-          VER=""
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then VER="${GITHUB_REF#refs/tags/}"; fi
-          if [ -n "$VER" ]; then
-            python3 tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless
-          else
-            python3 tools/leak_check.py pkg
-          fi
-          cp config.example.json pkg/
+          VER="$(python3 tools/release_metadata.py --version)"
+          python3 tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless
 
       - name: Include documentation and dependency licenses
         shell: bash
@@ -168,24 +152,25 @@ jobs:
           cp LICENSE README.md config.example.json pkg/
           cp -R docs pkg/
           mkdir -p pkg/licenses
-          for notice in build/vcpkg_installed/x64-linux/share/*/copyright; do
+          for notice in build/vcpkg_installed/${{ matrix.triplet }}/share/*/copyright; do
             test -f "$notice" || continue
             dep=$(basename "$(dirname "$notice")")
             mkdir -p "pkg/licenses/$dep"
             cp "$notice" "pkg/licenses/$dep/"
           done
 
+      - name: Record source and dependencies
+        run: python3 tools/release_metadata.py --package pkg --triplet ${{ matrix.triplet }}
+
       - name: Zip
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
-          [[ "$GITHUB_REF" == refs/tags/* ]] || VER="dev-${GITHUB_SHA::7}"
-          cd pkg && zip -r "../tradingbot-$VER-linux-x64.zip" . && cd ..
+          VER="$(python3 tools/release_metadata.py --version)"
+          cd pkg && zip -r "../tradingbot-$VER-linux-${{ matrix.arch }}.zip" . && cd ..
           ls -la tradingbot-*.zip
 
       # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: tradingbot-linux-x64
+          name: tradingbot-linux-${{ matrix.arch }}
           path: tradingbot-*.zip

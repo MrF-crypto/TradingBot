@@ -234,6 +234,7 @@ private:
     enum class ConnState { Disconnected, Connecting, Connected, Failed, NetworkError };
     ConnState      connState_ = ConnState::Disconnected;
     bool           trendStateBlocked_ = false;
+    bool           trendSaveFailed_ = false;
     QString        connNetName_;       // "主网"/"测试网"，连接成功后顶部计时行要用
     QElapsedTimer  connect_elapsed_;   // 连接成功后开始计时，用于顶部计时显示
     QElapsedTimer  breathe_clock_;     // 呼吸灯相位时钟

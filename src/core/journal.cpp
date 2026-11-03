@@ -29,26 +29,8 @@ int64_t ms_of(std::chrono::system_clock::time_point t) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
 }
 
-std::string seg_name(char c) {
-    switch (c) {
-    case smart::kListLong:   return "做多名单";
-    case smart::kListShort:  return "做空名单";
-    case smart::kSegStrong:  return "强势";
-    case smart::kSegWeak:    return "弱势";
-    case smart::kSegMid:     return "中间";
-    case smart::kSegHot:     return "过热";
-    default:                 return {};
-    }
-}
-
-
 std::string side_name(trend::Pos p) {
     return p == trend::Pos::Short ? "空" : "多";
-}
-
-int rank_in(const std::vector<std::string>& v, const std::string& s) {
-    auto it = std::find(v.begin(), v.end(), s);
-    return it == v.end() ? 0 : (int)(it - v.begin()) + 1;
 }
 
 } // namespace
@@ -97,7 +79,7 @@ void Journal::append(const std::string& file, const std::string& header, const s
         std::error_code ec;
         fs::create_directories(dir_, ec);
         const fs::path p = fs::path(dir_) / file;
-        // 新版本加了列：老文件的表头对不上，接着写会错列。每个文件每次运行核对一次，
+        // 新版本改了列：老文件的表头对不上，接着写会错列。每个文件每次运行核对一次，
         // 对不上就把老文件改名（xxx-old-时间.csv）留着，另起一份
         if (header_checked_.insert(file).second && fs::exists(p, ec)) {
             std::string first;
@@ -155,9 +137,7 @@ void Journal::trade(const TrendTrade& t) {
       << (open_ms ? num((close_ms - open_ms) / 3600000.0, 4) : std::string()) << ","
       << csv_field(t.symbol) << "," << side_name(t.side) << ","
       << trend::strategy_name(t.strategy) << "," << csv_field(t.interval) << ","
-      << (t.is_auto ? "自动" : "手动") << "," << seg_name(t.seg) << ","
-      << (t.rank > 0 ? std::to_string(t.rank) : std::string()) << ","
-      << (t.score > 0 ? num(t.score, 4) : std::string()) << ","
+      << (t.is_auto ? "自动" : "手动") << ","
       << num(t.entry_price, 10) << "," << num(t.exit_price, 10) << "," << num(t.qty, 10) << ","
       << num(t.pnl, 8) << "," << num(fee, 6) << "," << num(t.pnl - fee, 8) << ","
       << num(t.entry_dist_atr, 4) << ","
@@ -170,8 +150,7 @@ void Journal::trade(const TrendTrade& t) {
       << csv_field(t.reason) << "\n";
     std::lock_guard<std::mutex> lk(mtx_);
     append("trades.csv",
-           "平仓时间UTC,开仓时间UTC,持仓小时,品种,方向,策略,周期,手动自动,开仓时所在段,段内名次,"
-           "分数,开仓价,平仓价,数量,盈亏U,估算手续费U,净盈亏U,入场离通道边沿ATR,"
+           "平仓时间UTC,开仓时间UTC,持仓小时,品种,方向,策略,周期,手动自动,开仓价,平仓价,数量,盈亏U,估算手续费U,净盈亏U,入场离通道边沿ATR,"
            "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,浮盈亏最低ATR,"
            "浮盈亏最高R,浮盈亏最低R,入场量比,入场箱体ATR,入场主动买入占比,原因",
            l.str());
@@ -189,66 +168,32 @@ void Journal::filter(const FilterEvent& e) {
 }
 
 void Journal::pool(int64_t ms, const std::string& symbol, const std::string& event,
-                   char seg, int rank, double score, const std::string& reason) {
+                   const std::string& reason) {
     std::ostringstream l;
-    l << utc_time(ms) << "," << csv_field(symbol) << "," << csv_field(event) << ","
-      << seg_name(seg) << "," << (rank > 0 ? std::to_string(rank) : std::string()) << ","
-      << (score > 0 ? num(score, 4) : std::string()) << "," << csv_field(reason) << "\n";
+    l << utc_time(ms) << "," << csv_field(symbol) << "," << csv_field(event) << "," << csv_field(reason) << "\n";
     std::lock_guard<std::mutex> lk(mtx_);
-    append("pool.csv", "时间UTC,品种,事件,段,段内名次,分数,原因", l.str());
+    append("pool.csv", "时间UTC,品种,事件,原因", l.str());
 }
 
-void Journal::scan(int64_t ms, const smart::Ranking& rk, const smart::Segmented& sg,
+void Journal::scan(int64_t ms, const std::map<std::string, smart::Features>& candidates,
                    const std::set<std::string>& with_bot,
                    const std::map<std::string, smart::OiStat>& oi) {
-    const std::string t = utc_time(ms);
     std::ostringstream l;
-    for (const auto& kv : rk.rows) {
-        const auto& s = kv.second;
-        const auto& f = s.f;
-        char seg = 0;
-        int  rank = 0;
-        if (auto it = sg.seg.find(kv.first); it != sg.seg.end()) {
-            // 混合模式：所在段，以及在该段名单里的名次（没进名单 = 空）
-            seg = it->second;
-            const auto& list = seg == smart::kSegStrong ? sg.strong
-                             : seg == smart::kSegWeak   ? sg.weak
-                             : seg == smart::kSegHot    ? sg.hot
-                                                        : sg.mid;
-            rank = rank_in(list, kv.first);
-        } else if (int r = rank_in(rk.longs, kv.first); r > 0) {
-            seg = smart::kListLong;  rank = r;    // 突破模式
-        } else if (int r2 = rank_in(rk.shorts, kv.first); r2 > 0) {
-            seg = smart::kListShort; rank = r2;
-        }
-        l << t << "," << csv_field(kv.first) << "," << seg_name(seg) << ","
-          << (rank > 0 ? std::to_string(rank) : std::string()) << ","
-          << num(s.long_score, 4) << "," << num(s.short_score, 4) << ","
-          << num(s.squeeze_score, 4) << "," << num(s.rs_pct, 4) << ","
-          << num(f.rs, 4) << "," << num(f.er24, 4) << "," << num(f.box12_atr, 4) << ","
-          << num(f.atr_ratio, 4) << "," << num(f.box48_atr, 4) << "," << num(f.vol_lift, 4) << ","
-          << num(f.pos12, 4) << "," << num(f.atr_pct, 4) << "," << num(f.max_up24, 4) << ","
-          << num(f.max_dn24, 4) << "," << num(f.close, 10) << ","
-          << (with_bot.count(kv.first) ? "是" : "") << ","
-          << num(f.taker1, 4) << "," << num(f.taker6, 4);
-        if (auto o = oi.find(kv.first); o != oi.end()) {
-            const auto& s2 = o->second;
-            l << "," << utc_time(s2.ms) << "," << num(s2.value, 10) << ","
-              << num(s2.chg1, 4) << "," << num(s2.chg4, 4) << "," << num(s2.chg24, 4);
-        } else {
-            l << ",,,,,";
-        }
+    for (const auto& [symbol, f] : candidates) {
+        l << utc_time(ms) << "," << csv_field(symbol) << "," << num(f.atr_pct, 4) << ","
+          << num(f.close, 10) << "," << (with_bot.count(symbol) ? "是" : "");
+        if (auto it = oi.find(symbol); it != oi.end()) {
+            const auto& stat = it->second;
+            l << "," << utc_time(stat.ms) << "," << num(stat.value, 10) << ","
+              << num(stat.chg1, 4) << "," << num(stat.chg4, 4) << "," << num(stat.chg24, 4);
+        } else l << ",,,,,";
         l << "\n";
     }
     std::lock_guard<std::mutex> lk(mtx_);
     prune_locked(ms);
     append("scan-" + utc_date(ms) + ".csv",
-           "时间UTC,品种,段,段内名次,做多分,做空分,蓄势分,强弱百分位,相对强弱,效率比24,"
-           "箱体12/ATR,ATR14/ATR100,箱体48/ATR,量能抬升,箱体内位置,ATR%,7天最大单日涨%,"
-           "7天最大单日跌%,收盘价,已有bot,主动买入占比1h,主动买入占比6h,"
-           "持仓量时间UTC,持仓价值U,持仓量变化1h%,持仓量变化4h%,持仓量变化24h%",
+           "时间UTC,品种,ATR%,收盘价,已有bot,持仓量时间UTC,持仓价值U,持仓量变化1h%,持仓量变化4h%,持仓量变化24h%",
            l.str());
 }
-
 
 } // namespace ccbot

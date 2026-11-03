@@ -48,6 +48,7 @@ struct FakeMarket {
     std::set<std::string> fail_oi;         // 这些币的持仓量拉不到
     bool oi_429 = false;                   // 持仓量接口整组被限流（它有自己的独立配额）
     std::atomic<int> oi_calls{0};
+    std::atomic<int> btc_kline_calls{0};
 
     // 持仓量：25 个整点，每小时 +10，持仓价值固定 5e6
     static std::string oi_hist(const std::string& sym) {
@@ -124,6 +125,7 @@ struct FakeMarket {
             if (path == "/fapi/v1/premiumIndex") { out.body = funding(); return true; }
             if (path.rfind("/fapi/v1/klines?symbol=", 0) == 0) {
                 const auto s = path.substr(23, path.find('&') - 23);
+                if (s == "BTCUSDT") ++btc_kline_calls;
                 out.body = fail_klines.count(s) ? "" : klines(s);
                 return true;
             }
@@ -171,13 +173,10 @@ struct Rig {
         run->on_symbol_added   = [this](const std::string& s) { subs.insert(s); };
         run->on_symbol_removed = [this](const std::string& s) { subs.erase(s); };
     }
-    // 默认按突破模式（两份名单）——下面大部分用例测的是那一套；混合模式单独一段
-    smart::Config cfg(int ln = 2, int sn = 2) {
+    // 通过硬过滤的全部品种进入统一候选池。
+    smart::Config cfg() {
         smart::Config c;
         c.enabled = true;
-        c.dir_mode = smart::DirMode::Breakout;
-        c.long_n = ln; c.short_n = sn;
-        c.min_score = 0;
         // 假行情的 1h ATR 约 2%（贴着默认上限）。这里测的是候选池机制，不是 ATR 门槛：放宽
         c.atr_pct_min = 0.8;
         c.atr_pct_max = 6.0;
@@ -215,7 +214,7 @@ int main() {
     const std::string dir = (std::filesystem::temp_directory_path() / "ccg_smart_runner_test").string();
     std::filesystem::create_directories(dir);
 
-    // ── 基本流程：扫描 → 两份名单各取前 2 → 自动建 bot ─────────────────────
+    // ── 基本流程：扫描 → 全部合格币 → 自动建 bot ─────────────────────
     {
         Rig r(dir + "/a.json");
         basic_market(r.mk);
@@ -223,16 +222,16 @@ int main() {
         check(r.run->due(kNow), "启用后立刻到点");
         const auto rep = r.run->run_once(kNow);
         check(rep.ok, "扫描成功");
-        check(rep.added == 4, "加了 4 个（做多 2 + 做空 2），实际 " + std::to_string(rep.added));
-        check(r.has_bot("UPAUSDT") && r.has_bot("DNAUSDT"), "  最强的上涨币和下跌币都在");
+        check(rep.added == 5 && rep.candidates.size() == 5, "全部 5 个合格币进入统一候选，实际 " + std::to_string(rep.added));
+        check(r.has_bot("UPAUSDT") && r.has_bot("DNAUSDT"), "  上涨币和下跌币都在");
         check(!r.has_bot("BTCUSDT") && !r.has_bot("ETHUSDT"), "  BTC/ETH 内置排除");
+        check(r.mk.btc_kline_calls == 0, "  统一候选不拉 BTC 基准计算相对评分");
         check(!r.has_bot("THINUSDT") && !r.has_bot("NEWUSDT"), "  成交额不足 / 上线不满 14 天的不加");
         const auto b = r.bot("UPAUSDT");
         check(b.is_auto && !b.armed && b.cfg.interval == "1h" &&
               b.cfg.rule.direction == trend::Direction::Both && b.cfg.use_disaster_stop &&
               b.cfg.rule.lock_atr && !b.cfg.rule.accel_exit && b.cfg.rule.following.enabled,
               "  自动 bot：未上膛、1h 趋势跟踪、多空、硬止损、出场优化");
-        check(b.smart_list == 'L' && b.smart_rank == 1 && b.smart_score > 0, "  名单信息写进了 bot");
         check(r.subs.count("UPAUSDT") == 1, "  通知应用层订阅价格");
         check(r.run->due(kNow + 60000), "扫完之后每分钟有轻量异动观察");
         check(r.run->due(kNow / 3600000 * 3600000 + 3600000 + 61000), "  下个整点后 1 分钟到点");
@@ -257,14 +256,22 @@ int main() {
         rep = r.run->run_once(kNow + 3600000 * 31LL);
         check(!rep.ok && r.eng->get_bots().size() == n0, "24h 行情拉不到（返回 HTML）：同样不动");
 
-        // 字段解析出问题（比如成交额全成了很小的数）：全市场 0 个合格，当数据异常
+        // 数据正常但全部跌破硬门槛：合法空候选池，批量保护保留 bot 但暂停全部新仓。
         r.mk.fail_t24 = false;
         for (auto& kv : r.mk.syms) kv.second.quote_vol = 1;
         r.run->force();
         rep = r.run->run_once(kNow + 3600000 * 32LL);
-        check(!rep.ok && has(rep.summary, "数据异常") && r.eng->get_bots().size() == n0,
-              "全市场合格为 0：疑似数据异常，整轮作废、bot 一个不动");
+        bool all_retiring = true;
+        for (const auto& b : r.eng->get_bots()) all_retiring &= b.retiring;
+        check(rep.ok && rep.candidates.empty() && all_retiring && r.eng->get_bots().size() == n0,
+              "全市场合格为 0：空候选池，批量保护保留已有 bot 并暂停新仓");
         for (auto& kv : r.mk.syms) kv.second.quote_vol = 20e6;
+        r.run->force();
+        rep = r.run->run_once(kNow + 3600000 * 33LL);
+        bool any_retiring = false;
+        for (const auto& b : r.eng->get_bots()) any_retiring |= b.retiring;
+        check(rep.ok && !rep.candidates.empty() && !any_retiring,
+              "硬门槛恢复后重新允许候选等待突破");
     }
 
     // ── 单个币的K线拉不到：它是"未知"，不淘汰；成交额掉了：淘汰 ──────────────
@@ -346,42 +353,30 @@ int main() {
         check(autos == 0 && r.has_bot("FLATUSDT"), "关闭：空仓自动 bot 全部移除，手动 bot 保留");
     }
 
-    // ── 混合模式：强势仅多 / 弱势仅空 / 中间多空 / 过热仅空 ─────────────────────
+    // ── 统一候选不以历史形态预定方向 ─────────────────────
     {
         Rig r(dir + "/m.json");
         auto& m = r.mk.syms;
-        m["UPAUSDT"].slope  = 0.05;    // 最强（除了暴涨币）⇒ 强势
-        m["UPBUSDT"].slope  = 0.02;    // 偏强但没进前 30% ⇒ 中间
-        m["DNAUSDT"].slope  = -0.05;   // 弱 ⇒ 弱势
+        m["UPAUSDT"].slope  = 0.05;    // 历史上涨
+        m["UPBUSDT"].slope  = 0.02;    // 较慢上涨
+        m["DNAUSDT"].slope  = -0.05;   // 历史下跌
         m["DNBUSDT"].slope  = -0.03;
-        m["FLATUSDT"].slope = 0;       // 横着 ⇒ 中间
+        m["FLATUSDT"].slope = 0;       // 横盘
         m["FLAT2USDT"].slope = 0;
-        m["PUMPUSDT"].pump  = 0.9;     // 一根K线涨 90% ⇒ 过热
+        m["PUMPUSDT"].pump  = 0.9;     // 历史一根K线涨 90%
         m["BTCUSDT"].slope  = 0;
         auto c = r.cfg();
-        c.dir_mode = smart::DirMode::Mixed;
         c.tmpl.rule.following.short_vol_ratio = 1.0;
         r.run->set_config(c);
         const auto rep = r.run->run_once(kNow);
-        check(rep.ok && rep.groups.size() == 4, "混合模式：名单分四组（强 / 弱 / 中 / 过热）");
-        auto dir_of = [&](const std::string& s) { return r.bot(s).cfg.rule.direction; };
-        auto seg_of = [&](const std::string& s) { return r.bot(s).smart_list; };
-        check(seg_of("UPAUSDT") == smart::kSegStrong && dir_of("UPAUSDT") == trend::Direction::Both,
-              "  强势候选保留多空许可");
-        check(seg_of("DNAUSDT") == smart::kSegWeak && dir_of("DNAUSDT") == trend::Direction::Both,
-              "  弱势候选保留多空许可");
-        check(seg_of("FLATUSDT") == smart::kSegMid && dir_of("FLATUSDT") == trend::Direction::Both,
-              "  横盘币：中间段、多空（谁突破做谁）");
-        check(seg_of("PUMPUSDT") == smart::kSegHot && dir_of("PUMPUSDT") == trend::Direction::Both,
-              "  历史暴涨 90% 的币：仅分组，不预测后续方向");
-        check(r.bot("PUMPUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio,
-              "  历史异动不覆盖多头量比规则");
-        check(r.bot("DNAUSDT").cfg.rule.following.short_vol_ratio == 1.0,
-              "  做空有独立量比参数，不由候选分组决定");
-        check(r.bot("FLATUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio &&
-              c.tmpl.rule.breakout_vol_ratio > 0,
-              "  中间段照常要量比（横盘币缩量跌破多半是洗盘）");
-        check(has(rep.summary, "强势") && has(rep.summary, "异动"), "  汇总里按段列出");
+        check(rep.ok && rep.candidates.size() == 7, "七个合格品种全部进入统一候选");
+        for (const auto& [symbol, sym] : m) {
+            if (symbol == "BTCUSDT") continue;
+            check(r.has_bot(symbol) && r.bot(symbol).cfg.rule.direction == trend::Direction::Both,
+                  "历史上涨、下跌、横盘、暴涨均不锁定候选方向：" + symbol);
+        }
+        check(r.bot("PUMPUSDT").cfg.rule.breakout_vol_ratio == c.tmpl.rule.breakout_vol_ratio &&
+              r.bot("DNAUSDT").cfg.rule.following.short_vol_ratio == 1.0, "不同历史形态使用同一入场模板");
 
         // 数据记录层：扫描快照与候选池事件
         const auto jdir = std::filesystem::path(dir) / "journal_m";
@@ -409,7 +404,7 @@ int main() {
         check(has(dna_line, ",5000000,0.813,3.333,24"),
               "  持仓量：价值与 1/4/24h 变化写进扫描快照");
         check(!flat_line.empty() && !has(flat_line, "5000000"),
-              "  持仓量拉不到的币：那几列留空，照常排名");
+              "  持仓量拉不到的币：那几列留空，照常加入候选");
         check(rpj.ok, "  持仓量不影响这一轮");
 
         // 持仓量接口被限流：它有独立配额，不能把全局闸门（下单、止损也走它）冻住；
@@ -512,17 +507,45 @@ int main() {
         check(r.eng->day_pnl().realized == -1, "状态里已有今天的数：以状态为准，不覆盖");
     }
 
+    // 重扫、模板替换与停启智能模式都不得绕过平仓后的等待。
+    {
+        Rig r(dir + "/reentry.json");
+        auto c = r.cfg();
+        TrendBot waiting;
+        waiting.cfg = smart::make_bot_config(c, "WAITUSDT");
+        waiting.is_auto = true; waiting.reentry_after_ms = kNow + 7200000;
+        r.eng->restore_bot(waiting);
+        r.mk.syms["WAITUSDT"].slope = 0;
+        r.mk.syms["OTHERUSDT"].slope = 0;
+        c.tmpl.rule.donchian_period = 20;
+        r.run->set_config(c); r.run->run_once(kNow);
+        check(r.bot("WAITUSDT").reentry_after_ms == waiting.reentry_after_ms &&
+              r.bot("WAITUSDT").cfg.rule.donchian_period == 20,
+              "候选模板重建后继续保留平仓等待");
+        r.mk.syms["WAITUSDT"].quote_vol = 1;
+        r.run->force(); r.run->run_once(kNow + 3600000);
+        check(r.has_bot("WAITUSDT") && r.bot("WAITUSDT").retiring && r.bot("WAITUSDT").waiting_reentry(),
+              "过滤不合格时暂停新仓但保留等待记录，防止删后重加绕过");
+        c.enabled = false; r.run->set_config(c); r.run->housekeep(kNow + 3600000);
+        check(r.has_bot("WAITUSDT") && r.bot("WAITUSDT").retiring,
+              "关闭智能模式保留等待记录且禁止新仓");
+        c.enabled = true; r.mk.syms["WAITUSDT"].quote_vol = 20e6;
+        r.run->set_config(c); r.run->run_once(kNow + 3600000);
+        check(!r.bot("WAITUSDT").retiring && r.bot("WAITUSDT").reentry_after_ms == waiting.reentry_after_ms,
+              "重新通过过滤只解除候选暂停，仍须等待新的收盘突破");
+    }
+
     // 持仓中的趋势跟踪更新出场设置；不改周期、方向、杠杆及已有止损。
     {
         Rig r(dir + "/hold_exit.json");
         auto c = r.cfg();
         TrendBot held;
-        held.cfg = smart::make_bot_config(c, "HELDUSDT", trend::Direction::LongOnly, smart::kSegStrong);
+        held.cfg = smart::make_bot_config(c, "HELDUSDT", trend::Direction::LongOnly);
         held.is_auto = true;
-        held.smart_list = smart::kSegStrong;
         held.st.pos = trend::Pos::Long;
         held.st.entry_price = 100; held.st.peak = 106; held.st.stop = 99; held.qty = 1;
         r.eng->restore_bot(held);
+        check(r.bot("HELDUSDT").retiring, "恢复自动 bot 后先等新一轮候选过滤，持仓管理保留");
         TrendBot manual = held;
         manual.cfg.symbol = "MANUUSDT"; manual.is_auto = false;
         r.eng->restore_bot(manual);
@@ -551,8 +574,17 @@ int main() {
               "关闭智能模式保留持仓并标为待移出");
         c.enabled = true;
         r.run->set_config(c);
-        check(!r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").st.stop == 99,
-              "重新启用会接回持仓，撤销待移出而不改变保护");
+        check(r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").st.stop == 99,
+              "重新启用等待候选过滤确认，不直接解除待移出");
+        r.mk.syms["HELDUSDT"].slope = 0;
+        r.run->run_once(kNow);
+        check(!r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").qty == 1,
+              "通过新扫描后接回候选，持仓保持");
+        r.mk.syms["HELDUSDT"].quote_vol = 1;
+        r.mk.syms["OTHERUSDT"].slope = 0;
+        r.run->force(); r.run->run_once(kNow + 3600000);
+        check(r.bot("HELDUSDT").retiring && r.bot("HELDUSDT").qty == 1 && r.bot("HELDUSDT").st.stop == 99,
+              "持仓不合格时只禁止新仓，不丢弃仓位及止损");
     }
 
     // Event observations share the production scheduler but do not repeatedly scan candles.

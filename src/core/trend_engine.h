@@ -122,6 +122,7 @@ struct TrendBot {
     trend::State  st;
     State       state   = State::Running;
     bool        pending = false;   // 有在途订单，本 tick 跳过
+    bool        rotation_reserved = false; // only a slot reservation; no opening order sent yet
 
     // Reserve before sending an opening order. Uncertain outcomes retain the
     // reservation across restart until a fresh reconciliation proves exposure absent.
@@ -134,7 +135,30 @@ struct TrendBot {
     std::chrono::steady_clock::time_point uncertain_last_query{};
     int uncertain_empty_seen = 0;
     double current_price = 0;
+    std::chrono::steady_clock::time_point price_time{};
     double qty           = 0;      // 当前持仓数量（绝对值，0=空仓）
+
+    // Persisted confirmed candle progress. Missing data is backfilled, never counted or erased.
+    struct RotationHealth {
+        int64_t open_ms = 0, last_bar_ms = 0, last_favorable_ms = 0;
+        int samples = 0, weak_bars = 0;
+        double best_close = 0;
+        following::Config settings;
+    } rotation_health;
+    int64_t rotation_attempt_bar_ms = 0, rotation_noted_bar_ms = 0;
+    struct MonitorEvent { int64_t at_ms = 0; std::string kind, text; };
+    struct MonitorState {
+        bool saved = false, recovering = false, fetch_failed = false;
+        int64_t cursor_ms = 0, target_ms = 0, updated_ms = 0, trend_since_ms = 0;
+        int trend_bars = 0;
+        following::Regime regime = following::Regime::Unknown, previous = following::Regime::Unknown;
+        following::SignalData last_signal;
+        double last_close = 0;
+        std::string model_key, data_error, rotation_reason, shape;
+        std::vector<MonitorEvent> events;
+    } monitor;
+    bool needs_reconcile = false;
+    int64_t resume_after_ms() const;
 
     // 信号快照（由应用层拉取K线后喂入）
     following::Signal following;
@@ -195,6 +219,7 @@ struct TrendBot {
     // 留着它，"外部已平"那条路径才能把这笔按硬止损价记进统计和当日亏损。
     // 随仓位关闭清零，不落盘
     double ds_vanished_price = 0;
+    std::string ds_vanished_id; // Retain the ID for executed-order verification after disappearance.
 
     // 本仓位已尝试挂单的次数。阶梯见 TrendEngine::kDs* 常量
     int  ds_attempts = 0;
@@ -257,22 +282,31 @@ struct TrendBot {
     // 智能模式不碰它们。落盘
     bool   is_auto = false;
     // false = 刚加入，价格回到通道内之前不认突破。
-    // 扫描选中的币很可能【此刻就在通道外】（强势名单尤其如此），不上膛的话
+    // 扫描选中的币很可能【此刻就在通道外】（突破发生之后尤其如此），不上膛的话
     // 第一拍就判成突破，等于追高进场。不落盘：恢复时空仓的自动 bot 一律重新上膛
     bool   armed   = true;
-    // 待移出：智能模式已关、或已切到另一套策略，这个自动 bot 只把手上这笔管完，
-    // 平仓后【不再开新仓】，等智能模式删掉它。不落盘：每次维护都会重新标
+    // 待移出：智能模式已关、或已不满足候选硬过滤，这个自动 bot 只把手上这笔管完，
+    // 平仓后【不再开新仓】。不落盘：恢复后先暂停新仓，成功扫描再确认准入。
     bool   retiring = false;
-    double smart_score = 0;   // 最近一次扫描的综合分，名额紧张时按它取舍
-    int    smart_rank  = 0;   // 名单内排名，0 = 已不在名单
-    char   smart_list  = 0;   // 名单 / 分段代码（smart::kList* / kSeg*），0 = 无
+    // 智能趋势跟踪平仓后：最早可用的收盘确认时间（下一根完整K线收盘）。
+    // 保留到下一笔开仓成交；落盘、换参数与候选重扫都不能清掉等待。
+    int64_t reentry_after_ms = 0;
+    bool waiting_reentry() const {
+        return is_auto && cfg.rule.strategy == trend::Strategy::TrendFollowing && reentry_after_ms > 0;
+    }
+    following::Config signal_following_config() const {
+        auto f = cfg.rule.following;
+        if (waiting_reentry() && st.pos == trend::Pos::Flat) {
+            // 复用收盘模型计算突破证据；是否应用 EMA 趋势过滤仍由原配置决定。
+            f.enabled = true;
+            f.close_confirm = true;
+        }
+        return f;
+    }
 
     // 开仓那一刻的情况，平仓时写进成交记录（数据记录层）。随仓位落盘：
-    // 跨重启的仓位平掉时也要知道它是从哪一段、几分、离通道多远进来的
+    // 跨重启保留入场距离、初始止损与持仓极值
     int64_t open_ms        = 0;
-    char    open_seg       = 0;
-    int     open_rank      = 0;
-    double  open_score     = 0;
     double  open_dist_atr  = std::numeric_limits<double>::quiet_NaN();
     // 浮盈亏最高 / 最低用。有利极值就是 st.peak，这里补上另一头：
     // trough = 持仓期最差价（多=最低、空=最高），0 = 还没采到；
@@ -308,12 +342,9 @@ struct TrendTrade {
     bool        reversed    = false;     // 本次平仓后是否反手了
     std::chrono::system_clock::time_point close_time{};
 
-    // ── 数据记录层用（开仓那一刻的情况），给实盘复盘：哪一段赚钱、入场晚了多少 ──
+    // ── 数据记录层用（开仓那一刻的情况），给实盘复盘入场位置与成本 ──
     std::chrono::system_clock::time_point open_time{};   // 0 = 不知道（老仓位）
     bool        is_auto = false;
-    char        seg     = 0;      // 开仓时所在的名单 / 分段（smart::kList* / kSeg*）
-    int         rank    = 0;
-    double      score   = 0;
     // 开仓价离通道边沿多远（ATR 为单位，向突破方向为正）。只有趋势跟踪有；NaN = 没有
     double      entry_dist_atr = std::numeric_limits<double>::quiet_NaN();
     trend::Strategy strategy = trend::Strategy::TrendFollowing;
@@ -382,12 +413,21 @@ public:
     // 交易所止损。硬止损是进程外的保护，不是策略决策，暂停也照样要补。
     // 应用层每拍调用一次（与是否有价格无关）
     void maintain_paused_hard_stops();
-    // 只在空仓且没有在途订单时移除，返回是否删了。智能模式淘汰用：扫描拿到的
+    // 只在空仓、无在途订单且没有待完成的再次入场等待时移除。智能模式淘汰用：扫描拿到的
     // 快照与真正删除之间，那个 bot 可能刚好开了仓——直接 remove_bot 会把一笔
     // 真实仓位变成没人管的孤儿仓
     bool remove_if_flat(const std::string& bot_id);
     void stop_all();
     std::vector<TrendBot> get_bots() const;
+    struct Inspection {
+        TrendBot bot;
+        std::string gate, rotation, decision;
+        bool replaceable = false, has_signal = false, filtered = false;
+    };
+    std::vector<Inspection> inspect_bots() const;
+    void update_monitor_history(const std::string& id, const std::vector<following::Observation>& history,
+                                int64_t target_ms, const following::Config& settings);
+    void mark_signal_failure(const std::string& id, const std::string& reason);
 
     void set_log_cb(LogCb cb)     { log_cb_   = std::move(cb); }
     void set_trade_cb(TradeCb cb) { trade_cb_ = std::move(cb); }
@@ -410,6 +450,7 @@ public:
     void set_risk_limits(double total, double direction, double cost_bps);
     void set_max_total_margin(double usdt);
     void set_max_open_positions(int n);
+    void set_rotation_enabled(bool enabled);
 
     // ── 智能模式相关的账户级闸门（都只拦【开新仓】，已有仓位照常管理）────────
     // 当日亏损限额（0 = 关）：全部 bot（手动 + 自动）当日已实现盈亏，减去每笔
@@ -424,11 +465,8 @@ public:
     // 手动暂停开新仓（应急开关）。对全部 bot 生效，不删 bot、不动已有仓位
     void set_pause_new(bool on);
     bool pause_new() const;
-    // 名额紧张时优先高分：同时持仓数 ≥ 上限 − reserve 时，自动 bot 的综合分
-    // 低于 min_score 就不开。手动 bot 不受影响。reserve = 0 关
-    void set_priority_reserve(int reserve, double min_score);
-    // 智能模式每轮扫描后写入排名与分数（界面显示、名额取舍用）
-    void set_smart_meta(const std::string& bot_id, double score, int rank, char list);
+    // Independent of the user's pause switch; one healthy store cannot clear another failure.
+    void set_persistence_error(const std::string& source, const std::string& error);
     // 标为待移出：手上的仓位照常管到平仓，平仓后不再开新仓。on=false 撤销
     // （关掉智能模式又用同一套策略打开：这些 bot 重新归它管）
     void set_retiring(const std::string& bot_id, bool on = true);
@@ -630,8 +668,12 @@ private:
     void submit_close(const std::string& bot_id, const std::string& reason,
                       trend::Pos reverse_to);
     void submit_open (const std::string& bot_id, trend::Pos dir, bool from_reverse);
+    void execute_open(const std::string& bot_id, trend::Pos dir, bool from_reverse);
+    void execute_close(const std::string& bot_id, const std::string& reason,
+                       trend::Pos reverse_to, bool* fully_closed = nullptr);
+    void verify_external_close(const std::string& bot_id);
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
-    void log(const std::string& msg) const;
+    void log(const std::string& msg);
 
     // 计算下单数量。Notional 用固定名义；RiskBased 用【真实止损距离】反推
     // 并受 budget 封顶。
@@ -640,9 +682,38 @@ private:
     // stop_price<=0 或与 price 重合时无法计算，返回 0（调用方跳过下单）
     double plan_qty(const TrendConfig& cfg, double price, double stop_price) const;
     // 账户级闸门：空串=放行，否则是拦截原因。⚠ 调用方须已持 mtx_
-    std::string open_gate_block(const TrendBot& self) const;
-    std::string risk_gate_block(const TrendBot& self, trend::Pos dir, double risk) const;
+    std::string open_gate_block(const TrendBot& self, const TrendBot* releasing = nullptr) const;
+    void start_reentry_wait(TrendBot& bot);
+    const char* reentry_block(const TrendBot& bot, trend::Pos direction) const;
+    std::string risk_gate_block(const TrendBot& self, trend::Pos dir, double risk,
+                                const TrendBot* releasing = nullptr) const;
     double max_total_risk_ = 0, max_direction_risk_ = 0, risk_cost_rate_ = 0;
+
+    bool rotation_enabled_ = false;
+    struct RotationRequest {
+        trend::Pos dir = trend::Pos::Flat;
+        int64_t bar_ms = 0;
+        uint64_t arrival = 0;
+    };
+    uint64_t rotation_arrival_ = 0;
+    std::map<std::string, RotationRequest> rotation_queue_;
+    struct RotationTask {
+        std::string incoming, outgoing;
+        trend::Pos dir = trend::Pos::Flat;
+        int64_t bar_ms = 0;
+        bool opening = false;
+        double planned_qty = 0, planned_price = 0, planned_atr = 0, planned_stop = 0;
+        double cost_rate = 0;
+        TrendConfig config;
+    } rotation_;
+    void update_rotation_health(TrendBot& bot);
+    bool rotation_exit_eligible(const TrendBot& bot, bool allow_pending = false) const;
+    std::string rotation_entry_block(const TrendBot& bot, trend::Pos dir,
+                                     int64_t signal_bar, trend::Inputs* in = nullptr) const;
+    void pump_rotation();
+    void execute_rotation();
+    void finish_rotation();
+    std::string rotation_close_block(const TrendBot& outgoing) const;
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;
@@ -655,6 +726,7 @@ private:
     int                             seq_ = 0;
     double                          max_total_margin_   = 0;   // 0=不限
     int                             max_open_positions_ = 0;   // 0=不限
+    std::map<std::string, std::string> persistence_errors_;
     // 账户级硬止损熔断：累计的兜底平仓次数，以及是否已经全局停止开新仓。
     // 一次成功挂单会把计数清零——那说明故障已经过去了
     int                             ds_abandons_total_  = 0;
@@ -676,8 +748,6 @@ private:
     double                          daily_loss_limit_ = 0;
     double                          float_loss_limit_ = 0;
     bool                            pause_new_        = false;
-    int                             prio_reserve_     = 0;
-    double                          prio_min_score_   = 0;
     int64_t                         day_key_          = 0;   // day_realized_ 属于哪个 UTC 日
     double                          day_realized_     = 0;
     // 自动 bot 的过滤计数（按类别）与被闸门拦过的 bot。见 take_filter_summary

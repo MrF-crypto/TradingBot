@@ -1,3 +1,4 @@
+#include "core/monitor_state.h"
 // MainWindow 的趋势策略部分：行序、行填充、配置表单、落地、持久化。
 //
 // 单独一个翻译单元，不塞进 main_window.cpp——那个文件已经 3800+ 行，
@@ -10,6 +11,7 @@
 // 落盘文件名仍是 sar_bots.json（v4.x 留下的），改名会让升级的人丢掉全部配置。
 #include "gui/main_window.h"
 #include "core/app_logic.h"
+#include "core/atomic_file.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -24,7 +26,7 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
-#include <QSaveFile>
+#include <QStatusBar>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QVBoxLayout>
@@ -115,46 +117,11 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     botTable_->setItem(row, ColIdx, mk(QString::number(row + 1), kGrey));
 
     // ── 1 品种 ──
-    // 智能模式的自动 bot 带标签：哪份名单、第几名。不在名单里了（持仓中等走完）显示"待移出"
+    // 智能模式只显示统一候选及暂停新仓状态，不显示分榜和排名。
     if (b.is_auto) {
-        // 名单 / 分段代码见 core/smart_mode.h（L/S 突破模式，U/D/M/H 混合模式）
-        auto list_short = [](char c) -> QString {
-            switch (c) {
-            case 'L': return "多";
-            case 'S': return "空";
-            case 'U': return "强";
-            case 'D': return "弱";
-            case 'M': return "中";
-            case 'H': return "过热";
-            default:  return "";
-            }
-        };
-        auto list_long = [](char c) -> QString {
-            switch (c) {
-            case 'L': return "做多名单";
-            case 'S': return "做空名单";
-            case 'U': return "强势候选";
-            case 'D': return "弱势候选";
-            case 'M': return "中间段（多空）";
-            case 'H': return "异动候选";
-            default:  return "名单";
-            }
-        };
-        // "智能"已经显示在周期·模式列，这里只标段和名次。
-        // 名单信息不落盘：重启后到第一轮扫描之前分数是 0，这时不标
-        const QString tag = b.smart_rank > 0
-            ? QString("%1#%2").arg(list_short(b.smart_list)).arg(b.smart_rank)
-            : (b.smart_score > 0 ? QString("待移出") : QString());
-        auto* sym_it = mk(QString::fromStdString(b.cfg.symbol) + (tag.isEmpty() ? "" : "  " + tag),
-                          (b.smart_rank > 0) ? kBlue : kGrey);
-        sym_it->setToolTip(QString("智能模式管理的 bot\n综合分 %1　%2\n"
-                                   "空仓时掉出名单（连续 2 轮、满 24 小时）会被自动移除；"
-                                   "持仓中绝不移除，等这笔走完")
-                               .arg(b.smart_score, 0, 'f', 0)
-                               .arg(b.smart_rank > 0
-                                        ? QString("%1第 %2 名").arg(list_long(b.smart_list))
-                                                              .arg(b.smart_rank)
-                                        : QString("已不在名单")));
+        auto* sym_it = mk(QString::fromStdString(b.cfg.symbol), b.retiring ? kGrey : kBlue);
+        sym_it->setToolTip("智能统一候选：通过硬过滤后监控自身趋势与突破。\n"
+                          "不合格品种暂停新仓，已有仓位继续管理至平仓；数据未知时保留状态。");
         botTable_->setItem(row, ColSym, sym_it);
     } else {
         botTable_->setItem(row, ColSym, mk(QString::fromStdString(b.cfg.symbol)));
@@ -465,6 +432,9 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     if (stopped)            st_s = "已停止";
     else if (b.pending)     st_s = "下单中";
     else if (has_pos)       st_s = "持仓中";
+    else if (b.needs_reconcile) st_s = "恢复核对";
+    else if (b.monitor.fetch_failed) st_s = "K线数据异常";
+    else if (b.monitor.recovering) st_s = "补齐历史K线";
     else if (b.st.cooldown_left > 0)
         st_s = QString("冷却%1根").arg(b.st.cooldown_left);
     else {
@@ -476,7 +446,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
         else                                st_s = "等信号";
     }
     // 被闸门拦住不是"正常等待"，标琥珀让它和"等信号"区分开
-    const bool gated = st_s.startsWith("闸门") || st_s == "信号过期";
+    const bool gated = st_s.startsWith("闸门") || st_s == "信号过期" || b.monitor.fetch_failed || b.monitor.recovering || b.needs_reconcile;
     QString st_c = stopped ? kRed : has_pos ? kBlue : gated ? kAmber : kGrey;
 
     // ATR 数据灯：原先是独立一列，合表后并进状态列。
@@ -492,6 +462,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     {
         QString tip = QString::fromStdString(b.last_decision);
         if (tip.isEmpty()) tip = "尚未产生决策";
+        if (!b.monitor.data_error.empty()) tip += "\n行情状态：" + QString::fromStdString(b.monitor.data_error);
         tip += "\n\n";
         if (!b.last_action.empty())
             tip += QString("最近动作：%1\n").arg(QString::fromStdString(b.last_action));
@@ -499,7 +470,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
             tip += bar_mode
                 ? "⚠ 摆动窗口未就绪：K 线还没拉到，算不出止损线，引擎不会开新仓。\n"
                   "（裸K线模式不需要 ATR，所以 ATR 缺失不影响它）\n"
-                : "⚠ 尚未拉到 K 线：没有 ATR 就没有止损线，引擎不会开新仓。\n";
+                : "⚠ K线或指标尚未就绪：无法确定入场止损线，暂不开新仓；已有止损继续保留。\n";
             tip += "刚添加的品种最多等一个信号周期；持续如此请看日志里的"
                    "「信号拉取失败」告警";
         } else if (b.atr_pct > 0) {
@@ -1586,14 +1557,22 @@ void MainWindow::save_trend_bots() {
         // 单号必须跨重启存活：不存的话重启后会遗留一张触发价对不上的
         // 孤儿单，而 closePosition 同方向只能有一张，新的挂不上去
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
+        o["ds_vanished_id"]      = QString::fromStdString(b.ds_vanished_id);
         o["disaster_stop_price"] = b.disaster_stop_price;
         o["state"]           = (int)b.state;
-        o["open_uncertain"] = b.open_uncertain || (b.pending && b.st.pos == trend::Pos::Flat);
+        o["open_uncertain"] = b.open_uncertain || (b.pending && !b.rotation_reserved && b.st.pos == trend::Pos::Flat);
         o["uncertain_client_id"] = QString::fromStdString(b.uncertain_client_id);
         o["reserved_risk"] = b.reserved_risk;
         o["reserved_margin"] = b.reserved_margin;
         o["reserved_dir"] = (int)b.reserved_dir;
         o["auto"]            = b.is_auto;   // 智能模式管理的 bot
+        if (b.is_auto) {
+            smart::Config stored;
+            stored.tmpl = b.cfg;
+            stored.dir_long = b.cfg.rule.direction != trend::Direction::ShortOnly;
+            stored.dir_short = b.cfg.rule.direction != trend::Direction::LongOnly;
+            o["auto_config"] = QJsonDocument::fromJson(QByteArray::fromStdString(smart::config_to_json(stored))).object();
+        }
         // ── 运行时状态 ──
         // Qt 的 QJsonValue(double) 是全精度往返，不像 ostringstream 会截到 6 位。
         // 这点在 SAR 上尤其要紧：止损线【就是】出场价
@@ -1609,11 +1588,8 @@ void MainWindow::save_trend_bots() {
         // 开仓时被突破的通道边沿。丢了的话"收盘跌回通道内就走"在重启后失效
         o["entry_edge"]      = b.st.entry_edge;
         o["fail_bar_ms"]     = (qint64)b.st.fail_bar_ms;   // 假突破从哪一根的收盘开始判
-        // 数据记录层：开仓那一刻的名单信息与入场位置，跨重启的仓位平掉时要用
+        // 数据记录层：开仓时间与入场位置，跨重启的仓位平掉时要用
         o["open_ms"]         = (qint64)b.open_ms;
-        o["open_seg"]        = (int)b.open_seg;
-        o["open_rank"]       = b.open_rank;
-        o["open_score"]      = b.open_score;
         if (std::isfinite(b.open_dist_atr)) o["open_dist_atr"] = b.open_dist_atr;
         // 浮盈亏最低（持仓期最差价）与 R 的分母。丢了的话重启前那段浮亏就没了
         o["trough"]          = b.trough;
@@ -1621,12 +1597,13 @@ void MainWindow::save_trend_bots() {
         if (std::isfinite(b.open_vol_ratio)) o["open_vol_ratio"] = b.open_vol_ratio;
         if (std::isfinite(b.open_box_atr))   o["open_box_atr"]   = b.open_box_atr;
         if (std::isfinite(b.open_taker))     o["open_taker"]     = b.open_taker;
-        o["smart_list"]      = (int)b.smart_list;
         o["consec_reverses"] = b.st.consec_reverses;
         o["cooldown_left"]   = b.st.cooldown_left;
         // ③ 裸K 专用：once_per_bar 的判据（最后一次开仓所在K线的开盘时间）。
         // 用 qint64 重载而不是 double：毫秒时间戳虽然还在 double 的精确整数
         // 范围内，但这是个"现在够用"的巧合，不值得把它写进持久化格式
+        o["monitor_checkpoint"] = QJsonDocument::fromJson(QByteArray::fromStdString(monitor_checkpoint_json(b))).object();
+        o["reentry_after_ms"] = (qint64)b.reentry_after_ms;
         o["last_entry_bar_ms"] = (qint64)b.st.last_entry_bar_ms;
         o["qty"]             = b.qty;
         o["realized_pnl"]    = b.realized_pnl;
@@ -1634,12 +1611,16 @@ void MainWindow::save_trend_bots() {
         o["win_count"]       = b.win_count;
         arr.append(o);
     }
-    // QSaveFile = 原子写（写临时文件 + commit 时改名）。崩在写入中途不会
-    // 留下半截 JSON——而半截 JSON 丢掉的正是那条止损线
-    QSaveFile f(QString::fromStdString(trend_cfg_path()));
-    if (!f.open(QIODevice::WriteOnly)) return;
-    f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
-    f.commit();
+    const auto payload = QJsonDocument(arr).toJson(QJsonDocument::Compact).toStdString();
+    const auto result = ccbot::write_atomic_file(trend_cfg_path(), payload);
+    if (trend_engine_) trend_engine_->set_persistence_error("趋势断点", result.error);
+    if (!result.ok) {
+        trendSaveFailed_ = true;
+        statusBar()->showMessage("状态保存失败，已暂停新开仓：" + QString::fromStdString(result.error));
+    } else if (trendSaveFailed_) {
+        trendSaveFailed_ = false;
+        statusBar()->showMessage("状态保存已恢复", 10000);
+    }
 }
 
 void MainWindow::load_and_restore_trend() {
@@ -1648,15 +1629,49 @@ void MainWindow::load_and_restore_trend() {
     QFile f(QString::fromStdString(trend_cfg_path()));
     if (!f.open(QIODevice::ReadOnly)) return;
     const auto doc = QJsonDocument::fromJson(f.readAll());
-    if (!doc.isArray()) return;
+    if (!doc.isArray()) {
+        trendStateBlocked_ = true;
+        QMessageBox::critical(this, "状态文件损坏", "状态文件不是有效JSON数组，已停止恢复并保留原文件。");
+        return;
+    }
 
     trendStateBlocked_ = false;
     for (const auto& value : doc.array()) {
         const auto o = value.toObject();
+        if (!value.isObject() || o["symbol"].toString().isEmpty()) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "状态文件损坏", "状态条目或品种字段无效，已保留原文件。");
+            return;
+        }
+        if (o.contains("auto_config")) {
+            smart::Config probe; std::string error;
+            if (!o["auto_config"].isObject() || !smart::config_from_json(
+                QJsonDocument(o["auto_config"].toObject()).toJson(QJsonDocument::Compact).toStdString(), probe, &error)) {
+                trendStateBlocked_ = true;
+                QMessageBox::critical(this, "状态文件损坏", "保存的策略参数无效，保留原文件：" + QString::fromStdString(error));
+                return;
+            }
+        }
+        if (o.contains("monitor_checkpoint")) {
+            TrendBot probe; std::string error;
+            if (!o["monitor_checkpoint"].isObject() || !restore_monitor_checkpoint(
+                QJsonDocument(o["monitor_checkpoint"].toObject()).toJson(QJsonDocument::Compact).toStdString(), probe, error)) {
+                trendStateBlocked_ = true;
+                QMessageBox::critical(this, "状态文件损坏", QString::fromStdString(error.empty() ? "监控断点类型错误，保留原文件" : error));
+                return;
+            }
+        }
         if (o.contains("open_uncertain") && !o["open_uncertain"].isBool()) {
             trendStateBlocked_ = true;
             QMessageBox::critical(this, "状态文件损坏",
                 "开仓委托状态字段损坏，已停止恢复并保留原状态文件。请先核对委托与持仓。");
+            return;
+        }
+        if (o.contains("reentry_after_ms") &&
+            (!o["reentry_after_ms"].isDouble() || o["reentry_after_ms"].toInteger(-1) < 0)) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "状态文件损坏",
+                "平仓后等待状态字段损坏，已停止恢复并保留原状态文件。");
             return;
         }
         const bool removed = o["strategy"].toInt(0) == 3 ||
@@ -1801,15 +1816,24 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.disaster_stop_buffer_pct =
             o["disaster_stop_buffer_pct"].toDouble(1.0);
         b.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
+        b.ds_vanished_id      = o["ds_vanished_id"].toString().toStdString();
         b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (TrendBot::State)o["state"].toInt(0);
+        b.needs_reconcile = true;
         b.is_auto = o["auto"].toBool(false);
         b.open_uncertain = o["open_uncertain"].toBool(false);
         b.uncertain_client_id = o["uncertain_client_id"].toString().toStdString();
         b.reserved_risk = o["reserved_risk"].toDouble(0);
         b.reserved_margin = o["reserved_margin"].toDouble(0);
         b.reserved_dir = (trend::Pos)o["reserved_dir"].toInt(0);
-        if (b.is_auto) b.cfg.rule.following = smartCfg_.tmpl.rule.following;
+        if (b.is_auto) {
+            b.cfg.rule.following = smartCfg_.tmpl.rule.following; // legacy file migration
+            if (o["auto_config"].isObject()) {
+                smart::Config stored;
+                smart::config_from_json(QJsonDocument(o["auto_config"].toObject()).toJson(QJsonDocument::Compact).toStdString(), stored, nullptr);
+                b.cfg.rule.following = stored.tmpl.rule.following;
+            }
+        }
 
         const int pos = o["pos"].toInt((int)trend::Pos::Flat);
         b.st.pos = (pos == (int)trend::Pos::Long)  ? trend::Pos::Long
@@ -1825,9 +1849,6 @@ void MainWindow::load_and_restore_trend() {
         b.st.entry_edge      = o["entry_edge"].toDouble(0);
         b.st.fail_bar_ms     = (int64_t)o["fail_bar_ms"].toInteger(0);
         b.open_ms            = (int64_t)o["open_ms"].toInteger(0);
-        b.open_seg           = (char)o["open_seg"].toInt(0);
-        b.open_rank          = o["open_rank"].toInt(0);
-        b.open_score         = o["open_score"].toDouble(0);
         b.open_dist_atr      = o.contains("open_dist_atr")
                                    ? o["open_dist_atr"].toDouble(0)
                                    : std::numeric_limits<double>::quiet_NaN();
@@ -1839,9 +1860,9 @@ void MainWindow::load_and_restore_trend() {
                                                           : std::numeric_limits<double>::quiet_NaN();
         b.open_taker         = o.contains("open_taker") ? o["open_taker"].toDouble(0)
                                                         : std::numeric_limits<double>::quiet_NaN();
-        b.smart_list         = (char)o["smart_list"].toInt(0);
         b.st.consec_reverses = o["consec_reverses"].toInt(0);
         b.st.cooldown_left   = o["cooldown_left"].toInt(0);
+        b.reentry_after_ms = (int64_t)o["reentry_after_ms"].toInteger(0);
         b.st.last_entry_bar_ms = (int64_t)o["last_entry_bar_ms"].toInteger(0);
         b.qty          = o["qty"].toDouble(0);
         b.realized_pnl = o["realized_pnl"].toDouble(0);
@@ -1861,6 +1882,12 @@ void MainWindow::load_and_restore_trend() {
         // 路径没拦，手改过的落盘文件会漏进来）。只剩一套策略之后，这类跨引擎
         // 冲突不存在了——同品种只能有一个 bot，由 restore_bot 自己保证
 
+        if (o.contains("monitor_checkpoint")) {
+            std::string error;
+            if (!restore_monitor_checkpoint(QJsonDocument(o["monitor_checkpoint"].toObject()).toJson(QJsonDocument::Compact).toStdString(), b, error)) {
+                trendStateBlocked_ = true; return;
+            }
+        }
         if (!trend_engine_->restore_bot(b).empty()) {
             ++n;
             if (ticker_) ticker_->subscribe(b.cfg.symbol);

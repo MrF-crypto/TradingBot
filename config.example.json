@@ -13,7 +13,6 @@
     "strategy": "trend_following",
     "dir_long": true,
     "dir_short": true,
-    "dir_mode": "mixed",
     "atr_pct_min": 0.1,
     "atr_pct_max": 8,
     "max_abs_chg24": 0,
@@ -50,7 +49,8 @@
       "lock_atr": true,
       "accel_exit": false,
       "signal_max_age_sec": 120
-    }
+    },
+    "rotate_when_full": false
   },
   "trend_bots": [
     {

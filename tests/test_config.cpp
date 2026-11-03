@@ -201,7 +201,7 @@ int main() {
                          "\"template\":{\"budget_usdt\":50,\"atr_mult\":2.5}}}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "smart_mode 段能加载（不配 trend_bots 也行）");
-        check(hc.smart.enabled && !hc.smart.dir_short && hc.smart.long_n == 30 &&
+        check(hc.smart.enabled && !hc.smart.dir_short &&
               std::fabs(hc.smart.min_quote_vol - 8e6) < 1e-6 &&
               std::fabs(hc.smart.daily_loss_limit - 150) < 1e-9 && hc.smart.blacklist.count("XUSDT"),
               "  各项读入");

@@ -101,7 +101,7 @@ public:
     };
     // 统一的 K 线拉取+解析（fetch_indicators / fetch_trend 共用）
     std::vector<Bar> fetch_klines(const std::string& symbol,
-                                  const std::string& interval, int limit);
+                                  const std::string& interval, int limit, int64_t end_ms = 0);
 
     // ── SAR 策略信号快照（ATR + 唐奇安通道）────────────────────────────────
     // 公开接口，不占签名限流。一次K线拉取同时算出止损距离和入场信号。
@@ -111,6 +111,10 @@ public:
     //   而价格用的【是】当前未收盘K线的实时收盘值——用已收盘的通道，让实时
     //   价格去撞它，这才是突破
     struct TrendSnapshot {
+        std::string error; // A concrete failure reason; never replaced by a generic stale label.
+        std::vector<following::Observation> history;
+        int64_t history_target_ms = 0;
+        bool history_only = false;
         following::Signal following;
         bool    ok      = false;   // ATR 与通道都算得出来
         double  price   = 0;
@@ -132,7 +136,7 @@ public:
     };
     TrendSnapshot fetch_trend_signal(const std::string& symbol, const std::string& interval,
                                  int donchian_period, int atr_period,
-                                 const following::Config& following = {});
+                                 const following::Config& following = {}, int64_t resume_after_ms = 0);
 
     // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
     // fetch_atr 删于 v5.9.9：零调用者，它只服务已移除的网格 DCA
@@ -412,6 +416,8 @@ public:
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
+    CloseVerification verify_close(const std::string& symbol, const std::string& entry_side,
+                                   const std::string& stop_id) override;
     // 【本线程】上一次请求的失败原因（空 = 成功或业务错误）：超时 / 连不上 / 连接中断 /
     // HTTP 状态码 / 返回的不是 JSON（附开头几十个字）。日志里"JSON解析失败"之类的话
     // 光看分不出是代理冒充、币安网关 502 还是超时，修法完全不同。
@@ -426,8 +432,6 @@ public:
                                       double qty = 0) override;
     bool cancel_disaster_stop(const std::string& symbol,
                               const std::string& order_id) override;
-    bool is_disaster_stop_live(const std::string& symbol,
-                               const std::string& order_id, bool* ok) override;
 
 private:
     // 不带 -4061 自愈包装的裸下单。只给 place_market 用 —— 见它那段注释：
@@ -526,8 +530,6 @@ private:
     static CurlSlot* grab_slot(CurlSlot (&pool)[kCurlPoolSize], std::unique_lock<std::mutex>& lk);
     // 设杠杆成功过的（品种 → 杠杆）。同样的杠杆不再重复设：每次开仓都发一次 POST，
     // 多一个请求就多一次在代理上失败的机会
-    std::mutex                           lev_mtx_;
-    std::unordered_map<std::string, int> lev_set_;
 
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;

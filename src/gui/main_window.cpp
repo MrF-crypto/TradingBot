@@ -3,6 +3,7 @@
 #include "core/key_store.h"
 #include "core/app_logic.h"
 #include "core/parallel.h"
+#include "core/shutdown.h"
 #include "net/alert.h"
 
 #include <QApplication>
@@ -167,8 +168,7 @@ MainWindow::~MainWindow() {
     // 超时是 10 秒；而一次 place_market 会串起很多次 HTTP：
     //     POST 超时 10s → 空响应 → 查单恢复 3×(600ms+10s) ≈ 42s
     // 坏网络下 42 秒是很平常的情形，20 秒远远不够。
-    const bool drained = (!pool_ || pool_->wait_idle(kShutdownDrainMs));
-    if (fetchPool_) fetchPool_->wait_idle(5000);   // 数据拉取不影响资金，等短一点
+    const bool drained = ccbot::shutdown_pools(fetchPool_.get(), pool_.get(), kShutdownDrainMs);
 
     // ③ 此刻状态最完整，落盘
     if (tradesDirty_) save_trades(true);
@@ -184,7 +184,7 @@ MainWindow::~MainWindow() {
     // 绝不在已释放的对象上执行代码
     if (!drained) {
         // 跳过清理直接结束进程，避免访问已释放内存
-        log("退出时仍有下单任务未完成，已直接退出；下次启动会对账核对", "WARN");
+        log("退出时仍有数据或订单任务未完成，已保存可用断点并直接退出；下次启动会对账核对", "WARN");
         std::_Exit(0);
     }
 }
@@ -200,6 +200,15 @@ QString MainWindow::portable_data_dir() {
     if (!cached.isEmpty()) return cached;
 
     QString portable = QCoreApplication::applicationDirPath() + "/data";
+#ifdef Q_OS_MAC
+    // A new .app must not write into its signed bundle. Preserve a legacy portable
+    // data directory if one already exists; otherwise upgrades share AppDataLocation.
+    if (!QDir(portable).exists()) {
+        cached = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QDir().mkpath(cached);
+        return cached;
+    }
+#endif
     if (QDir().mkpath(portable)) {
         QFile probe(portable + "/.write_test");
         if (probe.open(QIODevice::WriteOnly)) {
@@ -1301,6 +1310,7 @@ void MainWindow::onConnect() {
             }
             // 智能模式：运行器持有引擎指针，随引擎一起重建
             startSmartRunner();
+            save_trend_bots(); // 首次入场前验证断点可写；失败仅暂停新增风险。
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
@@ -1844,8 +1854,12 @@ void MainWindow::onTick() {
                     }
                     auto snap = client_->fetch_trend_signal(
                         b.cfg.symbol, b.cfg.interval,
-                        b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.cfg.rule.following);
+                        b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.signal_following_config(), b.resume_after_ms());
+                    if (snap.history_target_ms > 0)
+                        trend_engine_->update_monitor_history(b.bot_id, snap.history, snap.history_target_ms, b.signal_following_config());
+                    if (snap.history_only) { ++okn_a; return; }
                     if (!snap.ok) {
+                        trend_engine_->mark_signal_failure(b.bot_id, snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error);
                         mark_failed(b.cfg.symbol);
                         return;
                     }
@@ -1860,12 +1874,14 @@ void MainWindow::onTick() {
                                                snap.taker_ratio, snap.range_pace, snap.following);
                   } catch (...) {
                     // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
+                    trend_engine_->mark_signal_failure(need[idx].bot_id, "网络或行情处理失败，保留断点等待重试");
                     mark_failed(need[idx].cfg.symbol);
                   }
                 });
                 const int okn = okn_a.load();
                 trendSigBusy_.store(false);
                 QMetaObject::invokeMethod(this, [this, failed, okn]() {
+                    save_trend_bots();
                     // 只在【集合变化】时报。拉取每分钟一轮，而一个拼错的品种会
                     // 永远失败——每轮都报就是每小时 60 条同样的告警，把真正有用
                     // 的日志全冲走（本项目踩过这个：150 行日志里 120 行是噪音）

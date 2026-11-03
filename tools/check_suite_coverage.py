@@ -46,11 +46,25 @@ def needs_tsan() -> set[str]:
 
     判据放在【测试源码】上而不是被测代码上：一个测试只有真的起了并发，
     TSan 才有东西可查。"""
+    def source_with_headers(path: Path, seen: set[Path]) -> str:
+        path = path.resolve()
+        if path in seen or not path.is_file():
+            return ""
+        seen.add(path)
+        body = path.read_text(encoding="utf-8", errors="replace")
+        for name in re.findall(r'^\s*#include\s+"([^"]+)"', body, re.M):
+            header = (path.parent / name).resolve()
+            if header.is_relative_to(ROOT / "tests"):
+                body += source_with_headers(header, seen)
+        return body
+
     out = set()
-    for f in (ROOT / "tests").glob("test_*.cpp"):
-        body = f.read_text(encoding="utf-8", errors="replace")
+    cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    for target, sources in re.findall(r'add_executable\((ccg_\w+_tests)\s+([^)]*)\)', cmake):
+        body = "".join(source_with_headers(ROOT / name, set())
+                       for name in re.findall(r'tests/[\w/]+\.cpp', sources))
         if "std::thread" in body or "ThreadPool" in body:
-            out.add("ccg_" + f.stem.removeprefix("test_") + "_tests")
+            out.add(target)
     return out
 
 

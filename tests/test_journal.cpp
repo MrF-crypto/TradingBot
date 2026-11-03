@@ -53,7 +53,7 @@ int main() {
     t.entry_price = 100; t.exit_price = 110; t.qty = 2; t.pnl = 20;
     t.reason = "追踪止盈出场，等待新信号";
     t.open_time = at(t0); t.close_time = at(t0 + 5 * 3600000LL);
-    t.is_auto = true; t.seg = smart::kSegStrong; t.rank = 3; t.score = 72.5;
+    t.is_auto = true;
     t.entry_dist_atr = 0.8; t.interval = "1h";
     t.mfe_usd = 30; t.mae_usd = -8; t.mfe_pct = 15; t.mae_pct = -4;
     t.mfe_atr = 7.5; t.mae_atr = -2; t.mfe_r = 2.5; t.mae_r = -0.6667;
@@ -69,9 +69,9 @@ int main() {
     check(tl.size() == 3, "trades.csv：表头 1 行 + 2 笔（表头只写一次）");
     if (tl.size() == 3) {
         check(tl[0].rfind("\xEF\xBB\xBF", 0) == 0 && has(tl[0], "入场离通道边沿ATR"), "  带 BOM 的中文表头");
-        check(has(tl[1], "AAAUSDT") && has(tl[1], "强势") && has(tl[1], ",3,") &&
-              has(tl[1], "72.5") && has(tl[1], ",0.8,") && has(tl[1], "自动"),
-              "  开仓时所在段、名次、分数、入场离边沿 ATR 都写进去了");
+        check(has(tl[1], "AAAUSDT") && has(tl[1], ",0.8,") && has(tl[1], "自动") &&
+              !has(tl[0], "分数") && !has(tl[0], "名次"),
+              "  保留入场离边沿 ATR 和自动标记，移除评分列");
         check(has(tl[1], "2026-10-10 13:00:00,2026-10-10 08:00:00,5,"), "  平仓/开仓时间与持仓小时");
         // 估算手续费 (100+110)*2*0.0005 = 0.21，净盈亏 19.79
         check(has(tl[1], ",0.21,19.79,"), "  估算手续费与净盈亏");
@@ -102,24 +102,17 @@ int main() {
     check(fs::exists(dir / "scan-20261001.csv"), "  保留期内的不动");
 
     // ── 候选池 ──
-    j.pool(t0, "DDDUSDT", "加入", smart::kSegHot, 1, 40, "仅空");
-    j.pool(t0, "DDDUSDT", "移出", 0, 0, 0, "连续 2 轮掉出名单");
+    j.pool(t0, "DDDUSDT", "加入", "双向");
+    j.pool(t0, "DDDUSDT", "移出", "硬过滤不合格");
     auto pl = lines_of(dir / "pool.csv");
-    check(pl.size() == 3 && has(pl[1], "过热") && has(pl[2], "掉出名单"), "pool.csv：加入 / 移出事件");
+    check(pl.size() == 3 && has(pl[1], "双向") && has(pl[2], "硬过滤不合格"), "pool.csv：加入 / 移出事件");
 
     // ── 扫描快照 ──
-    smart::Ranking rk;
-    smart::Scored s;
-    s.symbol = "EEEUSDT"; s.long_score = 80; s.rs_pct = 90;
-    s.f.ok = true; s.f.rs = 1.2; s.f.close = 0.01234; s.f.max_up24 = 12;
-    rk.rows["EEEUSDT"] = s;
-    smart::Scored s2 = s; s2.symbol = "FFFUSDT"; s2.f.rs = 0;
-    rk.rows["FFFUSDT"] = s2;
-    smart::Segmented sg;
-    sg.seg["EEEUSDT"] = smart::kSegStrong;
-    sg.seg["FFFUSDT"] = smart::kSegMid;
-    sg.strong = {"EEEUSDT"};
-    rk.rows["EEEUSDT"].f.taker1 = 0.55; rk.rows["EEEUSDT"].f.taker6 = 0.48;
+    std::map<std::string, smart::Features> candidates;
+    smart::Features f;
+    f.ok = true; f.close = 0.01234; f.atr_pct = 2;
+    candidates["EEEUSDT"] = f;
+    candidates["FFFUSDT"] = f;
     std::map<std::string, smart::OiStat> oi;
     {
         smart::OiStat o;
@@ -128,20 +121,19 @@ int main() {
     }
     // 老版本留下的今天的文件（表头少几列）：改名留着，另起一份
     std::ofstream(dir / "scan-20261010.csv", std::ios::binary) << "\xEF\xBB\xBF" "时间UTC,品种\nold,row\n";
-    j.scan(t0, rk, sg, {"EEEUSDT"}, oi);
+    j.scan(t0, candidates, {"EEEUSDT"}, oi);
     auto sl = lines_of(dir / "scan-20261010.csv");
-    check(sl.size() == 3, "scan 快照：全部合格币各一行（不只是进名单的）");
+    check(sl.size() == 3, "scan 快照：统一候选池每个合格币各一行");
     if (sl.size() == 3) {
-        check(has(sl[1], "EEEUSDT,强势,1,") && has(sl[1], "0.01234") && has(sl[1], ",是"),
-              "  所在段、段内名次、收盘价、已有 bot");
-        check(has(sl[2], "FFFUSDT,中间,,"), "  分了段但没进名单：名次留空");
-        check(has(sl[0], ",已有bot,主动买入占比1h,主动买入占比6h,持仓量时间UTC,持仓价值U,"
+        check(has(sl[1], "EEEUSDT,2,0.01234,是"), "  品种、ATR%、收盘价、已有 bot");
+        check(has(sl[2], "FFFUSDT,2,0.01234,"), "  无 bot 的合格候选也记录");
+        check(has(sl[0], ",已有bot,持仓量时间UTC,持仓价值U,"
                          "持仓量变化1h%,持仓量变化4h%,持仓量变化24h%"),
-              "  主动买入占比与持仓量的表头");
-        check(has(sl[1], ",是,0.55,0.48,2026-10-10 07:00:00,12345678,1.5,-2.25,") &&
+              "  持仓量观察值的表头");
+        check(has(sl[1], ",是,2026-10-10 07:00:00,12345678,1.5,-2.25,") &&
               sl[1].back() == ',',
-              "  主动买入占比 1h/6h、持仓量时间/价值/变化；24h 那点没拿到留空");
-        check(has(sl[2], ",,,,,,,") , "  主动买入与持仓量都没拿到：留空");
+              "  持仓量时间/价值/变化；24h 那点没拿到留空");
+        check(has(sl[2], ",,,,,,") , "  持仓量没拿到：留空");
     }
     {
         int old = 0;
@@ -157,7 +149,7 @@ int main() {
     }
     {
         // 同一次运行里再写：表头已核对过，直接追加
-        j.scan(t0 + 3600000LL, rk, sg, {}, oi);
+        j.scan(t0 + 3600000LL, candidates, {}, oi);
         check(lines_of(dir / "scan-20261010.csv").size() == 5, "  之后照常追加，不再改名");
     }
 

@@ -8,6 +8,7 @@
 #include <future>
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 
 namespace ccbot {
 
@@ -22,11 +23,7 @@ public:
     }
 
     ~ThreadPool() {
-        {
-            std::unique_lock lock(mtx_);
-            stop_ = true;
-        }
-        cv_.notify_all();
+        stop_accepting();
         for (auto& t : workers_) {
             if (t.joinable()) t.join();
         }
@@ -40,6 +37,7 @@ public:
         std::future<Ret> fut = task->get_future();
         {
             std::unique_lock lock(mtx_);
+            if (stop_) throw std::runtime_error("thread pool is shutting down");
             tasks_.emplace([task] { (*task)(); });
         }
         cv_.notify_one();
@@ -47,6 +45,10 @@ public:
     }
 
     size_t size() const { return workers_.size(); }
+    void stop_accepting() {
+        { std::lock_guard lock(mtx_); stop_ = true; }
+        cv_.notify_all();
+    }
 
     // 阻塞到"队列空 且 没有在途任务"。
     //

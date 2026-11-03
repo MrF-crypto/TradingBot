@@ -8,6 +8,8 @@ vcpkg_installed/
 *.log
 .vs/
 CMakeUserPresets.json
+__pycache__/
+*.pyc
 
 # 本地保存的加密凭证/配置，不应提交
 *credentials*

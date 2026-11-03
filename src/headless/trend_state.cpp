@@ -1,5 +1,12 @@
 #include "headless/trend_state.h"
 #include "core/app_logic.h"
+#include "core/monitor_state.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <stdexcept>
 #include "core/smart_mode.h"
 
@@ -62,7 +69,9 @@ std::string get_str(simdjson::dom::object& o, const char* key, const std::string
 
 } // namespace
 
-void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots) {
+namespace {
+std::mutex state_save_mutex;
+SaveResult save_trend_state_locked(const std::string& path, const std::vector<TrendBot>& bots) {
     std::ostringstream ss;
     // ⚠ 必须设精度。ostringstream 默认 6 位有效数字，而这里存的是开仓价、
     //   止损线、持仓量。截断的后果在 SAR 上比 DCA 更直接：止损线【就是】出场价，
@@ -74,13 +83,20 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
     for (const auto& b : bots) {
         if (!first) ss << ",";
         first = false;
+        smart::Config saved_template;
+        saved_template.tmpl = b.cfg;
+        saved_template.dir_long = b.cfg.rule.direction != trend::Direction::ShortOnly;
+        saved_template.dir_short = b.cfg.rule.direction != trend::Direction::LongOnly;
         ss << "{"
            << "\"symbol\":\""    << json_escape(b.cfg.symbol) << "\","
            << "\"state\":"       << (int)b.state << ","
            // 智能模式管理的 bot 不在配置文件里，恢复时要靠这个标记 + 智能模式模板
            // 重建参数（见 load_trend_state）
            << "\"auto\":"        << (b.is_auto ? "true" : "false") << ","
-           << "\"open_uncertain\":" << ((b.open_uncertain || (b.pending && b.st.pos == trend::Pos::Flat)) ? "true" : "false") << ","
+           << (b.is_auto ? "\"auto_config\":" + smart::config_to_json(saved_template) + "," : "")
+           << "\"saved_reverse\":" << static_cast<int>(b.cfg.rule.reverse) << ","
+           << "\"saved_hard_stop\":" << (b.cfg.use_disaster_stop ? "true" : "false") << ","
+           << "\"open_uncertain\":" << ((b.open_uncertain || (b.pending && !b.rotation_reserved && b.st.pos == trend::Pos::Flat)) ? "true" : "false") << ","
            << "\"uncertain_client_id\":\"" << json_escape(b.uncertain_client_id) << "\","
            << "\"reserved_risk\":" << b.reserved_risk << ","
            << "\"reserved_margin\":" << b.reserved_margin << ","
@@ -100,9 +116,6 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
            // 数据记录层：开仓那一刻的名单信息与入场位置。⚠ NaN 写进 JSON 是非法的，
            // 没有值就不写这个键
            << "\"open_ms\":"     << b.open_ms << ","
-           << "\"open_seg\":"    << (int)b.open_seg << ","
-           << "\"open_rank\":"   << b.open_rank << ","
-           << "\"open_score\":"  << b.open_score << ","
            << (std::isfinite(b.open_dist_atr)
                    ? "\"open_dist_atr\":" + std::to_string(b.open_dist_atr) + ","
                    : std::string())
@@ -121,14 +134,16 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
                    ? "\"open_taker\":" + std::to_string(b.open_taker) + ","
                    : std::string())
 
-           << "\"smart_list\":"  << (int)b.smart_list << ","
            // ③ 纯裸K 专用：once_per_bar 的判据。不存的话重启会让"这一根已开过"
            //    忘掉，盘中即时模式下同一根里会再开一次
+           << "\"monitor_checkpoint\":" << monitor_checkpoint_json(b) << ","
+           << "\"reentry_after_ms\":" << b.reentry_after_ms << ","
            << "\"last_entry_bar_ms\":" << b.st.last_entry_bar_ms << ","
            << "\"consec_reverses\":" << b.st.consec_reverses << ","
            // 单号必须跨重启存活：遗留一张触发价对不上的孤儿单会让
            // 下次挂新单被拒（closePosition 同方向只能有一张）
            << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
+           << "\"ds_vanished_id\":\"" << json_escape(b.ds_vanished_id) << "\","
            << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"cooldown_left\":"   << b.st.cooldown_left << ","
            << "\"qty\":"          << b.qty << ","
@@ -141,28 +156,25 @@ void save_trend_state(const std::string& path, const std::vector<TrendBot>& bots
     }
     ss << "]";
 
-    // 原子写盘：先写临时文件再改名。直接覆盖写的话，进程崩在写文件中途会留下
-    // 半截 JSON，重启后仓位跟踪静默丢失——而丢的正是那条止损线
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f) return;
-        f << ss.str();
-        f.flush();
-        if (!f.good()) return;   // 磁盘满等，保留旧文件不动
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        std::ofstream f(path, std::ios::binary | std::ios::trunc);
-        if (f) f << ss.str();
-        std::filesystem::remove(tmp, ec);
-    }
+    return write_atomic_file(path, ss.str());
+}
+} // namespace
+
+SaveResult save_trend_state(const std::string& path, const std::vector<TrendBot>& bots) {
+    std::lock_guard<std::mutex> lock(state_save_mutex);
+    return save_trend_state_locked(path, bots);
+}
+
+SaveResult save_trend_state(const std::string& path, TrendEngine& engine) {
+    std::lock_guard<std::mutex> lock(state_save_mutex);
+    const auto result = save_trend_state_locked(path, engine.get_bots());
+    engine.set_persistence_error("趋势断点", result.error);
+    return result;
 }
 
 std::vector<TrendTrade> load_trades_csv(const std::string& path) {
     std::vector<TrendTrade> out;
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
     if (!f) return out;
     std::string line;
     bool header = true;
@@ -203,30 +215,35 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const TrendConfig* auto_tmpl) {
     std::vector<TrendBot> out;
 
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
     if (!f) return out;
     std::ostringstream buf;
     buf << f.rdbuf();
     const std::string raw = buf.str();
-    if (raw.empty()) return out;
+    if (raw.empty()) throw std::runtime_error("状态文件为空，保留原文件并停止恢复");
 
     simdjson::dom::parser p;
     simdjson::dom::array arr;
     auto ps = simdjson::padded_string(raw);
-    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS) return out;
+    if (p.parse(ps).get_array().get(arr) != simdjson::SUCCESS)
+        throw std::runtime_error("状态文件JSON损坏，保留原文件并停止恢复");
 
     for (auto elem : arr) {
         simdjson::dom::object o;
-        if (elem.get(o) != simdjson::SUCCESS) continue;
+        if (elem.get(o) != simdjson::SUCCESS) throw std::runtime_error("状态条目格式无效，停止恢复");
 
         const std::string sym = get_str(o, "symbol", "");
-        if (sym.empty()) continue;
+        if (sym.empty()) throw std::runtime_error("状态条目缺少品种，停止恢复");
 
         bool is_auto = false;
         {
             bool v = false;
             if (o["auto"].get(v) == simdjson::SUCCESS) is_auto = v;
         }
+        int64_t reentry_after = 0;
+        const auto reentry_err = o["reentry_after_ms"].get(reentry_after);
+        if ((reentry_err != simdjson::SUCCESS && reentry_err != simdjson::NO_SUCH_FIELD) || reentry_after < 0)
+            throw std::runtime_error("reentry_after_ms 状态字段损坏，保留原文件并停止恢复");
         const int saved_pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
         const char smart_list = (char)(int)get_num(o, "smart_list", 0);
 
@@ -248,8 +265,22 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         if (is_auto) {
             if (auto_tmpl) {
                 auto_cfg = *auto_tmpl;
-            } else if (saved_pos == (int)trend::Pos::Flat && !saved_uncertain) {
+            } else if (saved_pos == (int)trend::Pos::Flat && !saved_uncertain && reentry_after == 0) {
                 continue;
+            }
+            simdjson::dom::element saved_config;
+            const auto saved_error = o["auto_config"].get(saved_config);
+            if (saved_error == simdjson::SUCCESS) {
+                smart::Config stored; std::string why;
+                if (!smart::config_from_json(simdjson::minify(saved_config), stored, &why))
+                    throw std::runtime_error("自动品种策略参数损坏：" + why);
+                auto_cfg = stored.tmpl;
+                auto_cfg.rule.direction = smart::bot_direction(stored);
+                auto_cfg.rule.reverse = static_cast<trend::ReverseMode>(get_i64(o, "saved_reverse", static_cast<int>(trend::ReverseMode::None)));
+                bool hard_stop = true;
+                if (o["saved_hard_stop"].get(hard_stop) == simdjson::SUCCESS) auto_cfg.use_disaster_stop = hard_stop;
+            } else if (saved_error != simdjson::NO_SUCH_FIELD) {
+                throw std::runtime_error("自动品种策略参数格式无效");
             }
             // 没有模板但有持仓：默认参数的趋势跟踪接着管，至少止损线还在
             auto_cfg.symbol = sym;
@@ -260,8 +291,10 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         if (!cfg) continue;
 
         TrendBot b;
-        b.cfg   = *cfg;                       // 参数用最新配置，不用落盘的
+        b.needs_reconcile = true; // Also protect migration from older state files.
+        b.cfg   = *cfg; // Automatic bots retain their saved template; manual configs remain explicit.
         b.is_auto = is_auto;
+        b.reentry_after_ms = reentry_after;
         bool uncertain = false;
         if (o["open_uncertain"].get(uncertain) == simdjson::SUCCESS) b.open_uncertain = uncertain;
         b.uncertain_client_id = get_str(o, "uncertain_client_id", "");
@@ -284,9 +317,6 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.st.entry_edge      = get_num(o, "entry_edge", 0);
         b.st.fail_bar_ms     = get_i64(o, "fail_bar_ms", 0);
         b.open_ms            = get_i64(o, "open_ms", 0);
-        b.open_seg           = (char)(int)get_num(o, "open_seg", 0);
-        b.open_rank          = (int)get_num(o, "open_rank", 0);
-        b.open_score         = get_num(o, "open_score", 0);
         b.open_dist_atr      = get_num(o, "open_dist_atr", std::numeric_limits<double>::quiet_NaN());
         b.trough             = get_num(o, "trough", 0);
         b.open_stop          = get_num(o, "open_stop", 0);
@@ -294,10 +324,10 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.open_box_atr       = get_num(o, "open_box_atr", std::numeric_limits<double>::quiet_NaN());
         b.open_taker         = get_num(o, "open_taker", std::numeric_limits<double>::quiet_NaN());
 
-        b.smart_list         = smart_list;
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
+        b.ds_vanished_id      = get_str(o, "ds_vanished_id", "");
         b.disaster_stop_price = get_num(o, "disaster_stop_price", 0);
         b.st.cooldown_left   = (int)get_num(o, "cooldown_left", 0);
         b.qty           = get_num(o, "qty", 0);
@@ -317,6 +347,11 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
             b.qty = 0;
         }
 
+        simdjson::dom::element checkpoint;
+        if (o["monitor_checkpoint"].get(checkpoint) == simdjson::SUCCESS) {
+            std::string error;
+            if (!restore_monitor_checkpoint(simdjson::to_string(checkpoint), b, error)) throw std::runtime_error(error);
+        }
         out.push_back(std::move(b));
     }
     return out;
