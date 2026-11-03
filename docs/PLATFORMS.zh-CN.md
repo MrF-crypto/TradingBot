@@ -9,7 +9,7 @@
 | macOS | Apple Silicon ARM64 | `TradingBot.app`、`ccbot_headless` | `macos-15` |
 | Linux | x64、ARM64 | `ccbot_headless` | Ubuntu 24.04 对应架构 |
 
-macOS 流水线的应用部署目标为 14.4；这是当前 Qt 6.12 支持的最低运行版本。Qt 的应用包和部署机制见 [Qt macOS 文档](https://doc.qt.io/qt-6/macos.html)。Intel 和 Apple Silicon 使用各自的原生包，无需依赖 Rosetta。CI runner 架构以 [GitHub 官方表格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 为准。
+macOS 发布包的应用与依赖统一以 15.0 为运行基线，避免把针对较新系统编译的静态依赖链接进声明支持旧系统的包。Qt 的应用包和部署机制见 [Qt macOS 文档](https://doc.qt.io/qt-6/macos.html)。Intel 和 Apple Silicon 使用各自的原生包，无需依赖 Rosetta。CI runner 架构以 [GitHub 官方表格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 为准。
 
 Linux 预编译包面向 Ubuntu 24.04 及具备对应 glibc/C++ 运行库的系统，不承诺兼容 Alpine/musl 或更旧发行版；其他发行版可从源码构建。Linux 本次交付入口为 headless，未验证 Linux Qt 桌面环境。
 
@@ -20,7 +20,7 @@ Linux 预编译包面向 Ubuntu 24.04 及具备对应 glibc/C++ 运行库的系�
 ```bash
 cmake -S . -B build/macos -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCCBOT_WERROR=ON \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.4 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
   -DVCPKG_TARGET_TRIPLET=arm64-osx
 cmake --build build/macos --parallel 4
@@ -36,7 +36,7 @@ python3 tools/check_unix_package.py pkg --platform macos --arch arm64
 
 ## Linux 源码构建
 
-安装 C++20 编译器、CMake、Ninja、pkg-config 及 vcpkg 所需构建工具。ARM64 使用 `arm64-linux`，x64 使用 `x64-linux`。
+安装 C++20 编译器、CMake、Ninja、pkg-config 及 vcpkg 所需构建工具。ARM64 使用 `arm64-linux`，x64 使用 `x64-linux`。Linux ARM64 使用本项目固定的 vcpkg 版本时，需要新版 CMake；CI 已固定为 4.4.5，避免 runner 预装旧版本不支持依赖配置脚本。
 
 ```bash
 cmake -S . -B build/linux -G Ninja \

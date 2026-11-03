@@ -31,7 +31,7 @@ def main():
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('QT_', 'QML', 'DYLD_', 'LD_LIBRARY_PATH', 'LD_PRELOAD'))}
     env['PATH'] = '/usr/bin:/bin:/usr/sbin:/sbin'
-    env['QT_QPA_PLATFORM'] = 'offscreen'
+    env['QT_QPA_PLATFORM'] = 'cocoa' if args.platform == 'macos' else 'offscreen'
     for exe in executables:
         if not exe.is_file():
             raise RuntimeError(f'Missing executable: {exe}')
