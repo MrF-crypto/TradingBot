@@ -1220,6 +1220,7 @@ void MainWindow::onConnect() {
             // 首次对时的结果：偏移量是 -1021 的直接成因，连接时就该让人看见
             log(QString::fromStdString(tsync.to_log()), tsync.accepted ? "OK" : "WARN");
             trend_engine_ = std::make_shared<TrendEngine>(client_, pool_);
+            signalRefresh_ = std::make_shared<SignalRefresh>();
             trend_engine_->set_max_total_margin(maxTotalMargin_);
             trend_engine_->set_log_cb([this](const std::string& msg) {
                 QMetaObject::invokeMethod(this, [this, msg]() {
@@ -1787,33 +1788,32 @@ void MainWindow::onTick() {
     refreshPositions();
     refreshAccount();
 
-    // ── SAR 信号拉取（ATR + 唐奇安通道），每 20 个 tick 约 60 秒 ───────────────
-    // 止损线的推进【不靠这个】：它在每个 tick 用实时价推进，只有 ATR 的数值
-    // 来自这里。所以这一批慢一点不影响保护，只影响新仓位的入场判定
+    // ── 信号拉取：正常周期刷新，跨K线等待使用有限的短间隔重试 ───────────────
+    // K线暂缺时暂停新开仓及依赖新指标的止损推进；实时价仍检查已有止损线，
+    // 交易所硬止损和监控断点继续保留。
     if (trend_engine_ && !trendSigBusy_.load()) {
-        // 每个 bot 按自己周期该有的节奏拉：4h 的每 60 秒一次就够，3m 的要 45 秒
-        // 一次才不会错过收盘。tick 是 3 秒一拍，所以除以 3 换算成拍数
         const bool forced = trendSigForce_.exchange(false);
+        const auto refresh = signalRefresh_;
+        const auto bots = trend_engine_->get_bots();
+        std::vector<std::string> ids;
+        for (const auto& b : bots) ids.push_back(b.bot_id);
+        refresh->prune(ids);
         std::vector<TrendBot> need;
-        for (const auto& b : trend_engine_->get_bots()) {
+        for (const auto& b : bots) {
             if (b.state != TrendBot::State::Running) continue;
-            const int ticks = std::max(1,
-                TrendEngine::signal_period_sec(b.cfg.interval) / 3);
-            if (forced || (slowTickCount_ % ticks) == 1)
+            if (refresh->claim(b.bot_id, b.cfg.symbol, SignalRefresh::Clock::now(), forced))
                 need.push_back(b);
         }
         if (!need.empty()) {
             trendSigBusy_.store(true);
-            run_async([this, need]() {
-                // 失败的品种要报出来。原先这里是 `if (!snap.ok) continue;`——
-                // 完全静默，于是"信号拉不到"和"拉到了但没突破"在界面上长得
-                // 一模一样，都是"等信号"。用户唯一能做的就是干等
-                QStringList failed;
-                std::atomic<int> okn_a{0};
-                std::mutex fail_mtx;
-                auto mark_failed = [&](const std::string& s) {
-                    std::lock_guard<std::mutex> fl(fail_mtx);
-                    failed << QString::fromStdString(s);
+            run_async([this, need, refresh]() {
+                auto report = [&](const TrendBot& b, SignalRefresh::Result result, const std::string& error = "") {
+                    const bool waiting = refresh->finish(b.bot_id, result, error,
+                        TrendEngine::signal_period_sec(b.cfg.interval),
+                        static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000,
+                        client_->market_time_ms(), SignalRefresh::Clock::now());
+                    if (result == SignalRefresh::Result::Waiting || result == SignalRefresh::Result::Failed)
+                        trend_engine_->mark_signal_failure(b.bot_id, error, waiting);
                 };
                 // 并行拉：智能模式下可能有上百个 bot，串行一轮要一两分钟，超过刷新周期。
                 // HTTP 客户端自带连接池与限流闸门，引擎的写入口自己持锁
@@ -1824,8 +1824,7 @@ void MainWindow::onTick() {
                     if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) {
                         auto bp = client_->fetch_bar_pattern(
                             b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
-                        if (!bp.ok) { mark_failed(b.cfg.symbol); return; }
-                        ++okn_a;
+                        if (!bp.ok) { report(b, SignalRefresh::Result::Failed, "K线请求失败：" + client_->last_error()); return; }
                         // 裸K 与 抛物线SAR 只要原始高低点，【不需要 ATR】——
                         // 少拉一次 REST。update_bars 自己设 sig_ok，所以不必
                         // 像 v5.1.0 之前那样成对调用两个接口（漏一次的表现是
@@ -1850,6 +1849,7 @@ void MainWindow::onTick() {
                         s.range_now_lo = bp.range_now_lo;
                         s.bar_open_ms = bp.bar_open_ms;
                         trend_engine_->update_bars(b.bot_id, s);
+                        report(b, SignalRefresh::Result::Ready);
                         return;
                     }
                     auto snap = client_->fetch_trend_signal(
@@ -1857,13 +1857,12 @@ void MainWindow::onTick() {
                         b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.signal_following_config(), b.resume_after_ms());
                     if (snap.history_target_ms > 0)
                         trend_engine_->update_monitor_history(b.bot_id, snap.history, snap.history_target_ms, b.signal_following_config());
-                    if (snap.history_only) { ++okn_a; return; }
+                    if (snap.history_only) { report(b, SignalRefresh::Result::Backfill); return; }
                     if (!snap.ok) {
-                        trend_engine_->mark_signal_failure(b.bot_id, snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error);
-                        mark_failed(b.cfg.symbol);
+                        report(b, snap.waiting_for_bar ? SignalRefresh::Result::Waiting : SignalRefresh::Result::Failed,
+                               snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error);
                         return;
                     }
-                    ++okn_a;
                     // 量比：开了 vol_paced 的用按已走时间折算的那个
                     trend_engine_->update_signal(b.bot_id, snap.atr, snap.atr_pct,
                                                snap.dc_ok, snap.dc_up, snap.dc_dn,
@@ -1872,45 +1871,18 @@ void MainWindow::onTick() {
                                                                     : snap.vol_ratio,
                                                snap.er_ok, snap.er, snap.prev_close,
                                                snap.taker_ratio, snap.range_pace, snap.following);
+                    report(b, SignalRefresh::Result::Ready);
                   } catch (...) {
                     // 跨线程的异常会直接 terminate；拉取失败当成这一个没拉到
-                    trend_engine_->mark_signal_failure(need[idx].bot_id, "网络或行情处理失败，保留断点等待重试");
-                    mark_failed(need[idx].cfg.symbol);
+                    report(need[idx], SignalRefresh::Result::Failed, "网络或行情处理失败，保留断点等待重试");
                   }
                 });
-                const int okn = okn_a.load();
+                const auto notices = refresh->take_notices();
                 trendSigBusy_.store(false);
-                QMetaObject::invokeMethod(this, [this, failed, okn]() {
+                QMetaObject::invokeMethod(this, [this, notices]() {
                     save_trend_bots();
-                    // 只在【集合变化】时报。拉取每分钟一轮，而一个拼错的品种会
-                    // 永远失败——每轮都报就是每小时 60 条同样的告警，把真正有用
-                    // 的日志全冲走（本项目踩过这个：150 行日志里 120 行是噪音）
-                    std::set<std::string> now;
-                    for (const auto& f : failed) now.insert(f.toStdString());
-
-                    // 连续两轮都失败才报；只有报过的才报恢复
-                    QStringList fresh;
-                    std::set<std::string> reported;
-                    for (const auto& s : now) {
-                        if (trendSigFailed_.count(s)) { reported.insert(s); continue; }
-                        if (trendSigPrevFail_.count(s)) {
-                            reported.insert(s);
-                            fresh << QString::fromStdString(s);
-                        }
-                    }
-                    QStringList healed;
-                    for (const auto& s : trendSigFailed_)
-                        if (!now.count(s))
-                            healed << QString::fromStdString(s);
-                    trendSigFailed_   = std::move(reported);
-                    trendSigPrevFail_ = std::move(now);
-
-                    if (!fresh.isEmpty())
-                        // 拉不到 K 线 = 没有止损线，所以这些品种不开新仓
-                        log(QString("⚠ 信号拉取失败：%1（本轮成功 %2 个），这些品种暂不开新仓")
-                                .arg(fresh.join(", ")).arg(okn), "WARN");
-                    if (!healed.isEmpty())
-                        log(QString("信号已恢复：%1").arg(healed.join(", ")), "OK");
+                    for (const auto& notice : notices)
+                        log(QString::fromStdString(notice.text), notice.warning ? "WARN" : "INFO");
                     refreshBotTable();
                 }, Qt::QueuedConnection);
             });

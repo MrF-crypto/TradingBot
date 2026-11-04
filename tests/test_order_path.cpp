@@ -49,9 +49,11 @@ static const char* kExchangeInfo =
     R"({"filterType":"PRICE_FILTER","tickSize":"0.10"}]}]})";
 
 #include "backfill_scenarios.h"
+#include "rollover_scenarios.h"
 #include "unicode_symbol_scenarios.h"
 #include "audit_order_scenarios.h"
 int main() {
+    test_rollover_scenarios();
     test_audit_order_scenarios();
     test_backfill_scenarios();
     test_unicode_symbol_scenarios();

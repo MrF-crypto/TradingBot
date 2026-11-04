@@ -27,6 +27,7 @@ class QVBoxLayout;
 #include "core/funding_ledger.h"
 #include "core/thread_pool.h"
 #include "core/smart_mode.h"
+#include "core/signal_refresh.h"
 #include "app/smart_runner.h"
 #include "net/trading_client.h"
 #include "net/rest_price_feed.h"
@@ -325,13 +326,7 @@ private:
     // 没有它的话刚添加的品种会干等最多 60 秒，界面上什么都没有——
     // 而用户此刻正盯着看它到底有没有在工作
     std::atomic<bool> trendSigForce_{false};
-    // 已经报过「信号拉不到」的品种（仅 GUI 线程访问）。存在的理由是去重：
-    // 拉取每分钟一轮，而一个拼错的品种会永远失败——不去重就是每小时 60 条
-    // 一模一样的告警，把真正有用的日志全冲走。只在【集合发生变化】时报
-    std::set<std::string> trendSigFailed_;
-    // 上一轮信号拉取失败的品种。连续两轮都失败才报（单个品种失败一轮、下一分钟就好，
-    // 经代理时很常见，每次两行就是噪音）
-    std::set<std::string> trendSigPrevFail_;
+    std::shared_ptr<SignalRefresh> signalRefresh_ = std::make_shared<SignalRefresh>();
 
     // ── 智能模式 ──
     // 运行器随引擎一起在每次连接成功时重建（它持有引擎指针）。配置独立落盘，

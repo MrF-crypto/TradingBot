@@ -10,19 +10,19 @@ int64_t TrendBot::resume_after_ms() const {
     return 0;
 }
 
-void TrendEngine::mark_signal_failure(const std::string& id, const std::string& reason) {
+void TrendEngine::mark_signal_failure(const std::string& id, const std::string& reason, bool waiting_for_bar) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id); if (it == bots_.end()) return;
     auto& b = it->second;
     b.sig_ok = false;
     b.monitor.recovering = true;
-    b.monitor.fetch_failed = true;
+    b.monitor.fetch_failed = !waiting_for_bar;
+    b.monitor.waiting_for_bar = waiting_for_bar;
     const auto error = reason.empty() ? "行情拉取失败，保留断点等待恢复" : reason;
-    const bool changed = b.monitor.data_error != error;
     b.monitor.data_error = error;
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
     monitor_event(b, now, "数据", b.monitor.data_error);
-    if (changed) log(b.cfg.symbol + " K线数据异常：" + error);
+    // Individual details stay in the monitor; SignalRefresh emits one batch notice.
 }
 
 void TrendEngine::update_monitor_history(const std::string& id,
@@ -34,6 +34,7 @@ void TrendEngine::update_monitor_history(const std::string& id,
     if (!(settings == b.signal_following_config()) || !settings.enabled || target <= 0) return;
     auto& m = b.monitor;
     m.fetch_failed = false;
+    m.waiting_for_bar = false;
     const int64_t period = static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000;
     if (period <= 0) return;
     const auto key = monitor_model_key(b.cfg);

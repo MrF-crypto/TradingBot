@@ -40,6 +40,20 @@ static TradingClient make_client() {
 }
 
 int main() {
+    {
+        TradingClient cli = make_client();
+        constexpr int64_t boundary = 1800000000000LL;
+        cli.set_wall_clock_for_test([] { return boundary + 500; });
+        int64_t sent = 0;
+        cli.set_test_hook([&](const std::string&, const std::string&, const std::string& params, TradingClient::FakeReply& out) {
+            const auto pos = params.find("timestamp=");
+            if (pos != std::string::npos) sent = std::stoll(params.substr(pos + 10));
+            out.body = "{}"; return true;
+        });
+        cli.fetch_account();
+        check(cli.market_time_ms() == boundary + 500 && sent == boundary - 500,
+              "market clock keeps the current hour while signed requests retain their 1s safety offset");
+    }
     // ── ① 正常往返：采纳，并算出正确的偏移 ──────────────────────────────────
     // 造一个"本机比服务器慢 2170ms"的场景（正是实盘那台 iMac 的真实数值）
     {
@@ -278,6 +292,7 @@ int main() {
         fake_wall_shift = -1074;
         cli.fetch_account();
         const int64_t after = sent;
+        const auto market_after = cli.market_time_ms();
         const int64_t real_elapsed = now_ms() - w0;   // 两次调用之间真实流逝了多久
 
         // ⚠ 这里【不能】断言"移动量小于某个毫秒数"——那是机器速度的函数，
@@ -291,6 +306,8 @@ int main() {
               "  【核心】系统时钟被往回拨 1074ms，时间戳没有倒退（实际 " +
               std::to_string(moved) + "ms，同期真实流逝 " +
               std::to_string(real_elapsed) + "ms）");
+        check(market_after >= after + 1000 && market_after - (after + 1000) < 1000,
+              "market clock shares the monotonic exchange anchor and ignores wall-clock steps");
         check(moved <= real_elapsed + 200,
               "  也没有凭空跳前——推进量与真实流逝相称");
 

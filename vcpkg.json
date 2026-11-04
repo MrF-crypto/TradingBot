@@ -1,6 +1,6 @@
 {
   "name": "tradingbot",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "TradingBot — Binance USDT-M 趋势跟踪交易框架，含单一策略智能模式、手动策略、GUI 与 headless",
   "default-features": ["gui"],
   "dependencies": [

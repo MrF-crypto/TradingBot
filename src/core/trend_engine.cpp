@@ -193,6 +193,7 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.needs_reconcile = snap.needs_reconcile || snap.monitor.saved;
     snap.monitor.recovering = snap.monitor.saved;
     snap.monitor.fetch_failed = false;
+    snap.monitor.waiting_for_bar = false;
     if (snap.monitor.saved) snap.monitor.data_error = "恢复中：等待持仓核对与最新行情";
     snap.price_time = {};
     snap.sig_ok  = false;
@@ -727,6 +728,7 @@ void TrendEngine::update_signal(const std::string& id, double atr, double atr_pc
     if (!b.cfg.rule.following.enabled && b.sig_ok) {
         b.monitor.recovering = false;
         b.monitor.fetch_failed = false;
+        b.monitor.waiting_for_bar = false;
         b.monitor.data_error.clear();
         b.monitor.updated_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
     }
@@ -773,7 +775,13 @@ void TrendEngine::update_bars(const std::string& id, const BarSnap& s) {
     b.sig_time        = host_.now_steady();
     // 裸K 与 抛物线SAR 都不需要 ATR，所以它们的 sig_ok 只看K线本身。
     // 趋势跟踪的 sig_ok 归 update_signal 管（它要 ATR + 通道），这里不碰
-    if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) b.sig_ok = b.bar_ok;
+    if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) {
+        b.sig_ok = b.bar_ok;
+        if (b.sig_ok) {
+            b.monitor.recovering = b.monitor.fetch_failed = b.monitor.waiting_for_bar = false;
+            b.monitor.data_error.clear();
+        }
+    }
     if (s.bar_open_ms > 0 && s.bar_open_ms != b.bar_open_ms) b.bar_open_ms = s.bar_open_ms;
 }
 

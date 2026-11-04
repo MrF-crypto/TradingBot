@@ -112,6 +112,7 @@ public:
     //   价格去撞它，这才是突破
     struct TrendSnapshot {
         std::string error; // A concrete failure reason; never replaced by a generic stale label.
+        bool waiting_for_bar = false; // Valid response, but the next current candle is not available yet.
         std::vector<following::Observation> history;
         int64_t history_target_ms = 0;
         bool history_only = false;
@@ -379,6 +380,8 @@ public:
         }
     };
     TimeSyncResult sync_server_time();
+    // Exchange-aligned clock without the signing timestamp's one-second safety offset.
+    int64_t market_time_ms() const;
 
     // ── 测试注入点 ──────────────────────────────────────────────────────────
     // 订单路径（超时→查单恢复、部分成交、零成交、-1111重试）平时【永远不执行】，

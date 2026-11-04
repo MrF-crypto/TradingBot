@@ -107,4 +107,4 @@ python tools/check_suite_coverage.py
 
 许可证为 [MIT](LICENSE)，保留上游版权与许可声明。
 
-当前源码 **v1.3.2** 修复框架审计的 7 项执行与恢复问题，并完善 macOS / Linux 构建、打包和原生检查。完整变化及已执行验证见 [v1.3.2 说明](docs/releases/v1.3.2.md)。保留 v1.3.1 的中文合约编码修复，以及 v1.3.0 的监控断点兼容；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。
+当前源码 **v1.3.3** 修复整点 K 线误判、刷新延迟和日志刷屏，保留监控断点与已有仓位的止损保护。完整变化及验证范围见 [v1.3.3 说明](docs/releases/v1.3.3.md)。继续包含 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)，兼容已有监控断点；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。

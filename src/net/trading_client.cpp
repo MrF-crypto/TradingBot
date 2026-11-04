@@ -300,11 +300,15 @@ int64_t TradingClient::ts_ms() const {
     // steady_clock 是单调的，SetSystemTime 对它没有任何影响，所以别的程序
     // 怎么拨系统时钟都与我们无关。代价只有晶振漂移（典型 10~50ppm，
     // 15 分钟对时间隔内累计 0.04~0.18ms），可以忽略。
+    return market_time_ms() - 1000;
+}
+
+int64_t TradingClient::market_time_ms() const {
     if (has_anchor_.load(std::memory_order_acquire))
-        return mono_ms() + steady_offset_ms_.load(std::memory_order_relaxed) - 1000;
+        return mono_ms() + steady_offset_ms_.load(std::memory_order_relaxed);
 
     // 还没成功对过时：退回墙上时钟。此刻本来也没有可用偏移，两者等价
-    return wall_now_ms() - 1000;
+    return wall_now_ms();
 }
 
 int64_t TradingClient::wall_now_ms() const {
@@ -1606,8 +1610,8 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         const std::string& sym, const std::string& interval,
         int donchian_period, int atr_period, const following::Config& follow, int64_t resume_after_ms) {
     TrendSnapshot out;
-    const auto fail = [](std::string reason) {
-        TrendSnapshot failed; failed.error = std::move(reason); return failed;
+    const auto fail = [](std::string reason, bool waiting = false) {
+        TrendSnapshot failed; failed.error = std::move(reason); failed.waiting_for_bar = waiting; return failed;
     };
     if (donchian_period <= 0 || atr_period <= 0) return fail("通道或ATR周期参数无效");
 
@@ -1616,7 +1620,7 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
     const int need = std::max({donchian_period + 1, atr_period * 4,
                                follow.enabled ? follow.slow_period * 3 + follow.slope_bars : 0}) + 5;
     const int64_t period = static_cast<int64_t>(interval_seconds(interval)) * 1000;
-    const int64_t current_bar = period > 0 ? ts_ms() / period * period : 0;
+    int64_t current_bar = period > 0 ? market_time_ms() / period * period : 0;
     int extra = follow.enabled ? 32 : 0;
     int64_t target_bar = current_bar;
     if (follow.enabled && resume_after_ms > 0 && period > 0) {
@@ -1625,12 +1629,22 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         extra = static_cast<int>(std::min<int64_t>(256, (current_bar - resume_after_ms) / period));
         target_bar = resume_after_ms + extra * period;
     }
+    const bool historical_page = target_bar < current_bar;
     auto bars = fetch_klines(sym, interval, need + extra,
-                            target_bar < current_bar ? target_bar + period - 1 : 0);
+                            historical_page ? target_bar + period - 1 : 0);
     if (bars.empty()) return fail("K线请求失败：" + net_why(last_error()));
     if (follow.enabled) {
-        if (period <= 0 || bars.back().open_ms != target_bar)
-            return fail("交易所返回的K线未到目标时间，等待更新");
+        // Pool/rate-limit waits and HTTP itself can cross a candle boundary. Only
+        // historical pages retain their fixed endTime; live responses use the
+        // exchange clock AFTER the request, never the signing safety offset.
+        current_bar = period > 0 ? market_time_ms() / period * period : 0;
+        if (!historical_page) target_bar = current_bar;
+        if (period <= 0 || bars.back().open_ms != target_bar) {
+            const bool waiting = !historical_page && period > 0 && bars.back().open_ms == target_bar - period;
+            return fail(std::string(waiting ? "新K线尚未就绪" : "K线时间与目标周期不一致") +
+                        "（目标开盘 " + std::to_string(target_bar) + "，返回最新 " +
+                        std::to_string(bars.back().open_ms) + "）", waiting);
+        }
         if (bars.size() < static_cast<size_t>(need))
             return fail("K线数据不足：返回" + std::to_string(bars.size()) + "根，指标预热需" + std::to_string(need) + "根");
         for (size_t i = 1; i < bars.size(); ++i)
@@ -1686,7 +1700,7 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         // 已走时间按交易所时钟算（本机时钟可能偏几秒到几分钟）
         const int bar_sec = interval_seconds(interval);
         if (bar_sec > 0 && out.bar_open_ms > 0) {
-            const double frac = (double)(ts_ms() - out.bar_open_ms) / (bar_sec * 1000.0);
+            const double frac = (double)(market_time_ms() - out.bar_open_ms) / (bar_sec * 1000.0);
             out.vol_ratio_paced = indicators::paced_ratio(out.vol_ratio, frac);
             // 多单波动放大过滤的读数：ATR 用已收盘的，和箱体倍数同一个（当前根正在拉的话不撑大分母）
             const auto& cb = bars.back();
@@ -1713,9 +1727,13 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
         if (follow.close_confirm) out.vol_ratio = out.vol_ratio_paced = f.volume_ratio;
         // Reject stale/gapped/future candle snapshots even if HTTP succeeded.
         const int64_t period_ms = static_cast<int64_t>(interval_seconds(interval)) * 1000;
-        const int64_t now = ts_ms();
-        if (period_ms <= 0 || out.bar_open_ms > now || now - out.bar_open_ms >= period_ms)
-            out.following.ready = out.dc_ok = false;
+        const int64_t now = market_time_ms();
+        if (period_ms <= 0 || out.bar_open_ms > now || now - out.bar_open_ms >= period_ms) {
+            // A second rollover during computation cannot publish a stale live
+            // signal or advance its checkpoint. Retry from the saved cursor.
+            const bool waiting = period_ms > 0 && out.bar_open_ms == now / period_ms * period_ms - period_ms;
+            return fail(waiting ? "计算期间已跨K线周期，等待新K线" : "当前K线时间无效，等待核对", waiting);
+        }
         for (size_t i = 1; i < bars.size(); ++i)
             if (bars[i].open_ms - bars[i - 1].open_ms != period_ms)
                 out.following.ready = out.dc_ok = false;

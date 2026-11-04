@@ -22,7 +22,9 @@ static void check(bool ok, const std::string& what) {
     if (!ok) ++g_fail;
 }
 
+#include "signal_refresh_scenarios.h"
 int main() {
+    test_signal_refresh_scenarios();
     // ═══ 对账闸门 ════════════════════════════════════════════════════════════
     std::printf("── 对账闸门 ──\n");
     {

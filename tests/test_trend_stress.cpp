@@ -18,6 +18,7 @@
 // 一旦破了就是真的状态撕裂。
 #include "core/trend_engine.h"
 #include "core/thread_pool.h"
+#include "core/signal_refresh.h"
 
 #include <atomic>
 #include <chrono>
@@ -565,7 +566,34 @@ static void part_b_extremes() {
     }
 }
 
+static void signal_refresh_concurrency() {
+    SignalRefresh refresh;
+    const auto now = SignalRefresh::Clock::now();
+    std::atomic<int> claimed{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&] {
+            for (int i = 0; i < 160; ++i)
+                if (refresh.claim(std::to_string(i), "S" + std::to_string(i), now, true)) ++claimed;
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    check(claimed == 160, "concurrent scheduling claims each candidate exactly once");
+    workers.clear();
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&, worker] {
+            for (int i = worker; i < 160; i += 8)
+                refresh.finish(std::to_string(i), SignalRefresh::Result::Waiting, "pending", 60, 3600000, 1000, now);
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    const auto notices = refresh.take_notices();
+    check(notices.size() == 1 && notices.front().text.find("160") != std::string::npos &&
+          refresh.take_notices().empty(), "concurrent refresh completions retain all symbols in one deduplicated summary");
+}
+
 int main() {
+    signal_refresh_concurrency();
     part_a_concurrency();
     part_b_extremes();
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

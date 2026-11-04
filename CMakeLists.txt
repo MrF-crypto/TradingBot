@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.3.2 LANGUAGES CXX)
+project(TradingBot VERSION 1.3.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -341,6 +341,7 @@ endif()
 # 就能在这里不开窗口地测。纯头文件、不起线程 ⇒ 只进 ASan 列表，不进 TSan 列表
 add_executable(ccg_app_logic_tests tests/test_app_logic.cpp)
 target_include_directories(ccg_app_logic_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_app_logic_tests PRIVATE Threads::Threads)
 if(MSVC)
     target_compile_options(ccg_app_logic_tests PRIVATE /utf-8)
 endif()

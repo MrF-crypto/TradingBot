@@ -520,12 +520,17 @@ int main() {
         saved.rotation_health.best_close = 119.876543210987;
         saved.st.cooldown_left = 2; saved.last_counted_bar_ms = saved.monitor.cursor_ms;
         saved.rotation_attempt_bar_ms = saved.monitor.cursor_ms;
+        saved.monitor.waiting_for_bar = saved.monitor.recovering = true;
+        saved.monitor.data_error = "新K线尚未就绪";
         save_trend_state(path, {saved});
         auto changed_template = mk_cfg(""); changed_template.rule.following.slow_period = 60;
         const auto loaded = load_trend_state(path, {}, &changed_template);
         check(loaded.size() == 1, "checkpoint with strategy snapshot and Unicode events loads");
         if (!loaded.empty()) {
             const auto& restored = loaded.front();
+            check(!restored.monitor.waiting_for_bar && restored.monitor.recovering &&
+                  restored.qty == saved.qty && restored.st.stop == saved.st.stop,
+                  "restart during rollover wait preserves holdings and stop without persisting runtime retry state");
             check(restored.rotation_health.samples == 6 && restored.rotation_health.weak_bars == 3 &&
                   restored.rotation_health.best_close == saved.rotation_health.best_close &&
                   restored.monitor.last_signal.atr == saved.monitor.last_signal.atr && restored.monitor.cursor_ms == saved.monitor.cursor_ms,

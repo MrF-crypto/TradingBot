@@ -149,6 +149,7 @@ struct TrendBot {
     struct MonitorEvent { int64_t at_ms = 0; std::string kind, text; };
     struct MonitorState {
         bool saved = false, recovering = false, fetch_failed = false;
+        bool waiting_for_bar = false; // transient; never replaces the saved monitoring cursor
         int64_t cursor_ms = 0, target_ms = 0, updated_ms = 0, trend_since_ms = 0;
         int trend_bars = 0;
         following::Regime regime = following::Regime::Unknown, previous = following::Regime::Unknown;
@@ -427,7 +428,7 @@ public:
     std::vector<Inspection> inspect_bots() const;
     void update_monitor_history(const std::string& id, const std::vector<following::Observation>& history,
                                 int64_t target_ms, const following::Config& settings);
-    void mark_signal_failure(const std::string& id, const std::string& reason);
+    void mark_signal_failure(const std::string& id, const std::string& reason, bool waiting_for_bar = false);
 
     void set_log_cb(LogCb cb)     { log_cb_   = std::move(cb); }
     void set_trade_cb(TradeCb cb) { trade_cb_ = std::move(cb); }

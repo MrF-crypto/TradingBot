@@ -8,6 +8,7 @@
 #include "core/shutdown.h"
 #include "core/parallel.h"
 #include "core/smart_mode.h"
+#include "core/signal_refresh.h"
 #include "app/smart_runner.h"
 #include "net/trading_client.h"
 #include "net/rest_price_feed.h"
@@ -416,6 +417,7 @@ int main(int argc, char** argv) {
     // ind_busy / trend_busy 随网格DCA 的指标与趋势批次一并删除
     std::atomic<bool> hb_busy{false}, rec_busy{false};
     std::atomic<bool> trend_sig_busy{false};
+    auto signal_refresh = std::make_shared<SignalRefresh>();
     // 与 GUI 对齐为 4。此前 GUI 是 (下单2/数据4)、headless 是 (下单4/数据2)——
     // 两边正好写反，而两端跑的是同一套引擎、同样几十个品种。
     // 数据池要同时承载价格 REST 兜底、日线/趋势、1h 指标三类批次，2 个线程在
@@ -589,24 +591,31 @@ int main(int argc, char** argv) {
         }
 
         // ── 1c) 趋势信号拉取（ATR + 唐奇安通道 / K线快照）────────────────────
-        // 每 20 个 tick（约 60 秒）一轮。信号周期通常是 4h，用不着更密；
-        // 而止损线的推进【不靠这个】——它在每个 tick 用实时价推，只有 ATR 的
-        // 数值来自这里。所以这一批慢一点不影响保护
+        // 各品种按正常周期刷新，跨K线等待使用有限的短间隔重试。
+        // K线暂缺时暂停新开仓及依赖新指标的推进；实时价仍检查已有止损线，
+        // 交易所硬止损和监控断点继续保留。
         if (trend_engine && !trend_sig_busy.load()) {
             auto sbots = trend_engine->get_bots();
+            std::vector<std::string> ids;
+            for (const auto& b : sbots) ids.push_back(b.bot_id);
+            signal_refresh->prune(ids);
             std::vector<TrendBot> need;
             for (const auto& b : sbots) {
                 if (b.state != TrendBot::State::Running) continue;
-                // 每个 bot 按自己周期的节奏拉：3m 要 45 秒一次才不会错过收盘，
-                // 4h 每 60 秒一次就够。tick 是 3 秒一拍
-                const int ticks = std::max(1,
-                    TrendEngine::signal_period_sec(b.cfg.interval) / 3);
-                if ((tick_n % ticks) == 1)
+                if (signal_refresh->claim(b.bot_id, b.cfg.symbol, SignalRefresh::Clock::now()))
                     need.push_back(b);
             }
             if (!need.empty()) {
                 trend_sig_busy.store(true);
-                fetch_pool->submit([client, trend_engine, need, &trend_sig_busy]() {
+                fetch_pool->submit([client, trend_engine, need, signal_refresh, &trend_sig_busy]() {
+                    auto report = [&](const TrendBot& b, SignalRefresh::Result result, const std::string& error = "") {
+                        const bool waiting = signal_refresh->finish(b.bot_id, result, error,
+                            TrendEngine::signal_period_sec(b.cfg.interval),
+                            static_cast<int64_t>(TrendConfig::bar_seconds(b.cfg.interval)) * 1000,
+                            client->market_time_ms(), SignalRefresh::Clock::now());
+                        if (result == SignalRefresh::Result::Waiting || result == SignalRefresh::Result::Failed)
+                            trend_engine->mark_signal_failure(b.bot_id, error, waiting);
+                    };
                     // 并行拉：智能模式下可能有上百个 bot，串行一轮会超过刷新周期
                     parallel_for((int)need.size(), kSignalFetchWorkers, [&](int idx) {
                       try {
@@ -617,7 +626,7 @@ int main(int argc, char** argv) {
                         if (b.cfg.rule.strategy != trend::Strategy::TrendFollowing) {
                             auto bp = client->fetch_bar_pattern(
                                 b.cfg.symbol, b.cfg.interval, b.cfg.rule.swing_bars);
-                            if (!bp.ok) return;
+                            if (!bp.ok) { report(b, SignalRefresh::Result::Failed, "K线请求失败：" + client->last_error()); return; }
                             TrendEngine::BarSnap s;
                             s.open        = bp.cur_open;
                             s.prev_close  = bp.prev_close;
@@ -638,6 +647,7 @@ int main(int argc, char** argv) {
                             s.range_now_lo = bp.range_now_lo;
                             s.bar_open_ms = bp.bar_open_ms;
                             trend_engine->update_bars(b.bot_id, s);
+                            report(b, SignalRefresh::Result::Ready);
                             return;
                         }
                         auto snap = client->fetch_trend_signal(
@@ -645,9 +655,11 @@ int main(int argc, char** argv) {
                             b.cfg.rule.donchian_period, b.cfg.rule.atr_period, b.signal_following_config(), b.resume_after_ms());
                         if (snap.history_target_ms > 0)
                             trend_engine->update_monitor_history(b.bot_id, snap.history, snap.history_target_ms, b.signal_following_config());
-                        if (snap.history_only) return;
+                        if (snap.history_only) { report(b, SignalRefresh::Result::Backfill); return; }
                         if (!snap.ok) {
-                            trend_engine->mark_signal_failure(b.bot_id, snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error); return;
+                            report(b, snap.waiting_for_bar ? SignalRefresh::Result::Waiting : SignalRefresh::Result::Failed,
+                                   snap.error.empty() ? "行情拉取失败，保留监控断点" : snap.error);
+                            return;
                         }
                         // 量比：开了 vol_paced 的用按已走时间折算的那个
                         trend_engine->update_signal(b.bot_id, snap.atr, snap.atr_pct,
@@ -657,10 +669,13 @@ int main(int argc, char** argv) {
                                                                        : snap.vol_ratio,
                                                   snap.er_ok, snap.er, snap.prev_close,
                                                   snap.taker_ratio, snap.range_pace, snap.following);
+                        report(b, SignalRefresh::Result::Ready);
                       } catch (...) {
-                        trend_engine->mark_signal_failure(need[idx].bot_id, "网络或行情处理失败，保留断点等待重试");
+                        report(need[idx], SignalRefresh::Result::Failed, "网络或行情处理失败，保留断点等待重试");
                       }
                     });
+                    for (const auto& notice : signal_refresh->take_notices())
+                        log_line((notice.warning ? "警告：" : "") + notice.text);
                     trend_sig_busy.store(false);
                 });
             }

@@ -56,13 +56,14 @@ Row project(const TrendEngine::Inspection& view, bool connected) {
         else if (f.long_confirmed || f.short_confirmed) r.shape = "突破后回到通道内";
     }
     r.data = !connected ? "未连接 · 保留断点" : b.needs_reconcile ? "等待仓位/委托核对" :
-        m.fetch_failed ? "K线数据异常" : m.recovering ? "补齐中 · 保留进度" : stale ? "行情过期/缺失" : !quote_live ? "等待最新报价" : "实时监控";
+        m.waiting_for_bar ? "等待新K线 · 保留进度" : m.fetch_failed ? "K线数据异常" : m.recovering ? "补齐中 · 保留进度" : stale ? "行情过期/缺失" : !quote_live ? "等待最新报价" : "实时监控";
     r.updated = stamp(m.updated_ms);
     r.reason = !m.data_error.empty() && r.error ? qs(m.data_error) : qs(view.decision);
-    if (!r.held && !view.gate.empty() && !m.fetch_failed) r.reason = qs(view.gate);
+    if (!r.held && !view.gate.empty() && !m.fetch_failed && !m.waiting_for_bar) r.reason = qs(view.gate);
     if (r.held) r.stage = b.st.pos == trend::Pos::Long ? "持有多仓" : "持有空仓";
     else if (r.reentry) r.stage = "平仓后监控";
     else if (r.blocked) r.stage = "入场受阻";
+    else if (m.waiting_for_bar) r.stage = "等待新K线";
     else if (r.error) r.stage = "等待数据恢复";
     else if (!b.armed) r.stage = "等待入场准备";
     else if (r.signal) r.stage = "信号就绪 · 待复核";
@@ -71,7 +72,7 @@ Row project(const TrendEngine::Inspection& view, bool connected) {
     if (b.pending) r.stage = b.rotation_reserved ? "换仓预检/等待" : r.held ? "平仓处理中" : "开仓处理中";
     if (b.open_uncertain) r.stage = "委托结果待核对";
     if (b.state == TrendBot::State::Stopped) r.stage = "已停止 · 保留记录";
-    if (b.retiring && !b.pending && !m.fetch_failed) r.reason = "已移出候选，保留持仓管理/再入场记录";
+    if (b.retiring && !b.pending && !m.fetch_failed && !m.waiting_for_bar) r.reason = "已移出候选，保留持仓管理/再入场记录";
     QStringList detail;
     detail << r.symbol + "  |  " + r.stage + "  |  " + r.data
            << "趋势：" + r.trend + "；转变时间 " + stamp(m.trend_since_ms) + "；前态 " + qs(regime_name(m.previous))

@@ -1,6 +1,52 @@
 // Uses the fake exchange and deterministic clock from rotation_scenarios.h.
 static void test_resume_scenarios() {
     for (bool lg : {true, false}) {
+        RotationFixture f;
+        TrendBot held;
+        held.cfg = RotationFixture::config("GUARDEDUSDT");
+        held.cfg.use_disaster_stop = true;
+        held.is_auto = true; held.open_ms = RotationFixture::base - RotationFixture::hour;
+        held.qty = 10; held.st.pos = lg ? trend::Pos::Long : trend::Pos::Short;
+        held.st.entry_price = held.st.peak = held.current_price = 100;
+        held.st.entry_atr = 10; held.open_stop = held.st.stop = lg ? 95 : 105;
+        held.disaster_stop_id = "existing-protection"; held.disaster_stop_price = lg ? 94 : 106;
+        const auto id = f.engine.restore_bot(held);
+        f.engine.set_retiring(id, false); f.age(id, lg, 3);
+        const auto before = bot_of(f.engine, held.cfg.symbol);
+        std::vector<std::string> logs;
+        f.engine.set_log_cb([&](const std::string& s) { logs.push_back(s); });
+        f.cli->stop_log.clear();
+        f.engine.mark_signal_failure(id, "new candle pending", true);
+        f.engine.mark_signal_failure(id, "new candle pending", true);
+        f.engine.tick(held.cfg.symbol, 100);
+        const auto waiting = bot_of(f.engine, held.cfg.symbol);
+        check(!waiting.sig_ok && waiting.monitor.waiting_for_bar && !waiting.monitor.fetch_failed &&
+              waiting.monitor.cursor_ms == before.monitor.cursor_ms && waiting.monitor.trend_bars == before.monitor.trend_bars &&
+              waiting.rotation_health.samples == before.rotation_health.samples && waiting.st.stop == before.st.stop &&
+              waiting.qty == before.qty && waiting.disaster_stop_id == before.disaster_stop_id,
+              "rollover wait preserves long/short holdings, stop, checkpoint and observation counts");
+        check(logs.empty() && f.cli->stop_log.empty() && f.cli->calls.empty(),
+              "waiting never cancels protection, submits a trade or prints per-symbol global warnings");
+        f.engine.mark_signal_failure(id, "persistent candle failure");
+        check(bot_of(f.engine, held.cfg.symbol).monitor.fetch_failed &&
+              !bot_of(f.engine, held.cfg.symbol).monitor.waiting_for_bar, "retry exhaustion changes status without resetting progress");
+        f.cli->fill_price = lg ? 94 : 106;
+        f.engine.tick(held.cfg.symbol, f.cli->fill_price);
+        check(f.cli->calls.size() == 1 && f.cli->last_call().reduce_only &&
+              bot_of(f.engine, held.cfg.symbol).qty == 0,
+              "existing long/short stop still closes the position while candle data is unavailable");
+    }
+    for (bool lg : {true, false}) {
+        RotationFixture f;
+        const auto id = f.candidate("WAITUSDT", lg);
+        f.engine.mark_signal_failure(id, "new candle pending", true);
+        f.trigger("WAITUSDT", lg);
+        check(f.cli->calls.empty(), "a previous breakout cannot open a new long/short during candle wait");
+        f.signal(id, lg, true);
+        check(!bot_of(f.engine, "WAITUSDT").monitor.waiting_for_bar,
+              "fresh confirmed history clears the temporary wait state");
+    }
+    for (bool lg : {true, false}) {
         RotationFixture f; const auto id = f.holding("RESUMEUSDT", lg); f.age(id, lg, 3);
         const auto before = bot_of(f.engine, "RESUMEUSDT");
         f.engine.mark_signal_failure(id, "simulated disconnect");

@@ -60,6 +60,13 @@ int main(int argc, char** argv) {
         filter->setCurrentIndex(5); ok = ok && table->rowCount() == 1 && details->toPlainText().contains("再入场");
         filter->setCurrentIndex(6); ok = ok && table->rowCount() == 1 && table->item(0, 0)->text() == "ERAUSDT";
         ok = ok && table->item(0, 5)->text().contains("-1100") && table->item(0, 6)->text() == "K线数据异常";
+        auto& waiting = snapshot.bots.back().bot;
+        waiting.sig_ok = false; waiting.monitor.fetch_failed = false; waiting.monitor.waiting_for_bar = true;
+        waiting.monitor.data_error = "新K线尚未就绪";
+        filter->setCurrentIndex(0); filter->setCurrentIndex(6);
+        ok = ok && table->rowCount() == 1 && table->item(0, 1)->text() == "等待新K线" &&
+            table->item(0, 5)->text() == "新K线尚未就绪" && table->item(0, 6)->text() == "等待新K线 · 保留进度" &&
+            details->toPlainText().contains("已观察8根");
         filter->setCurrentIndex(0); search->setText("btc"); ok = ok && table->rowCount() == 1;
         search->clear(); table->setCurrentCell(0, 0); app.processEvents();
         if (argc > 1) ok = widget->grab().save(QString::fromLocal8Bit(argv[1])) && ok;
