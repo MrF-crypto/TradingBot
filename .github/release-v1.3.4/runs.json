@@ -1,0 +1,6 @@
+{
+  "Windows x64": {"id": 42217221730, "jobs": 1},
+  "macOS Intel / Apple Silicon": {"id": 42217221696, "jobs": 2},
+  "Linux x64 / ARM64": {"id": 42217221709, "jobs": 2},
+  "ASan + UBSan / TSan": {"id": 42217221682, "jobs": 2}
+}

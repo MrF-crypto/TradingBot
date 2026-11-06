@@ -1,0 +1,24 @@
+name: publish-verified-v1.3.4
+
+on:
+  push:
+    branches: [codex/publish-v1.3.4]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-verified-v1.3.4
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify final CI, packages and publish v1.3.4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/release-v1.3.4/publish.py
