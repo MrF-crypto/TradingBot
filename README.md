@@ -109,4 +109,4 @@ python tools/check_suite_coverage.py
 
 许可证为 [MIT](LICENSE)，保留上游版权与许可声明。
 
-当前源码 **v1.3.3** 修复整点 K 线误判、刷新延迟和日志刷屏，保留监控断点与已有仓位的止损保护。完整变化及验证范围见 [v1.3.3 说明](docs/releases/v1.3.3.md)。继续包含 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)，兼容已有监控断点；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。
+当前源码 **v1.3.4** 修复中文合约名称与行情匹配，细化行情异常提示；macOS 桌面版统一使用 `.app` 同级的 `data/`，支持完整复制旧数据并保留原目录。旧存档已有乱码时停止恢复并保留文件，附离线核对工具。完整变化及升级方法见 [v1.3.4 说明](docs/releases/v1.3.4.md)。继续包含 [v1.3.3 的 K 线刷新修复](docs/releases/v1.3.3.md) 和 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。
