@@ -5,6 +5,7 @@ import copy
 import json
 import math
 from pathlib import Path
+import sys
 
 
 def legacy_name(symbol):
@@ -115,6 +116,11 @@ def main():
 
 
 if __name__ == '__main__':
+    # Windows pipe output may default to a legacy code page that cannot encode
+    # the very Chinese names this tool must report. Keep reports UTF-8 even when
+    # redirected, and configure stderr as well for refusal/error messages.
+    sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     try:
         main()
     except (OSError, ValueError) as error:

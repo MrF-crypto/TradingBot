@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -72,20 +73,24 @@ class SymbolRepairTest(unittest.TestCase):
                        '--exchange-info', str(folder / 'market.json'),
                        '--positions', str(folder / 'positions.json'),
                        '--open-orders', str(folder / 'orders.json')]
-            dry = subprocess.run(command, capture_output=True)
+            environment = dict(os.environ, PYTHONIOENCODING='cp1252:strict')
+            dry = subprocess.run(command, capture_output=True, env=environment)
             self.assertEqual(dry.returncode, 0, dry.stderr)
+            for old, new in zip(self.aliases, self.names):
+                self.assertIn(f'{old} -> {new}', dry.stdout.decode('utf-8'))
             self.assertEqual(len(list(folder.iterdir())), 4)
             output = folder / 'reviewed.json'
-            completed = subprocess.run(command + ['--output', str(output)], capture_output=True)
+            completed = subprocess.run(command + ['--output', str(output)], capture_output=True, env=environment)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(state.read_bytes(), original)
             self.assertEqual((folder / 'reviewed.json.original.bak').read_bytes(), original)
             self.assertEqual([x['symbol'] for x in json.loads(output.read_text(encoding='utf-8'))], self.names)
             before = output.read_bytes()
-            refused = subprocess.run(command + ['--output', str(output)], capture_output=True)
+            refused = subprocess.run(command + ['--output', str(output)], capture_output=True, env=environment)
             self.assertNotEqual(refused.returncode, 0)
+            self.assertIn('拒绝覆盖', refused.stderr.decode('utf-8'))
             self.assertEqual(output.read_bytes(), before)
-            refused = subprocess.run(command + ['--output', str(state)], capture_output=True)
+            refused = subprocess.run(command + ['--output', str(state)], capture_output=True, env=environment)
             self.assertNotEqual(refused.returncode, 0)
             self.assertEqual(state.read_bytes(), original)
 
