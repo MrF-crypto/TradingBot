@@ -48,8 +48,22 @@ static bool write_file(const std::string& p, const std::string& s) {
     return true;
 }
 
+#include "symbol_locale_fixture.h"
 int main() {
     const std::string path = "test_cfg.json";
+    in_symbol_locales([&] {
+        write_file(path, R"({"api_key":"k","api_secret":"s","trend_bots":[{"symbol":"龙虾usdt"},{"symbol":"牛来USDT"},{"symbol":"币安人生USDT"}]})");
+        HeadlessConfig hc; std::string err;
+        check(load_headless_config(path, hc, err) && hc.trend_bots.size() == 3 &&
+              hc.trend_bots[0].symbol == "龙虾USDT" && hc.trend_bots[1].symbol == "牛来USDT" &&
+              hc.trend_bots[2].symbol == "币安人生USDT", "headless config preserves all three Chinese contracts across locales");
+    });
+    {
+        write_file(path, R"({"api_key":"k","api_secret":"s","trend_bots":[{"symbol":"ɾ�ș�USDT"}]})");
+        HeadlessConfig hc; std::string err;
+        check(!load_headless_config(path, hc, err) && err.find("乱码") != std::string::npos,
+              "lossy Chinese config fails explicitly before starting trading");
+    }
 
     // ── ① 损坏/缺失文件不崩溃 ───────────────────────────────────────────────
     // v4.7.1 之前这里前面还有四组网格DCA 的用例（默认值回落、显式值采纳、

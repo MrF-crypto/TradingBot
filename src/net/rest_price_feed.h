@@ -72,6 +72,7 @@ public:
         // 留着它是为了让界面/日志能说清口径变了 —— 成交价不抗插针，
         // 拿它推移动止损比标记价更容易被打掉，用的人有权知道
         bool    from_fallback = false;
+        bool fresh(int64_t now) const;
     };
 
     // 健康状态。只有四个数，而且每一个都是【直接观测】到的，不是推断出来的。
@@ -82,6 +83,8 @@ public:
         int     fail_streak   = 0;   // 连续失败轮数
         size_t  symbols       = 0;
         size_t  fresh         = 0;   // 价格在 kStaleMs 之内的品种数
+        struct Issue { std::string symbol; bool received; int64_t age_ms; };
+        std::vector<Issue> issues; // Same snapshot as fresh; includes never-received quotes.
 
         // ⚠ 判据是"这一轮有没有拿到数据"，不是"连接还在不在"。
         //   轮询没有"连接"这个中间状态，所以也就没有"看起来正常但其实已死"
@@ -89,7 +92,7 @@ public:
         bool healthy() const {
             if (!running) return false;
             if (last_ok_ms == 0) return false;          // 一次都没成功
-            if (age_ms > kStaleMs) return false;
+            if (age_ms < 0 || age_ms > kStaleMs) return false;
             // ⚠ 必须看 fail_streak，不能只看"缓存里的价还新鲜"。
             //   周期 1 秒而陈旧阈值 10 秒，所以连挂好几轮之后价格仍在窗口内 ——
             //   只看新鲜度的话健康灯会绿着，而行情其实已经连挂三轮。
@@ -101,6 +104,8 @@ public:
             return symbols == 0 || fresh == symbols;
         }
         std::string summary() const;
+        std::string details() const;
+        std::string badge() const;
     };
 
     void start();

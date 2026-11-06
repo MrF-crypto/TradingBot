@@ -232,8 +232,10 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         simdjson::dom::object o;
         if (elem.get(o) != simdjson::SUCCESS) throw std::runtime_error("状态条目格式无效，停止恢复");
 
-        const std::string sym = get_str(o, "symbol", "");
+        const std::string sym = app::normalize_symbol(get_str(o, "symbol", "")).symbol;
         if (sym.empty()) throw std::runtime_error("状态条目缺少品种，停止恢复");
+        if (!symbol_text::intact(sym))
+            throw std::runtime_error("品种名称损坏，保留原文件并停止恢复；请核对持仓及委托后按 docs/SYMBOL_RECOVERY.zh-CN.md 修复");
 
         bool is_auto = false;
         {

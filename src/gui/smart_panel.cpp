@@ -3,6 +3,7 @@
 // 这里只负责"什么时候调"和"怎么显示"。
 #include "gui/main_window.h"
 #include "gui/candidate_monitor.h"
+#include "core/symbol_text.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -561,7 +562,7 @@ void MainWindow::openSmartDialog() {
         c.max_abs_funding = s.fund->value();
         c.blacklist.clear();
         for (auto x : s.black->text().split(QRegularExpression("[,，\\s]+"), Qt::SkipEmptyParts)) {
-            x = x.trimmed().toUpper();
+            x = QString::fromStdString(symbol_text::upper_ascii(x.trimmed().toStdString()));
             if (!x.isEmpty()) c.blacklist.insert(x.toStdString());
         }
         c.daily_loss_limit = s.day->value();

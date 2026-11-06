@@ -17,12 +17,13 @@
 //   · 品种名缺 USDT 后缀：GUI 自动补全并告警；headless 完全不处理，于是手写的
 //     "BTC" 永远拉不到 K 线、永远"等信号"，进程照常运行 —— 静默失效
 #include "core/trend_decision.h"
+#include "core/symbol_text.h"
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 namespace ccbot::app {
 
@@ -91,10 +92,10 @@ struct SymbolFix {
 inline SymbolFix normalize_symbol(const std::string& raw) {
     SymbolFix f;
     std::string s = raw;
-    auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    auto not_space = [](unsigned char ch) { return !symbol_text::ascii_space(ch); };
     s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
     s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
-    for (auto& ch : s) ch = (char)std::toupper((unsigned char)ch);
+    s = symbol_text::upper_ascii(std::move(s));
 
     auto ends_with = [&](const char* suf) {
         const std::string t(suf);

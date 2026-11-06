@@ -180,6 +180,10 @@ bool load_headless_config(const std::string& path, HeadlessConfig& out, std::str
                                            "\" 缺少后缀，已按 " + c.symbol + " 处理");
             }
             if (c.symbol.empty()) continue;
+            if (!symbol_text::intact(c.symbol)) {
+                err = "品种名称包含乱码，未启动交易：" + c.symbol;
+                return false;
+            }
 
             for (auto field : so) {
                 std::string k(field.key);

@@ -70,9 +70,51 @@ static std::vector<std::string> reconcile(
 }
 
 #include "audit_state_scenarios.h"
+#include "symbol_locale_fixture.h"
 int main() {
     test_audit_state_scenarios();
     const std::string path = "trend_state_test.json";
+    in_symbol_locales([&] {
+        for (const auto& symbol : chinese_symbols) {
+            auto saved = mk_bot(symbol, trend::Pos::Short, 100, 95, 105, 2);
+            saved.cfg.rule.following.enabled = true;
+            saved.disaster_stop_id = "protect-123"; saved.disaster_stop_price = 106;
+            saved.open_uncertain = true; saved.uncertain_client_id = "opening-123";
+            saved.reserved_risk = 10; saved.reserved_margin = 50;
+            saved.monitor.model_key = monitor_model_key(saved.cfg);
+            saved.monitor.cursor_ms = saved.monitor.target_ms = 1800000000000LL;
+            saved.monitor.trend_bars = 9;
+            saved.reentry_after_ms = saved.monitor.cursor_ms + 7200000;
+            saved.st.last_entry_bar_ms = saved.monitor.cursor_ms;
+            check(save_trend_state(path, {saved}).ok, "Chinese position checkpoint saves normally");
+            const auto loaded = load_trend_state(path, {saved.cfg});
+            check(loaded.size() == 1 && loaded[0].cfg.symbol == symbol && loaded[0].qty == 2 &&
+                  loaded[0].st.stop == 105 && loaded[0].disaster_stop_id == "protect-123" &&
+                  loaded[0].open_uncertain && loaded[0].uncertain_client_id == "opening-123" &&
+                  loaded[0].reserved_risk == 10 && loaded[0].reserved_margin == 50 &&
+                  loaded[0].monitor.cursor_ms == saved.monitor.cursor_ms && loaded[0].monitor.trend_bars == 9 &&
+                  loaded[0].reentry_after_ms == saved.reentry_after_ms &&
+                  loaded[0].st.last_entry_bar_ms == saved.st.last_entry_bar_ms && loaded[0].needs_reconcile,
+                  "restart preserves Chinese position, protective order, unknown opening and monitoring/re-entry progress");
+        }
+    });
+    {
+        const std::string damaged = R"([{"symbol":"ɾ�ș�USDT","pos":2,"qty":2,"disaster_stop_id":"protect-123"}])";
+        write_file(path, damaged);
+        bool refused = false;
+        try { (void)load_trend_state(path, {mk_cfg("龙虾USDT")}); }
+        catch (const std::exception&) { refused = true; }
+        std::ifstream input(path, std::ios::binary); std::ostringstream contents; contents << input.rdbuf();
+        check(refused && contents.str() == damaged, "damaged names are not discarded as removed configs; original state stays byte-identical");
+    }
+    {
+        auto saved = mk_bot("龙虾usdt", trend::Pos::Long, 100, 102, 95, 2);
+        saved.disaster_stop_id = "protect-lowercase";
+        check(save_trend_state(path, {saved}).ok, "legacy lowercase-suffix state saves");
+        const auto loaded = load_trend_state(path, {mk_cfg("龙虾USDT")});
+        check(loaded.size() == 1 && loaded[0].cfg.symbol == "龙虾USDT" && loaded[0].qty == 2 &&
+              loaded[0].disaster_stop_id == "protect-lowercase", "headless restore normalizes names before matching configs, retaining positions");
+    }
     {
         write_file(path, R"([{"symbol":"LEGACYUSDT","pos":0,"qty":0}])");
         const auto migrated = load_trend_state(path, {mk_cfg("LEGACYUSDT")});

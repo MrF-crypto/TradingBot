@@ -1643,6 +1643,14 @@ void MainWindow::load_and_restore_trend() {
             QMessageBox::critical(this, "状态文件损坏", "状态条目或品种字段无效，已保留原文件。");
             return;
         }
+        if (!symbol_text::intact(app::normalize_symbol(o["symbol"].toString().toStdString()).symbol)) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "品种名称损坏，已停止恢复",
+                "存档包含乱码品种：" + o["symbol"].toString() +
+                "\n原文件及交易所保护单保持不变。请先备份并核对品种名称、持仓及在途委托；"
+                "不能把乱码条目当成下架或空仓删除。修复方法见 docs/SYMBOL_RECOVERY.zh-CN.md。");
+            return;
+        }
         if (o.contains("auto_config")) {
             smart::Config probe; std::string error;
             if (!o["auto_config"].isObject() || !smart::config_from_json(

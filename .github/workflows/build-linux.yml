@@ -140,6 +140,9 @@ jobs:
       - name: Run all test suites
         run: ctest --test-dir build -C Release --output-on-failure --parallel 2
 
+      - name: Test legacy symbol recovery
+        run: python3 tests/test_symbol_repair.py
+
       - name: Package
         run: |
           set -e
@@ -161,6 +164,8 @@ jobs:
           set -e
           cp LICENSE README.md config.example.json pkg/
           cp -R docs pkg/
+          mkdir -p pkg/tools
+          cp tools/repair_symbol_state.py pkg/tools/
           mkdir -p pkg/licenses
           for notice in build/vcpkg_installed/${{ matrix.triplet }}/share/*/copyright; do
             test -f "$notice" || continue

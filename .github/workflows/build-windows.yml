@@ -86,6 +86,9 @@ jobs:
           QT_DEBUG_PLUGINS: '1'
         run: ctest --test-dir build -C Release --output-on-failure --parallel 2 --timeout 180
 
+      - name: Test legacy symbol recovery
+        run: python tests/test_symbol_repair.py
+
       - name: Upload test diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -139,6 +142,8 @@ jobs:
           set -e
           cp LICENSE README.md config.example.json pkg/
           cp -R docs pkg/
+          mkdir -p pkg/tools
+          cp tools/repair_symbol_state.py pkg/tools/
           mkdir -p pkg/licenses
           for notice in build/vcpkg_installed/x64-windows/share/*/copyright; do
             test -f "$notice" || continue

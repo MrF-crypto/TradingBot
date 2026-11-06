@@ -18,6 +18,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <limits>
+#include "symbol_locale_fixture.h"
 
 using namespace ccbot;
 
@@ -39,6 +41,47 @@ static bool wait_until(F f, int timeout_ms = 5000) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    in_symbol_locales([] {
+        std::unordered_map<std::string, double> prices;
+        for (int i = 0; i < 197; ++i) prices["TEST" + std::to_string(i) + "USDT"] = 100;
+        for (const auto& symbol : chinese_symbols) prices[symbol] = 1;
+        RestPriceFeed feed([&] { return prices; }, [&] { return prices; });
+        for (const auto& [symbol, price] : prices) { (void)price; feed.subscribe(symbol); }
+        feed.start();
+        check(wait_until([&] { return feed.health().fresh == 200; }), "200/200 symbols receive quotes, including all three Chinese contracts");
+        check(feed.health().healthy() && feed.health().badge() == "行情✓", "Unicode subscriptions do not cause partial-feed warnings");
+        for (const auto& symbol : chinese_symbols) {
+            const auto lower = symbol.substr(0, symbol.size() - 4) + "usdt";
+            double pct = 0;
+            check(feed.mark_price(lower) == 1 && wait_until([&] { return feed.change_24h(lower, pct); }) && pct == 1,
+                  "Chinese quote/24h cache lookup supports lowercase ASCII suffix");
+            feed.unsubscribe(lower);
+        }
+        check(feed.health().symbols == 197, "Chinese subscriptions can be removed without ghost entries");
+        feed.stop();
+    });
+    {
+        RestPriceFeed feed([] { return std::unordered_map<std::string,double>{{"BTCUSDT",100}}; }, {});
+        feed.subscribe("BTCUSDT"); feed.subscribe("龙虾USDT"); feed.start();
+        check(wait_until([&] { return feed.health().last_ok_ms > 0; }), "partial response is received");
+        auto h = feed.health();
+        check(!h.healthy() && h.badge() == "⚠部分行情异常：1/2" && h.issues.size() == 1 &&
+              h.details().find("龙虾USDT：从未收到有效报价") != std::string::npos,
+              "partial warnings name the missing contract, without misreporting a total outage");
+        check(feed.mark_price("BTCUSDT") == 100 && feed.mark_price("龙虾USDT") == 0,
+              "healthy symbols remain usable; missing quotes cannot drive strategy decisions");
+        h.fail_streak = 3;
+        check(h.badge() == "⚠行情连续拉取失败", "whole request failure takes precedence over partial warning");
+        h.age_ms = RestPriceFeed::kStaleMs + 1;
+        check(h.badge() == "⚠行情拉取中断", "stale whole-feed success is classified separately");
+        h.issues = {{"龙虾USDT", true, 12000}};
+        check(h.details().find("龙虾USDT：已 12 秒未更新") != std::string::npos, "previously received quote has an explicit age");
+        feed.stop();
+        RestPriceFeed::Tick tick; tick.mark_price = 1; tick.mark_ms = 100000;
+        check(tick.fresh(110000) && !tick.fresh(110001) && !tick.fresh(99999), "stale boundary and future timestamp fail closed");
+        tick.mark_price = std::numeric_limits<double>::infinity();
+        check(!tick.fresh(100001), "non-finite quotes are unusable");
+    }
 
     std::printf("── 用例1：订阅 → 首轮拿到价 ──\n");
     {

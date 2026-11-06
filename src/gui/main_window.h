@@ -153,7 +153,7 @@ private:
     // 币安合约单连接 200 条流的上限，超出后【静默】失效
     void unsubscribeIfUnused(const std::string& symbol);
 
-    // 持久化（便携模式：数据存程序目录 data/ 下，不可写时回退 AppData）
+    // 持久化（程序旁 data/；Windows 保留 AppData 回退，macOS 不可写时停止启动）
     void migrate_appdata_if_needed();
     std::string cred_path()     const;
     std::string bot_cfg_path()  const;

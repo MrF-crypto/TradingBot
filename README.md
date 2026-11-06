@@ -6,6 +6,8 @@
 
 从 [Releases](https://github.com/MrF-crypto/TradingBot/releases) 下载 Windows x64 便携包，完整解压到可写目录后运行 `TradingBot.exe`。DLL、`platforms/` 和许可证文件应与程序一起保留，不要只复制 EXE。同时包含 `ccbot_headless.exe`、配置模板和文档。macOS 按 Intel / Apple Silicon 选择 `.app` 包；Linux 按 x64 / ARM64 选择 headless 包，平台要求见 [平台说明](docs/PLATFORMS.zh-CN.md)。
 
+macOS 桌面版运行数据统一保存在 `TradingBot.app` 同级的 `data/`。首次升级会在启动前完整复制旧目录并保留原件；已有 `data/` 直接使用，不与旧记录混合。更新程序时保留该文件夹，备份时一并复制。API 凭证仍保存在 macOS 钥匙串，换电脑需要重新输入。
+
 桌面版首次启动后设置测试网账户。无界面版将 `config.example.json` 复制为 `config.json` 并填写本机配置，参考 [Headless 说明](docs/HEADLESS.md)。下载文件可用同一 Release 的 `SHA256SUMS.txt` 核验。
 
 ```powershell

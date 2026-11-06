@@ -23,7 +23,28 @@ static void check(bool ok, const std::string& what) {
 }
 
 #include "signal_refresh_scenarios.h"
+#include "symbol_locale_fixture.h"
 int main() {
+    in_symbol_locales([] {
+        for (const auto& symbol : chinese_symbols) {
+            const auto clean = app::normalize_symbol(symbol);
+            const auto lower = symbol.substr(0, symbol.size() - 4) + "usdt";
+            check(clean.symbol == symbol && !clean.changed && !clean.suffixed && symbol_text::intact(clean.symbol),
+                  "Chinese saved identifiers remain exact in every available locale");
+            check(app::normalize_symbol("\t " + lower + "\r\n").symbol == symbol,
+                  "ASCII whitespace/suffix normalization preserves UTF-8 bytes");
+            check(app::normalize_symbol(symbol.substr(0, symbol.size() - 4)).symbol == symbol,
+                  "Chinese bare symbol receives USDT suffix without losing bytes");
+        }
+        check(app::normalize_symbol("\v龙虾usdc\f").symbol == "龙虾USDC", "USDC suffix remains supported");
+        check(!symbol_text::intact("Ÿ�Ů�ĺ�ǔ�USDT") && !symbol_text::intact("ǉ�Ɲ�USDT") &&
+              !symbol_text::intact("ɾ�ș�USDT") && !symbol_text::intact(std::string("\xc5\xb8\x81") + "USDT"),
+              "lossy and raw damaged saved names cannot pass the restore guard");
+        check(!symbol_text::intact("\xc0\xaf") && !symbol_text::intact("\xed\xa0\x80") &&
+              !symbol_text::intact("\xf4\x90\x80\x80") && !symbol_text::intact("\xe7\x89") &&
+              !symbol_text::intact("BTC\tUSDT") && symbol_text::intact("币😀USDT"),
+              "symbol validation rejects malformed UTF-8 and controls but preserves valid Unicode");
+    });
     test_signal_refresh_scenarios();
     // ═══ 对账闸门 ════════════════════════════════════════════════════════════
     std::printf("── 对账闸门 ──\n");

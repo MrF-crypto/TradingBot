@@ -1,8 +1,11 @@
 #include "net/rest_price_feed.h"
+#include "core/symbol_text.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <sstream>
+#include <utility>
 
 namespace ccbot {
 
@@ -11,10 +14,21 @@ int64_t RestPriceFeed::now_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-static std::string to_upper(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return (char)std::toupper(c); });
-    return s;
+static std::string to_upper(std::string s) { return symbol_text::upper_ascii(std::move(s)); }
+
+bool RestPriceFeed::Tick::fresh(int64_t now) const {
+    return std::isfinite(mark_price) && mark_price > 0 && mark_ms > 0 &&
+           now >= mark_ms && now - mark_ms <= kStaleMs;
+}
+
+std::string RestPriceFeed::Health::badge() const {
+    if (!running) return "⚠行情未启动";
+    if (!last_ok_ms) return "⚠等待行情";
+    if (age_ms < 0 || age_ms > kStaleMs) return "⚠行情拉取中断";
+    if (fail_streak >= kUnhealthyFails) return "⚠行情连续拉取失败";
+    if (fresh < symbols) return std::string(fresh ? "⚠部分行情异常：" : "⚠全部品种行情异常：") +
+        std::to_string(symbols - fresh) + "/" + std::to_string(symbols);
+    return "行情✓";
 }
 
 std::string RestPriceFeed::Health::summary() const {
@@ -25,6 +39,18 @@ std::string RestPriceFeed::Health::summary() const {
     if (fresh < symbols)  o << " 陈旧" << (symbols - fresh);
     if (age_ms > 2000)    o << " 上次成功" << (age_ms / 1000) << "秒前";
     if (fail_streak > 0)  o << " 连续失败" << fail_streak << "轮";
+    return o.str();
+}
+
+std::string RestPriceFeed::Health::details() const {
+    std::ostringstream o;
+    o << summary();
+    for (const auto& issue : issues) {
+        o << "\n" << issue.symbol << "：";
+        if (!issue.received) o << "从未收到有效报价";
+        else if (issue.age_ms < 0) o << "报价时间异常";
+        else o << "已 " << issue.age_ms / 1000 << " 秒未更新";
+    }
     return o.str();
 }
 
@@ -123,7 +149,7 @@ void RestPriceFeed::loop() {
                 std::lock_guard<std::mutex> lk(mtx_);
                 for (const auto& s : subs_) {
                     auto it = all.find(s);
-                    if (it == all.end() || !(it->second > 0)) continue;
+                    if (it == all.end() || !std::isfinite(it->second) || !(it->second > 0)) continue;
                     auto& c = cache_[s];
                     c.symbol        = s;
                     c.mark_price    = it->second;
@@ -206,10 +232,9 @@ RestPriceFeed::Tick RestPriceFeed::get(const std::string& symbol) const {
 
 double RestPriceFeed::mark_price(const std::string& symbol) const {
     const auto t = get(symbol);
-    if (!(t.mark_price > 0)) return 0.0;
     // 陈旧保护：缓存里躺着一个冻结价时看起来完全正常，而引擎会拿它推移动止损、
     // 判触线，实际行情暴跌时完全失明。宁可返回 0 让上层知道"没有价"
-    if (now_ms() - t.mark_ms > kStaleMs) return 0.0;
+    if (!t.fresh(now_ms())) return 0.0;
     return t.mark_price;
 }
 
@@ -221,7 +246,7 @@ bool RestPriceFeed::change_24h(const std::string& symbol, double& out_pct) const
 }
 
 void RestPriceFeed::set_mark_price(const std::string& symbol, double price) {
-    if (!(price > 0)) return;
+    if (!std::isfinite(price) || !(price > 0)) return;
     const auto up = to_upper(symbol);
     const int64_t t = now_ms();
     std::lock_guard<std::mutex> lk(mtx_);
@@ -243,9 +268,12 @@ RestPriceFeed::Health RestPriceFeed::health() const {
     h.symbols = subs_.size();
     for (const auto& s : subs_) {
         auto it = cache_.find(s);
-        if (it != cache_.end() && it->second.mark_price > 0 &&
-            t - it->second.mark_ms <= kStaleMs)
+        if (it != cache_.end() && it->second.fresh(t))
             ++h.fresh;
+        else {
+            const bool received = it != cache_.end() && it->second.mark_ms > 0;
+            h.issues.push_back({s, received, received ? t - it->second.mark_ms : 0});
+        }
     }
     return h;
 }
@@ -256,8 +284,7 @@ std::vector<std::string> RestPriceFeed::stale_symbols() const {
     std::lock_guard<std::mutex> lk(mtx_);
     for (const auto& s : subs_) {
         auto it = cache_.find(s);
-        if (it == cache_.end() || !(it->second.mark_price > 0) ||
-            t - it->second.mark_ms > kStaleMs)
+        if (it == cache_.end() || !it->second.fresh(t))
             out.push_back(s);
     }
     return out;

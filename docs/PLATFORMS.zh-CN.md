@@ -32,7 +32,25 @@ python3 tools/check_unix_package.py pkg --platform macos --arch arm64
 
 默认 vcpkg macOS triplet 静态链接第三方库，Qt 的静态插件由 CMake 导入。共享 Qt 的源码构建使用 Qt 部署脚本复制依赖。CI 检查包的架构、依赖路径、离线启动与应用包签名；未满足检查的产物不上传。临时签名不等于 Apple Developer ID 签名或公证；本项目本轮未接入 Apple 公证发布。
 
-新安装的 `.app` 使用 Qt `AppDataLocation`（通常是 `~/Library/Application Support/CCGMonitor/TradingBot`）保存数据，不向应用包内部写入。程序文件升级时保留该目录。旧版可执行文件旁已有的 `data/` 继续使用；从旧裸可执行文件迁移到 `.app` 时，停机备份并把完整数据目录复制到新数据目录，核对持仓和恢复状态后再启用。
+macOS 桌面版把运行数据统一放在 `TradingBot.app` 同级的 `data/`，与 Windows 程序旁的 `data/` 一样。配置、持仓及监控断点、交易明细、日志、journal 和资金费账本都在其中，运行时不向新的应用包内部写入。
+
+```text
+tradingbot-macos/
+├── TradingBot.app
+├── ccbot_headless
+└── data/
+    ├── sar_bots.json
+    ├── ccg_smart.json
+    ├── ccg_smart_state.json
+    ├── logs/
+    └── journal/
+```
+
+首次升级且同级 `data/` 不存在或为空时，启动前会完整复制旧数据，原目录保留。优先采用旧版 `.app/Contents/MacOS/data/`（如有），否则采用 Qt `AppDataLocation`，通常为 `~/Library/Application Support/CCGMonitor/TradingBot`。复制在暂存目录完成后整体启用；源目录正在使用、复制失败或出现链接/特殊文件时停止启动，不使用半份存档。已有非空 `data/` 直接使用，不与系统目录混合。迁移与启动使用文件锁；同一数据目录不能运行两个实例。
+
+程序旁目录不可写时会明确报错，不会悄悄改用系统目录。请把整个程序文件夹放在可写位置后再启动。更新时替换 `.app` 并保留同级 `data/`；备份或搬迁时一并复制 `data/`。首次迁移前关闭旧程序，迁移后核对持仓和保护状态。
+
+API 凭证仍由 macOS 系统钥匙串保存；复制 `data/` 不会导出钥匙串，换电脑或系统需重新输入凭证。headless 继续按其配置中的数据路径运行，本次目录调整针对桌面版。
 
 ## Linux 源码构建
 

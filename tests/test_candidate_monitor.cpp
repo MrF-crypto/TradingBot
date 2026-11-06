@@ -13,9 +13,11 @@
 #include <QTemporaryDir>
 #include "core/monitor_state.h"
 #include <cstdio>
+#include "data_directory_scenarios.h"
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    const bool data_paths_ok = test_data_directory_scenarios();
     ccg::CandidateSnapshot snapshot; snapshot.connected = true;
     const auto now = QDateTime::currentMSecsSinceEpoch();
     for (int i = 0; i < 4; ++i) {
@@ -52,7 +54,7 @@ int main(int argc, char** argv) {
     widget->resize(1480, 850); widget->show(); app.processEvents();
     auto* table = widget->findChild<QTableWidget*>(); auto* filter = widget->findChild<QComboBox*>();
     auto* search = widget->findChild<QLineEdit*>(); auto* details = widget->findChild<QTextBrowser*>();
-    bool ok = table && filter && search && details;
+    bool ok = data_paths_ok && table && filter && search && details;
     if (ok) {
         ok = table->rowCount() == 4 && table->columnCount() == 8 && details->toPlainText().contains("9/6");
         filter->setCurrentIndex(4); ok = ok && table->rowCount() == 1 && table->item(0, 0)->text() == "ARBUSDT";

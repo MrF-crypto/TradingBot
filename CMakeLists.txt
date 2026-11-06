@@ -146,6 +146,7 @@ if(CCBOT_BUILD_GUI)
         src/gui/trend_panel.cpp
         src/gui/smart_panel.cpp
         src/gui/candidate_monitor.cpp
+        src/gui/data_directory.cpp
         ${CORE_SOURCES}
         ${APP_ICON_SOURCES}
     )
@@ -414,7 +415,7 @@ endforeach()
 enable_testing()
 if(TARGET TradingBot)
     qt_add_executable(tradingbot_monitor_smoke tests/test_candidate_monitor.cpp src/gui/candidate_monitor.cpp
-        src/core/monitor_checkpoint.cpp src/core/smart_mode.cpp)
+        src/core/monitor_checkpoint.cpp src/core/smart_mode.cpp src/gui/data_directory.cpp)
     target_include_directories(tradingbot_monitor_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tradingbot_monitor_smoke PRIVATE Qt6::Widgets simdjson::simdjson)
     ccbot_harden(tradingbot_monitor_smoke)

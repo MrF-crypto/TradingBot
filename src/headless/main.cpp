@@ -546,33 +546,23 @@ int main(int argc, char** argv) {
         }
 
         // ── 1d) 行情链路健康（每 20 tick ≈ 60 秒一次）────────────────────────
-        // 盯的是 WS 链路【本身】，不是"某个品种有没有价"。两者必须分开，
-        // 因为半开连接下 REST 兜底会让上面那套 stall 计数一直归零、一条告警不发，
-        // 而实际状况是：决策延迟从毫秒掉到秒级、REST 权重被持续消耗、
-        // 24h 涨幅（唯一没有任何兜底的数据）已经完全失效。
-        // 换句话说，没有这一段的话，这条最常见的劣化是彻底看不见的
+        // 同时区分整体 REST 拉取故障与部分品种报价缺失。
         if (tick_n % 20 == 0) {
             const auto fh = ticker.health();
-            log_line("行情链路: " + fh.summary(), fh.healthy() ? "OK" : "WARN");
+            log_line("行情链路: " + fh.badge() + " | " + fh.summary(), fh.healthy() ? "OK" : "WARN");
 
             if (!fh.healthy()) {
                 // 去抖 3 次（约 3 分钟）才叫人。healthy() 是瞬时判定，
                 // 单个品种偶发丢一两包很正常——为一次抖动叫人是在训练人忽略告警
                 if (++feed_bad_streak >= 3 && !feed_alerted) {
                     feed_alerted = true;
-                    std::string detail = fh.summary();
-                    const auto ss = ticker.stale_symbols();
-                    if (!ss.empty()) {
-                        detail += " | 断流品种:";
-                        for (size_t i = 0; i < ss.size() && i < 8; ++i) detail += " " + ss[i];
-                        if (ss.size() > 8) detail += " 等共" + std::to_string(ss.size()) + "个";
-                    }
+                    const std::string detail = fh.badge() + " | " + fh.details();
                     log_line("行情链路持续异常: " + detail, "ERR");
                     if (!webhook.empty()) {
                         std::thread([w = webhook, d = detail]() {
                             send_webhook(w, "[ccbot] ⚠ 行情链路持续约3分钟不健康 —— " + d
-                                            + "。策略可能正靠 REST 兜底在跑（延迟秒级），"
-                                              "且 24h 涨幅拦截已失效");
+                                            + "。缺价品种等待有效报价；已挂交易所硬止损独立执行，"
+                                              "本地移动止损需要有效报价。");
                         }).detach();
                     }
                 }

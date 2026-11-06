@@ -193,22 +193,18 @@ MainWindow::~MainWindow() {
 // 路径辅助（便携模式）
 // ─────────────────────────────────────────────────────────────────────────────
 // 数据目录 = 程序所在目录下的 data 子目录：策略配置、交易明细、API凭证、日志
-// 全部集中在这里——整个程序文件夹拷走就是完整备份（API凭证仍是DPAPI加密，换机
-// 需重新输入）。程序目录不可写时（如装进 Program Files）自动回退到系统 AppData
+// macOS 使用 .app 旁的 data，由 main 在载入账户前完成整目录迁移。
+// Windows 目录不可写时沿用 AppData 回退；macOS 明确报错，不静默切换账户状态。
+// macOS API 凭证仍在 Keychain，不属于 data/ 中的文件。
 QString MainWindow::portable_data_dir() {
+#ifdef Q_OS_MAC
+    // Prepared and locked in main(), before loading credentials or auto-connecting.
+    return qApp->property("tradingbotDataDirectory").toString();
+#else
     static QString cached;
     if (!cached.isEmpty()) return cached;
 
     QString portable = QCoreApplication::applicationDirPath() + "/data";
-#ifdef Q_OS_MAC
-    // A new .app must not write into its signed bundle. Preserve a legacy portable
-    // data directory if one already exists; otherwise upgrades share AppDataLocation.
-    if (!QDir(portable).exists()) {
-        cached = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-        QDir().mkpath(cached);
-        return cached;
-    }
-#endif
     if (QDir().mkpath(portable)) {
         QFile probe(portable + "/.write_test");
         if (probe.open(QIODevice::WriteOnly)) {
@@ -222,11 +218,19 @@ QString MainWindow::portable_data_dir() {
     QDir().mkpath(fallback);
     cached = fallback;
     return cached;
+#endif
 }
 
 // 一次性迁移：老版本数据在系统 AppData 里，新数据目录还是空的话自动搬过来，
 // 升级用户的策略/明细/凭证无感继承
 void MainWindow::migrate_appdata_if_needed() {
+#ifdef Q_OS_MAC
+    // macOS migration is already complete before the main window and live account
+    // exist. Do not run the legacy partial-file merge against a populated data/.
+    log("数据目录：" + portable_data_dir(), "INFO");
+    const auto note = qApp->property("tradingbotDataDirectoryNote").toString();
+    if (!note.isEmpty()) log(note, "OK");
+#else
     QString dst = portable_data_dir();
     QString old = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     if (dst == old) return;                          // 回退模式，无需迁移
@@ -256,6 +260,7 @@ void MainWindow::migrate_appdata_if_needed() {
     if (n > 0)
         log(QString("已从旧数据目录迁移 %1 个文件到程序目录 data/（原文件保留在 %2）")
             .arg(n).arg(old), "OK");
+#endif
 }
 
 std::string MainWindow::cred_path() const {
@@ -1517,14 +1522,13 @@ void MainWindow::updateHeader() {
         QString timeStr = QString("%1 | %2:%3:%4")
             .arg(connNetName_)
             .arg(hh, 2, 10, QChar('0')).arg(mm, 2, 10, QChar('0')).arg(ss, 2, 10, QChar('0'));
-        // 行情链路徽标。这和左边那个"已连接"是【两件不同的事】：那个指账户与
-        // 下单通道，这个指行情 WS。此前界面上完全没有地方能看出行情链路的状态，
-        // 而 WS 半开时账户通道照常绿着、REST 兜底照常有价，整个界面没有任何
-        // 一处会变色——这正是"降级但不可见"最后一块拼图
+        // 账户连接与 REST 行情健康分别显示；部分品种缺价不等于整个下单通道中断。
         if (ticker_ && (feed_hc_++ % 20) == 0) {     // 50ms × 20 = 1 秒重算一次
             const auto fh = ticker_->health();
-            feedBadge_ = fh.healthy() ? QStringLiteral("行情✓") : QStringLiteral("⚠行情异常");
-            feedTip_   = QString::fromStdString(fh.summary());
+            feedBadge_ = QString::fromStdString(fh.badge());
+            feedTip_   = QString::fromStdString(fh.details());
+            feedTip_ += QStringLiteral("\n交易按各品种有效报价及风控条件判断；过期报价不送入策略引擎。"
+                                      "\n已挂在交易所的硬止损独立执行，本地移动止损需要有效报价。");
         }
         const QString badge = feedBadge_.isEmpty() ? QString() : " | " + feedBadge_;
         const bool feed_bad = feedBadge_.startsWith(QChar(0x26A0));   // ⚠
@@ -1548,7 +1552,7 @@ void MainWindow::updateHeader() {
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::onAddWatchSymbol() {
     if (!addSymbolEdit_) return;
-    QString raw = addSymbolEdit_->text().trimmed().toUpper();
+    QString raw = QString::fromStdString(symbol_text::upper_ascii(addSymbolEdit_->text().trimmed().toStdString()));
     addSymbolEdit_->clear();
     if (raw.isEmpty()) return;
 

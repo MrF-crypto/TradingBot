@@ -64,6 +64,12 @@ def main():
         print(run(str(exe), '--version', env=env))
     if args.platform == 'macos':
         print(run(str(executables[1]), '--check-runtime', env=env))
+        data_path = Path(run(str(executables[1]), '--print-data-directory', env=env))
+        if data_path != root / 'data':
+            raise RuntimeError(f'Mac data directory must be beside the app: {data_path}')
+        if (root / 'data').exists():
+            raise RuntimeError('Offline package checks unexpectedly created runtime data')
+        print(f'Portable data path verified: {data_path}')
     print('Native package checks passed (no account access).')
 
 
