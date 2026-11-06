@@ -5,6 +5,8 @@
 #include <QStandardPaths>
 #include <QDir>
 #include <QMessageBox>
+#include <QPushButton>
+#include <QSettings>
 #include "gui/main_window.h"
 #include "gui/data_directory.h"
 #include <QVariant>
@@ -54,14 +56,46 @@ int main(int argc, char* argv[]) {
     // QLockFile 自带陈旧锁检测（崩溃残留的锁会被自动接管），正常运行的实例则拒绝二开。
     // 锁放数据目录（便携模式=程序目录data/）：同一份数据目录只允许一个实例
 #ifdef Q_OS_MAC
-    auto dataDirectory = ccg::prepare_macos_data_directory(QCoreApplication::applicationDirPath(),
-        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+    // Remember the real data path separately from account data: Gatekeeper may
+    // assign a different read-only AppTranslocation path on the next launch.
+    QSettings startupSettings;
+    ccg::DataDirectoryOptions dataOptions;
+    dataOptions.fallbackDirectory = QDir::home().filePath("TradingBot/data");
+    dataOptions.rememberedDirectory = startupSettings.value("startup/dataDirectory").toString();
+    dataOptions.rememberedCredentialSlot = startupSettings.value("startup/credentialSlot").toString();
+    const auto oldAppData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    auto dataDirectory = ccg::prepare_macos_data_directory(QCoreApplication::applicationDirPath(), oldAppData, dataOptions);
+    if (dataDirectory.needsChoice) {
+        QMessageBox choose(QMessageBox::Question, "启动 TradingBot",
+            "发现以前保存的数据。\n\n全新配置：重新填写 API，旧数据和旧凭证保留。\n"
+            "恢复旧数据：继续使用原配置和监控断点。\n\n"
+            "全新配置不会自动接管交易所已有仓位。\n\n数据将保存到：\n" + dataDirectory.path,
+            QMessageBox::NoButton);
+        auto* fresh = choose.addButton("全新配置", QMessageBox::ActionRole);
+        auto* restore = choose.addButton("恢复旧数据", QMessageBox::AcceptRole);
+        choose.addButton(QMessageBox::Cancel);
+        choose.setDefaultButton(restore);
+        choose.exec();
+        if (choose.clickedButton() != fresh && choose.clickedButton() != restore) return 0;
+        dataOptions.mode = choose.clickedButton() == fresh ? ccg::DataStartMode::Fresh : ccg::DataStartMode::Restore;
+        dataDirectory = {}; // Release the preparation lock before rechecking and applying the choice.
+        dataDirectory = ccg::prepare_macos_data_directory(QCoreApplication::applicationDirPath(), oldAppData, dataOptions);
+    }
     if (!dataDirectory.error.isEmpty()) {
         QMessageBox::critical(nullptr, "无法准备数据目录", dataDirectory.error);
         return 1;
     }
+    startupSettings.setValue("startup/dataDirectory", dataDirectory.path);
+    startupSettings.setValue("startup/credentialSlot", dataDirectory.credentialSlot);
+    startupSettings.sync();
+    if (startupSettings.status() != QSettings::NoError) {
+        QMessageBox::critical(nullptr, "无法保存启动设置", "无法记住数据目录，尚未载入账户：\n" + dataDirectory.path);
+        return 1;
+    }
     app.setProperty("tradingbotDataDirectory", dataDirectory.path);
     app.setProperty("tradingbotDataDirectoryNote", dataDirectory.note);
+    app.setProperty("tradingbotCredentialSlot", dataDirectory.credentialSlot);
+    app.setProperty("tradingbotSetupOnMissingCredentials", true);
 #endif
     QString lockDir = ccg::MainWindow::portable_data_dir();
     QLockFile instanceLock(lockDir + "/ccbot.lock");

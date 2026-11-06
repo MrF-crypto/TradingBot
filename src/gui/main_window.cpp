@@ -31,6 +31,8 @@
 #include <QAction>
 #include <QListWidgetItem>
 #include <QFormLayout>
+#include <QDesktopServices>
+#include <QUrl>
 
 #include <thread>
 #include <atomic>
@@ -142,6 +144,8 @@ MainWindow::MainWindow(QWidget* parent)
     // 若本地已保存有效凭证，启动后自动连接，无需再手动点击
     if (!apiKey_.trimmed().isEmpty() && !apiSecret_.trimmed().isEmpty()) {
         QTimer::singleShot(0, this, &MainWindow::onConnect);
+    } else if (qApp->property("tradingbotSetupOnMissingCredentials").toBool()) {
+        QTimer::singleShot(0, this, &MainWindow::openSettingsDialog);
     }
 }
 
@@ -194,7 +198,7 @@ MainWindow::~MainWindow() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 数据目录 = 程序所在目录下的 data 子目录：策略配置、交易明细、API凭证、日志
 // macOS 使用 .app 旁的 data，由 main 在载入账户前完成整目录迁移。
-// Windows 目录不可写时沿用 AppData 回退；macOS 明确报错，不静默切换账户状态。
+// macOS 在启动前决定并记住实际目录；既有数据不可读时不切换到空白账户。
 // macOS API 凭证仍在 Keychain，不属于 data/ 中的文件。
 QString MainWindow::portable_data_dir() {
 #ifdef Q_OS_MAC
@@ -304,13 +308,15 @@ void MainWindow::save_credentials() {
     c.testnet    = testnet_;
     c.account_mode = accountMode_;
     if (c.api_key.empty() || c.api_secret.empty()) return;
-    if (!KeyStore::save(c, cred_path()))
-        log("API Key 本地保存失败（DPAPI 加密或写盘出错）", "ERR");
+    const auto slot = qApp->property("tradingbotCredentialSlot").toString().toStdString();
+    if (!KeyStore::save(c, cred_path(), slot))
+        log("API Key 保存失败，请检查数据目录或系统凭证存储权限", "ERR");
 }
 
 void MainWindow::load_credentials() {
     KeyStore::Creds c;
-    if (!KeyStore::load(c, cred_path())) return;
+    const auto slot = qApp->property("tradingbotCredentialSlot").toString().toStdString();
+    if (!KeyStore::load(c, cred_path(), slot)) return;
     apiKey_    = QString::fromStdString(c.api_key);
     apiSecret_ = QString::fromStdString(c.api_secret);
     testnet_     = c.testnet;
@@ -790,6 +796,11 @@ void MainWindow::openSettingsDialog() {
     dv->addLayout(form);
 
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
+    auto* dataFolder = btnBox->addButton("打开数据文件夹", QDialogButtonBox::ActionRole);
+    dataFolder->setToolTip(portable_data_dir());
+    connect(dataFolder, &QPushButton::clicked, this, [] {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(MainWindow::portable_data_dir()));
+    });
     dv->addWidget(btnBox);
     connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);

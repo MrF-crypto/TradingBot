@@ -17,8 +17,10 @@ public:
         int         account_mode = 0;
     };
 
-    static bool save(const Creds& c, const std::string& path);
-    static bool load(Creds& c,       const std::string& path);
+    // Empty slot preserves the legacy macOS entry. Fresh GUI profiles use a
+    // persistent unique slot; file-based backends continue to use their path.
+    static bool save(const Creds& c, const std::string& path, const std::string& slot = {});
+    static bool load(Creds& c,       const std::string& path, const std::string& slot = {});
 };
 
 } // namespace ccbot

@@ -90,13 +90,13 @@ static bool read_blob(const std::string& path, std::vector<uint8_t>& enc) {
     return !enc.empty();
 }
 
-static bool backend_save(const std::string& plain, const std::string& path) {
+static bool backend_save(const std::string& plain, const std::string& path, const std::string& /*slot*/) {
     auto enc = dpapi_enc(plain);
     if (enc.empty()) return false;
     return write_blob(path, enc);
 }
 
-static bool backend_load(std::string& plain, const std::string& path) {
+static bool backend_load(std::string& plain, const std::string& path, const std::string& /*slot*/) {
     std::vector<uint8_t> enc;
     if (!read_blob(path, enc)) return false;
     plain = dpapi_dec(enc);
@@ -121,19 +121,26 @@ namespace ccbot {
 static const CFStringRef kService = CFSTR("com.ccbot.CCGMonitor");
 static const CFStringRef kAccount = CFSTR("binance-api");
 
-static CFMutableDictionaryRef base_query() {
+static CFMutableDictionaryRef base_query(const std::string& slot) {
     CFMutableDictionaryRef q = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0,
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!q) return nullptr;
+    CFStringRef account = slot.empty() ? kAccount : CFStringCreateWithBytes(
+        kCFAllocatorDefault, reinterpret_cast<const UInt8*>(slot.data()),
+        static_cast<CFIndex>(slot.size()), kCFStringEncodingUTF8, false);
+    if (!account) { CFRelease(q); return nullptr; }
     CFDictionarySetValue(q, kSecClass,       kSecClassGenericPassword);
     CFDictionarySetValue(q, kSecAttrService, kService);
-    CFDictionarySetValue(q, kSecAttrAccount, kAccount);
+    CFDictionarySetValue(q, kSecAttrAccount, account);
+    if (!slot.empty()) CFRelease(account);
     return q;
 }
 
-static bool backend_save(const std::string& plain, const std::string& /*path*/) {
+static bool backend_save(const std::string& plain, const std::string& /*path*/, const std::string& slot) {
     // 先删旧条目再新增（SecItemUpdate 的语义更繁琐，删+增等效且简单）
-    CFMutableDictionaryRef del = base_query();
+    CFMutableDictionaryRef del = base_query(slot);
+    if (!del) return false;
     SecItemDelete(del);
     CFRelease(del);
 
@@ -141,7 +148,8 @@ static bool backend_save(const std::string& plain, const std::string& /*path*/) 
                                   (const UInt8*)plain.data(), (CFIndex)plain.size());
     if (!data) return false;
 
-    CFMutableDictionaryRef add = base_query();
+    CFMutableDictionaryRef add = base_query(slot);
+    if (!add) { CFRelease(data); return false; }
     CFDictionarySetValue(add, kSecValueData, data);
     OSStatus st = SecItemAdd(add, nullptr);
     CFRelease(add);
@@ -149,8 +157,9 @@ static bool backend_save(const std::string& plain, const std::string& /*path*/) 
     return st == errSecSuccess;
 }
 
-static bool backend_load(std::string& plain, const std::string& /*path*/) {
-    CFMutableDictionaryRef q = base_query();
+static bool backend_load(std::string& plain, const std::string& /*path*/, const std::string& slot) {
+    CFMutableDictionaryRef q = base_query(slot);
+    if (!q) return false;
     CFDictionarySetValue(q, kSecReturnData,  kCFBooleanTrue);
     CFDictionarySetValue(q, kSecMatchLimit,  kSecMatchLimitOne);
 
@@ -177,7 +186,7 @@ namespace ccbot {
 // 同 Windows 分支：原子写 + 检查写是否成功。
 // 这个分支只为编译完整性存在（GUI 不在这些平台发布），但错误的成功返回值
 // 会误导任何将来在这里排查问题的人，不能因为"用不到"就留个坑
-static bool backend_save(const std::string& plain, const std::string& path) {
+static bool backend_save(const std::string& plain, const std::string& path, const std::string& /*slot*/) {
     const std::string tmp = path + ".tmp";
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -196,7 +205,7 @@ static bool backend_save(const std::string& plain, const std::string& path) {
     return true;
 }
 
-static bool backend_load(std::string& plain, const std::string& path) {
+static bool backend_load(std::string& plain, const std::string& path, const std::string& /*slot*/) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     plain.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -210,16 +219,16 @@ static bool backend_load(std::string& plain, const std::string& path) {
 // ─── 平台无关的打包/解包 ──────────────────────────────────────────────────────
 namespace ccbot {
 
-bool KeyStore::save(const Creds& c, const std::string& path) {
+bool KeyStore::save(const Creds& c, const std::string& path, const std::string& slot) {
     std::string plain = c.api_key + "\n" + c.api_secret + "\n" +
                         (c.testnet ? "1" : "0") + "\n" +
                         std::to_string(c.account_mode);
-    return backend_save(plain, path);
+    return backend_save(plain, path, slot);
 }
 
-bool KeyStore::load(Creds& c, const std::string& path) {
+bool KeyStore::load(Creds& c, const std::string& path, const std::string& slot) {
     std::string plain;
-    if (!backend_load(plain, path)) return false;
+    if (!backend_load(plain, path, slot)) return false;
 
     size_t p1 = plain.find('\n');
     if (p1 == std::string::npos) return false;

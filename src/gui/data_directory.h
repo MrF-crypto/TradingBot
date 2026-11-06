@@ -5,13 +5,22 @@
 #include <vector>
 
 namespace ccg {
+enum class DataStartMode { Ask, Restore, Fresh };
+struct DataDirectoryOptions {
+    DataStartMode mode = DataStartMode::Ask;
+    QString fallbackDirectory;
+    QString rememberedDirectory;
+    QString rememberedCredentialSlot;
+};
 // Owns startup/source locks until the application exits. No account files are parsed.
 struct PreparedDataDirectory {
-    QString path, note, error;
+    QString path, note, error, source, credentialSlot;
+    bool needsChoice = false;
     std::vector<std::unique_ptr<QLockFile>> locks;
 };
 
 QString macos_portable_data_path(const QString& executableDirectory);
 PreparedDataDirectory prepare_macos_data_directory(const QString& executableDirectory,
-                                                   const QString& oldAppData);
+                                                   const QString& oldAppData,
+                                                   const DataDirectoryOptions& options = {});
 } // namespace ccg

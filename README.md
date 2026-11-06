@@ -6,7 +6,7 @@
 
 从 [Releases](https://github.com/MrF-crypto/TradingBot/releases) 下载 Windows x64 便携包，完整解压到可写目录后运行 `TradingBot.exe`。DLL、`platforms/` 和许可证文件应与程序一起保留，不要只复制 EXE。同时包含 `ccbot_headless.exe`、配置模板和文档。macOS 按 Intel / Apple Silicon 选择 `.app` 包；Linux 按 x64 / ARM64 选择 headless 包，平台要求见 [平台说明](docs/PLATFORMS.zh-CN.md)。
 
-macOS 桌面版运行数据统一保存在 `TradingBot.app` 同级的 `data/`。首次升级会在启动前完整复制旧目录并保留原件；已有 `data/` 直接使用，不与旧记录混合。更新程序时保留该文件夹，备份时一并复制。API 凭证仍保存在 macOS 钥匙串，换电脑需要重新输入。
+macOS 桌面版优先使用 `TradingBot.app` 同级 `data/`；只读临时运行目录下自动选择可写位置并记住。首次发现旧记录时可选“全新配置”或“恢复旧数据”，全新配置直接填写 API，旧记录保留。通过“设置 → 打开数据文件夹”查看实际位置，更新和备份时保留完整文件夹。API 凭证仍保存在 macOS 钥匙串，换电脑需要重新输入。
 
 桌面版首次启动后设置测试网账户。无界面版将 `config.example.json` 复制为 `config.json` 并填写本机配置，参考 [Headless 说明](docs/HEADLESS.md)。下载文件可用同一 Release 的 `SHA256SUMS.txt` 核验。
 
@@ -109,4 +109,4 @@ python tools/check_suite_coverage.py
 
 许可证为 [MIT](LICENSE)，保留上游版权与许可声明。
 
-当前源码 **v1.3.4** 修复中文合约名称与行情匹配，细化行情异常提示；macOS 桌面版统一使用 `.app` 同级的 `data/`，支持完整复制旧数据并保留原目录。旧存档已有乱码时停止恢复并保留文件，附离线核对工具。完整变化及升级方法见 [v1.3.4 说明](docs/releases/v1.3.4.md)。继续包含 [v1.3.3 的 K 线刷新修复](docs/releases/v1.3.3.md) 和 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。
+当前源码 **v1.3.5** 简化 macOS 首次启动：自动处理只读临时运行目录，提供全新配置或恢复旧数据；全新配置直接填写 API，保留旧数据和旧凭证。详见 [v1.3.5 说明](docs/releases/v1.3.5.md)。继续包含 [v1.3.4 的中文合约行情修复](docs/releases/v1.3.4.md)、[v1.3.3 的 K 线刷新修复](docs/releases/v1.3.3.md) 和 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。

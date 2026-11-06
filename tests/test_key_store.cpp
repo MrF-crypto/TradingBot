@@ -7,6 +7,10 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <chrono>
+#if defined(__APPLE__)
+#include <Security/Security.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -49,16 +53,18 @@ static bool write_legacy_blob(const std::string& path, const std::string& plain)
 
 int main() {
     const std::string path = "test_creds.bin";
+    const std::string testSlot = "tradingbot-test-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
 
     // ① 新格式往返：普通合约
     {
         KeyStore::Creds w;
         w.api_key = "KEY_futures"; w.api_secret = "SEC_futures";
         w.testnet = true;  w.account_mode = 0;
-        check(KeyStore::save(w, path), "保存普通合约凭证");
+        check(KeyStore::save(w, path, testSlot), "保存普通合约凭证");
 
         KeyStore::Creds r;
-        check(KeyStore::load(r, path), "读回普通合约凭证");
+        check(KeyStore::load(r, path, testSlot), "读回普通合约凭证");
         check(r.api_key == w.api_key,         "  api_key 一致");
         check(r.api_secret == w.api_secret,   "  api_secret 一致");
         check(r.testnet == true,              "  testnet=true 保持");
@@ -70,10 +76,10 @@ int main() {
         KeyStore::Creds w;
         w.api_key = "KEY_pm"; w.api_secret = "SEC_pm";
         w.testnet = false; w.account_mode = 1;
-        check(KeyStore::save(w, path), "保存统一账户凭证");
+        check(KeyStore::save(w, path, testSlot), "保存统一账户凭证");
 
         KeyStore::Creds r;
-        check(KeyStore::load(r, path), "读回统一账户凭证");
+        check(KeyStore::load(r, path, testSlot), "读回统一账户凭证");
         check(r.api_key == "KEY_pm",  "  api_key 一致");
         check(r.testnet == false,     "  testnet=false 保持");
         check(r.account_mode == 1,    "  account_mode=1 保持");
@@ -86,6 +92,28 @@ int main() {
     // Windows(DPAPI 文件) 与 Linux(明文文件兜底) 仍然覆盖这段解析逻辑，
     // 而它本身是平台无关的共享代码
 #if defined(__APPLE__)
+    // Use unique test entries, never the application's real legacy credentials.
+    const auto freshSlot = testSlot + "-fresh";
+    KeyStore::Creds fresh;
+    check(!KeyStore::load(fresh, path, freshSlot), "全新配置不回退读取其他凭证");
+    fresh.api_key = "KEY_fresh"; fresh.api_secret = "SEC_fresh";
+    check(KeyStore::save(fresh, path, freshSlot), "保存独立的新配置凭证");
+    KeyStore::Creds old, again;
+    check(KeyStore::load(old, path, testSlot) && old.api_key == "KEY_pm", "新配置不覆盖原凭证");
+    check(KeyStore::load(again, path, freshSlot) && again.api_key == "KEY_fresh", "重启后按配置身份读回新凭证");
+    for (const auto& slot : {testSlot, freshSlot}) {
+        auto account = CFStringCreateWithBytes(kCFAllocatorDefault,
+            reinterpret_cast<const UInt8*>(slot.data()), static_cast<CFIndex>(slot.size()), kCFStringEncodingUTF8, false);
+        auto query = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (query && account) {
+            CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
+            CFDictionarySetValue(query, kSecAttrService, CFSTR("com.ccbot.CCGMonitor"));
+            CFDictionarySetValue(query, kSecAttrAccount, account);
+            check(SecItemDelete(query) == errSecSuccess, "清理专用测试凭证");
+        } else check(false, "创建测试清理查询");
+        if (account) CFRelease(account);
+        if (query) CFRelease(query);
+    }
     std::printf("[SKIP]  旧版格式兼容用例（macOS 用钥匙串后端，不经过文件）\n");
 #else
     {
@@ -93,7 +121,7 @@ int main() {
 
         KeyStore::Creds r;
         r.account_mode = 1;   // 先污染成非默认值，确认 load 真的会写回去
-        check(KeyStore::load(r, path), "读旧版密文");
+        check(KeyStore::load(r, path, testSlot), "读旧版密文");
         check(r.api_key == "OLDKEY",  "  旧 api_key 正确");
         check(r.api_secret == "OLDSEC","  旧 api_secret 正确");
         check(r.testnet == true,      "  旧 testnet 标志正确");
@@ -104,7 +132,7 @@ int main() {
     {
         check(write_legacy_blob(path, "K2\nS2\n0"), "造旧版密文(testnet=0)");
         KeyStore::Creds r;
-        check(KeyStore::load(r, path), "读旧版密文(testnet=0)");
+        check(KeyStore::load(r, path, testSlot), "读旧版密文(testnet=0)");
         check(r.testnet == false,   "  testnet=false 正确");
         check(r.account_mode == 0,  "  account_mode=0 正确");
     }
