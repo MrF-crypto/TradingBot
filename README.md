@@ -4,7 +4,7 @@
 
 ## 下载与运行
 
-从 [Releases](https://github.com/MrF-crypto/TradingBot/releases) 下载 Windows x64 便携包，完整解压到可写目录后运行 `TradingBot.exe`。DLL、`platforms/` 和许可证文件应与程序一起保留，不要只复制 EXE。同时包含 `ccbot_headless.exe`、配置模板和文档。macOS 按 Intel / Apple Silicon 选择 `.app` 包；Linux 按 x64 / ARM64 选择 headless 包，平台要求见 [平台说明](docs/PLATFORMS.zh-CN.md)。
+从 [Releases](https://github.com/MrF-crypto/TradingBot/releases) 下载对应平台包。Windows x64 只提供 `TradingBot.exe`、实际依赖的 DLL、`platforms/`、许可证及空 `data/`，完整解压后运行 GUI；不要只复制 EXE。macOS Intel / Apple Silicon 包顶层只有 `TradingBot.app` 和空 `data/`，许可证位于应用包内。无头程序只面向 Linux x64 / ARM64，包内附配置模板、简要运行说明及许可证。桌面包不再包含无头程序、配置模板、工具脚本或整套文档。平台要求见 [平台说明](docs/PLATFORMS.zh-CN.md)。
 
 macOS 桌面版优先使用 `TradingBot.app` 同级 `data/`；只读临时运行目录下自动选择可写位置并记住。首次发现旧记录时可选“全新配置”或“恢复旧数据”，全新配置直接填写 API，旧记录保留。通过“设置 → 打开数据文件夹”查看实际位置，更新和备份时保留完整文件夹。API 凭证仍保存在 macOS 钥匙串，换电脑需要重新输入。
 
@@ -86,10 +86,10 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-仅构建 headless 与测试时，同时关闭 CMake GUI 目标和 vcpkg 默认 GUI 特性：
+Linux 构建 headless 与测试时，同时关闭 CMake GUI 目标和 vcpkg 默认 GUI 特性：
 
-```powershell
-cmake -S . -B build/headless -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake -DCCBOT_BUILD_GUI=OFF -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON -DCCBOT_WERROR=ON
+```bash
+cmake -S . -B build/headless -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-linux -DCCBOT_BUILD_GUI=OFF -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON -DCCBOT_WERROR=ON
 cmake --build build/headless --config Release
 ctest --test-dir build/headless -C Release --output-on-failure
 ```
@@ -102,7 +102,7 @@ python tools/check_suite_coverage.py
 
 ## 配置与迁移
 
-复制 `config.example.json` 为本机 `config.json`，填写测试网凭证，再选择启用智能模式或配置手动 bot。字段见 [Headless 说明](docs/HEADLESS.md)。
+桌面版通过 GUI 配置。Linux 无头版复制 `config.example.json` 为本机 `config.json`，填写测试网凭证，再选择启用智能模式或配置手动 bot。字段见 [Headless 说明](docs/HEADLESS.md)。
 
 - 新配置使用 `"strategy": "trend_following"`；旧 `"turtle"` 名称作为输入别名兼容。
 - 智能 `"strategy": "bare"`、`"vol"` 明确拒绝，不会自动改成趋势跟踪；手动 `bare_k` 继续有效。
@@ -121,4 +121,4 @@ python tools/check_suite_coverage.py
 
 许可证为 [MIT](LICENSE)，保留上游版权与许可声明。
 
-当前源码 **v1.4.0** 新增可选的组合利润保护和空头净利润积累 BTC 现货，保存利润峰值、恢复条件和成交账本；同时包含 macOS 首次启动、全新配置和只读临时目录处理改进。完整功能、适用账户及升级说明见 [v1.4.0 发布说明](docs/releases/v1.4.0.md)。继续包含 [v1.3.4 的中文合约行情修复](docs/releases/v1.3.4.md)、[v1.3.3 的 K 线刷新修复](docs/releases/v1.3.3.md) 和 [v1.3.2 的审计与跨平台修复](docs/releases/v1.3.2.md)；正式下载以 GitHub Release 为准；包内 `BUILD_INFO.json` 记录源码和 CI，`SHA256SUMS.txt` 用于核验附件。
+当前源码 **v1.4.1** 修正发布包布局：Windows、macOS 仅提供 GUI 及必要配套，无头程序只面向 Linux。详见 [v1.4.1 发布说明](docs/releases/v1.4.1.md)。继续包含 [v1.4.0 的组合利润保护与 BTC 积累](docs/releases/v1.4.0.md)、macOS 启动改进及此前行情、监控修复；本次不修改交易策略、止损、账户配置和数据恢复逻辑。正式下载以 GitHub Release 为准；`BUILD_VERIFICATION.json` 随 Release 单独提供源码、CI、依赖和附件摘要，`SHA256SUMS.txt` 用于核验压缩包。

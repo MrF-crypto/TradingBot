@@ -4,10 +4,12 @@
 
 | 平台 | 架构 | 运行入口 | CI 原生环境 |
 | --- | --- | --- | --- |
-| Windows | x64 | `TradingBot.exe`、`ccbot_headless.exe` | Windows / MSVC |
-| macOS | Intel x64 | `TradingBot.app`、`ccbot_headless` | `macos-15-intel` |
-| macOS | Apple Silicon ARM64 | `TradingBot.app`、`ccbot_headless` | `macos-15` |
+| Windows | x64 | `TradingBot.exe` | Windows / MSVC |
+| macOS | Intel x64 | `TradingBot.app` | `macos-15-intel` |
+| macOS | Apple Silicon ARM64 | `TradingBot.app` | `macos-15` |
 | Linux | x64、ARM64 | `ccbot_headless` | Ubuntu 24.04 对应架构 |
+
+v1.4.1 起桌面发布包移除无头程序、无头配置模板、工具脚本和整套文档；CMake 也只在 Linux 生成及安装 `ccbot_headless`。Windows 保留 GUI 的实际 DLL 依赖闭包、Qt 平台插件、许可证和空 `data/`。macOS 顶层只有应用包和空 `data/`，许可证位于 `.app/Contents/Resources/licenses/`。空 `data/` 不含占位文件、凭证或运行记录。
 
 macOS 发布包的应用与依赖统一以 15.0 为运行基线，避免把针对较新系统编译的静态依赖链接进声明支持旧系统的包。Qt 的应用包和部署机制见 [Qt macOS 文档](https://doc.qt.io/qt-6/macos.html)。Intel 和 Apple Silicon 使用各自的原生包，无需依赖 Rosetta。CI runner 架构以 [GitHub 官方表格](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 为准。
 
@@ -89,4 +91,4 @@ ctest --test-dir build/linux-system --output-on-failure
 
 平台流水线统一运行 CTest：桌面构建 18 套（含离线 Qt 监控表测试），headless 构建 17 套。ASan/UBSan 登记 17 个核心套件，TSan 登记 7 个实际并发套件，包括新增的并发断点保存测试。登记和脚本检查不等同于运行成功，实际验证结果见对应版本说明及 CI 日志。
 
-`--version` 和 GUI `--check-runtime` 不加载账户、不读取持仓文件、不发送订单。本地 Windows 验证不能替代 macOS、Linux ARM64 的原生测试。跨平台成品须在相应流水线通过后发布；包内 `BUILD_INFO.json` 可追溯到准确源码提交及原生 CI，Release 附件提供 SHA256 校验清单。
+`--version` 和 GUI `--check-runtime` 不加载账户、不读取持仓文件、不发送订单。本地 Windows 验证不能替代 macOS、Linux ARM64 的原生测试。跨平台成品须在相应流水线通过后发布；构建信息移到 CI 产物中的独立 `release-info/`，绑定压缩包 SHA256，发布时合并进单独提供的 `BUILD_VERIFICATION.json`。Release 同时提供 `SHA256SUMS.txt`，无需在程序目录摆放构建说明文件。

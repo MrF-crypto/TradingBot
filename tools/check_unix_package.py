@@ -23,10 +23,9 @@ def main():
     ap.add_argument('--arch', choices=('x64', 'arm64'), required=True)
     args = ap.parse_args()
     root = args.package.resolve()
-    headless = root / 'ccbot_headless'
-    executables = [headless]
-    if args.platform == 'macos':
-        executables.append(root / 'TradingBot.app/Contents/MacOS/TradingBot')
+    executables = [root / ('TradingBot.app/Contents/MacOS/TradingBot' if args.platform == 'macos' else 'ccbot_headless')]
+    if args.platform == 'macos' and list(root.rglob('ccbot_headless*')):
+        raise RuntimeError('macOS desktop package must not include headless')
 
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(('QT_', 'QML', 'DYLD_', 'LD_LIBRARY_PATH', 'LD_PRELOAD'))}
@@ -63,11 +62,11 @@ def main():
         print(kind)
         print(run(str(exe), '--version', env=env))
     if args.platform == 'macos':
-        print(run(str(executables[1]), '--check-runtime', env=env))
-        data_path = Path(run(str(executables[1]), '--print-data-directory', env=env))
+        print(run(str(executables[0]), '--check-runtime', env=env))
+        data_path = Path(run(str(executables[0]), '--print-data-directory', env=env))
         if data_path != root / 'data':
             raise RuntimeError(f'Mac data directory must be beside the app: {data_path}')
-        if (root / 'data').exists():
+        if (root / 'data').exists() and any((root / 'data').iterdir()):
             raise RuntimeError('Offline package checks unexpectedly created runtime data')
         print(f'Portable data path verified: {data_path}')
     print('Native package checks passed (no account access).')

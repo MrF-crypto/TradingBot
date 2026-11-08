@@ -89,6 +89,9 @@ jobs:
       - name: Test legacy symbol recovery
         run: python tests/test_symbol_repair.py
 
+      - name: Test package policy
+        run: python tests/test_package_layout.py
+
       - name: Upload test diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -103,7 +106,7 @@ jobs:
           set -e
           mkdir -p pkg/platforms
           cd build/Release
-          cp TradingBot.exe ccbot_headless.exe *.dll ../../pkg/
+          cp TradingBot.exe *.dll ../../pkg/
           cp platforms/qwindows.dll ../../pkg/platforms/
           cd ../..
           ls -la pkg | head -30
@@ -124,6 +127,11 @@ jobs:
           Write-Output "Including runtime from $($crt.FullName)"
           $runtimeFiles = Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File
           $runtimeFiles | Copy-Item -Destination pkg
+          $dumpbin = Get-ChildItem "$vsInstall/VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe" -File |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin was not found" }
+          python tools/trim_windows_runtime.py pkg --dumpbin $dumpbin.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 硬门禁：白名单校验 + 内嵌版本号核对。
       # 不通过则整个 job 失败，没有任何产物产生 —— data/ 里的 API 凭证、持仓状态、
@@ -133,18 +141,13 @@ jobs:
         run: |
           VER="$(python tools/release_metadata.py --version)"
           python tools/leak_check.py pkg --expect-version "$VER" --exe TradingBot.exe
-          python tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless.exe
-          python tools/check_windows_package.py pkg "$VER"
 
-      - name: Include documentation and dependency licenses
+      - name: Include required licenses and empty data directory
         shell: bash
         run: |
           set -e
-          cp LICENSE README.md config.example.json pkg/
-          cp -R docs pkg/
-          mkdir -p pkg/tools
-          cp tools/repair_symbol_state.py pkg/tools/
-          mkdir -p pkg/licenses
+          mkdir -p pkg/data pkg/licenses/TradingBot
+          cp LICENSE pkg/licenses/TradingBot/
           for notice in build/vcpkg_installed/x64-windows/share/*/copyright; do
             test -f "$notice" || continue
             dep=$(basename "$(dirname "$notice")")
@@ -152,8 +155,12 @@ jobs:
             cp "$notice" "pkg/licenses/$dep/"
           done
 
-      - name: Record source and dependencies
-        run: python tools/release_metadata.py --package pkg --triplet x64-windows
+      - name: Verify final desktop package
+        shell: bash
+        run: |
+          VER="$(python tools/release_metadata.py --version)"
+          python tools/check_package_layout.py pkg --platform windows
+          python tools/check_windows_package.py pkg "$VER"
 
       - name: Zip
         shell: bash
@@ -162,9 +169,17 @@ jobs:
           cd pkg && 7z a "../tradingbot-$VER-win64.zip" . >/dev/null
           cd .. && ls -la tradingbot-*.zip
 
+      - name: Record source and archive outside the package
+        shell: bash
+        run: |
+          VER="$(python tools/release_metadata.py --version)"
+          python tools/release_metadata.py --output release-info --archive "tradingbot-$VER-win64.zip" --triplet x64-windows
+
       # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-win64
-          path: tradingbot-*.zip
+          path: |
+            tradingbot-*.zip
+            release-info/

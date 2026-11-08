@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.4.0 LANGUAGES CXX)
+project(TradingBot VERSION 1.4.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(_ccbot_gui_default OFF)
 if(WIN32 OR APPLE)
     set(_ccbot_gui_default ON)
 endif()
-option(CCBOT_BUILD_GUI "构建 Qt 图形界面（关闭后只构建 headless 与测试）" ${_ccbot_gui_default})
+option(CCBOT_BUILD_GUI "构建 Qt 图形界面（Linux 默认只构建 headless 与测试）" ${_ccbot_gui_default})
 
 # 版本号唯一来源：上面那行。窗口标题和 headless 启动横幅都从这里取（src/version.h），
 # 发版时只改一处。发布流水线的泄漏检查会核对 tag 版本号确实内嵌在可执行文件里，
@@ -196,7 +196,8 @@ if(CCBOT_BUILD_GUI)
     endif()
 endif()
 
-# ── 无界面(headless)版：配置文件驱动，不依赖 Qt，Windows/Linux 都能编译 ──────────
+# ── 无界面版只面向 Linux；桌面系统不生成或安装第二个程序入口 ──────────────
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_executable(ccbot_headless
     src/headless/main.cpp
     src/headless/headless_config.cpp
@@ -207,13 +208,6 @@ target_include_directories(ccbot_headless PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccbot_headless PRIVATE ${CORE_LIBS})
 target_compile_definitions(ccbot_headless PRIVATE ${CCBOT_VERSION_DEF})
 install(TARGETS ccbot_headless RUNTIME DESTINATION .)
-if(WIN32)
-    target_link_libraries(ccbot_headless PRIVATE crypt32 ws2_32 wsock32)
-    target_compile_definitions(ccbot_headless PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-endif()
-if(MSVC)
-    # 不链接 Qt6，拿不到 Qt 自带的 /utf-8 编译选项，源文件里的中文注释要自己声明编码
-    target_compile_options(ccbot_headless PRIVATE /utf-8)
 endif()
 
 # ── 指标数学逻辑单元测试——纯 C++ 头文件，不依赖 Qt/curl/网络，独立小可执行文件 ──
@@ -411,7 +405,6 @@ endif()
 
 set(CCBOT_OWN_TARGETS
     ccg_profit_tests
-    ccbot_headless
     ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests
     ccg_rate_tests ccg_timesync_tests ccg_config_tests
@@ -420,6 +413,9 @@ set(CCBOT_OWN_TARGETS
 )
 if(TARGET TradingBot)
     list(APPEND CCBOT_OWN_TARGETS TradingBot)
+endif()
+if(TARGET ccbot_headless)
+    list(APPEND CCBOT_OWN_TARGETS ccbot_headless)
 endif()
 foreach(t ${CCBOT_OWN_TARGETS})
     ccbot_harden(${t})

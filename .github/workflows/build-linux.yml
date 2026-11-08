@@ -143,6 +143,9 @@ jobs:
       - name: Test legacy symbol recovery
         run: python3 tests/test_symbol_repair.py
 
+      - name: Test package policy
+        run: python3 tests/test_package_layout.py
+
       - name: Package
         run: |
           set -e
@@ -158,15 +161,14 @@ jobs:
           VER="$(python3 tools/release_metadata.py --version)"
           python3 tools/leak_check.py pkg --expect-version "$VER" --exe ccbot_headless
 
-      - name: Include documentation and dependency licenses
+      - name: Include Linux configuration, quick start and licenses
         shell: bash
         run: |
           set -e
-          cp LICENSE README.md config.example.json pkg/
-          cp -R docs pkg/
-          mkdir -p pkg/tools
-          cp tools/repair_symbol_state.py pkg/tools/
-          mkdir -p pkg/licenses
+          cp config.example.json pkg/
+          cp docs/LINUX_PACKAGE.md pkg/README.md
+          mkdir -p pkg/licenses/TradingBot
+          cp LICENSE pkg/licenses/TradingBot/
           for notice in build/vcpkg_installed/${{ matrix.triplet }}/share/*/copyright; do
             test -f "$notice" || continue
             dep=$(basename "$(dirname "$notice")")
@@ -174,8 +176,8 @@ jobs:
             cp "$notice" "pkg/licenses/$dep/"
           done
 
-      - name: Record source and dependencies
-        run: python3 tools/release_metadata.py --package pkg --triplet ${{ matrix.triplet }}
+      - name: Verify final headless package
+        run: python3 tools/check_package_layout.py pkg --platform linux
 
       - name: Zip
         run: |
@@ -183,9 +185,16 @@ jobs:
           cd pkg && zip -r "../tradingbot-$VER-linux-${{ matrix.arch }}.zip" . && cd ..
           ls -la tradingbot-*.zip
 
+      - name: Record source and archive outside the package
+        run: |
+          VER="$(python3 tools/release_metadata.py --version)"
+          python3 tools/release_metadata.py --output release-info --archive "tradingbot-$VER-linux-${{ matrix.arch }}.zip" --triplet ${{ matrix.triplet }}
+
       # 标签构建产物保留供下载检查，不自动创建或更改正式 Release。
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tradingbot-linux-${{ matrix.arch }}
-          path: tradingbot-*.zip
+          path: |
+            tradingbot-*.zip
+            release-info/
