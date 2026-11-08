@@ -328,7 +328,8 @@ std::string TradingClient::http_get_public(const std::string& path, bool critica
             return fr.body;
         }
     }
-    std::string url  = pub_base_ + path;
+    std::string url = (path.rfind("/api/", 0) == 0 ?
+        (cfg_.testnet ? std::string("https://testnet.binance.vision") : std::string("https://api.binance.com")) : pub_base_) + path;
     std::string resp, rhdr;
 
     // 行情轮询走专用句柄（只有行情线程用，不会真的等）；其余从公开池取一个空闲槽
@@ -511,7 +512,8 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
         if (!slot) slot = grab_slot(get_pool_, lk);
         resp.clear();
         rhdr.clear();
-        const std::string url = base_ + path + (params.empty() ? "" : "?" + params);
+        const bool spot = path.rfind("/api/", 0) == 0 || path.rfind("/sapi/", 0) == 0;
+        const std::string url = (spot ? (cfg_.testnet ? std::string("https://testnet.binance.vision") : std::string("https://api.binance.com")) : base_) + path + (params.empty() ? "" : "?" + params);
         CURL* c = static_cast<CURL*>(slot->handle);
         curl_easy_setopt(c, CURLOPT_URL, url.c_str());
         curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
@@ -529,7 +531,8 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
 std::string TradingClient::http_post(const std::string& path, std::string params,
                                      long* out_code) {
     tl_net_err.clear();
-    std::string url  = base_ + path;
+    const bool spot = path.rfind("/api/", 0) == 0 || path.rfind("/sapi/", 0) == 0;
+    std::string url = (spot ? (cfg_.testnet ? std::string("https://testnet.binance.vision") : std::string("https://api.binance.com")) : base_) + path;
     std::string resp;
 
     // 取一个空闲槽（全忙时轮询等第一个空出来的，不死等 0 号槽）。
@@ -897,8 +900,8 @@ static bool is_timestamp_reject(const std::string& resp) {
 //                    又从"是不是模式变了"开始猜
 TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
                                                         const std::string& side,
-                                                        double qty, bool reduce_only) {
-    auto r = place_market_once(sym, side, qty, reduce_only);
+                                                        double qty, bool reduce_only, const std::string& tag) {
+    auto r = place_market_once(sym, side, qty, reduce_only, tag);
     if (r.ok || r.error.find("[-4061]") == std::string::npos) return r;
     // ⚠ uncertain 绝不重发：订单状态未知时重发可能变成双倍仓位。
     //   开仓【不幂等】，这条底线比自愈重要
@@ -915,7 +918,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
         r.error += "（持仓模式与下单时一致）";
         return r;
     }
-    auto r2 = place_market_once(sym, side, qty, reduce_only);
+    auto r2 = place_market_once(sym, side, qty, reduce_only, tag);
     if (!r2.ok)
         r2.error += std::string("（持仓模式已变为") +
                     (dual_mode_.load() ? "双向" : "单向") + "，重发后仍失败）";
@@ -924,7 +927,7 @@ TradingClient::OrderResult TradingClient::place_market(const std::string& sym,
 
 TradingClient::OrderResult TradingClient::place_market_once(const std::string& sym,
                                                         const std::string& side,
-                                                        double qty, bool reduce_only) {
+                                                        double qty, bool reduce_only, const std::string& tag) {
     OrderResult r;
     const auto& minfo = get_symbol_info(sym);
 
@@ -941,7 +944,7 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         if (try_qty < minfo.min_qty) { r.error = "数量小于最小下单量"; return r; }
 
         // 每次尝试用独立的 clientOrderId（-1111 重试是真正的新订单）
-        const std::string coid = make_client_order_id();
+        const std::string coid = tag.empty() ? make_client_order_id() : tag;
         r.client_order_id = coid;
         std::string body = "symbol=" + url::encode(sym) + "&side=" + side
             + "&type=MARKET&quantity=" + fmt_qty(try_qty, try_step)

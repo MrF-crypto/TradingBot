@@ -26,6 +26,7 @@
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <cmath>
@@ -107,6 +108,14 @@ void MainWindow::applySmartConfig(const smart::Config& c) {
 void MainWindow::smartTick() {
     if (!smart_) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    smart_->evaluate_profits(client_ ? client_->market_time_ms() : now);
+    if (slowTickCount_ % 10 == 3 && !profitBusy_.exchange(true)) {
+        auto sr = smart_;
+        run_async([this, sr, now] {
+            try { sr->service_profits(now); } catch (...) {}
+            profitBusy_.store(false);
+        });
+    }
     if (smart_->due(now) && !smartBusy_.exchange(true)) {
         auto sr = smart_;
         run_async([this, sr, now]() {
@@ -154,6 +163,8 @@ void MainWindow::refreshSmartBadge() {
     }
     if (smart_) {
         const auto rep = smart_->last_report();
+        if (smartCfg_.profit.protect || smartCfg_.profit.accumulate)
+            tip += "\n" + QString::fromStdString(smart_->profit_status());
         if (rep.at_ms > 0)
             tip += QString("%1上次扫描 %2：%3")
                        .arg(tip.isEmpty() ? "" : "\n")
@@ -517,6 +528,52 @@ void MainWindow::openSmartDialog() {
 
     tabs->addTab(trendPage, "设置");
 
+    QVBoxLayout* pv = nullptr;
+    auto* profitPage = makePage(pv);
+    const auto& pc = c0.profit;
+    auto* protection = group(pv, "组合利润保护（智能持仓，多空分别管理）");
+    auto* cbProtect = new QCheckBox("启用市场广度＋组合利润回撤保护"); cbProtect->setChecked(pc.protect);
+    protection->addRow(cbProtect);
+    auto* sArm = dspin(.01, 1e9, 10, 2, pc.arm_usdt, " U");
+    auto* sSoft = dspin(1, 99, 1, 1, pc.soft_drawdown * 100, " %");
+    auto* sHard = dspin(1, 100, 1, 1, pc.hard_drawdown * 100, " %");
+    auto* sWeak = dspin(0, 90, 1, 1, pc.weak_breadth * 100, " %");
+    auto* sDrop = dspin(1, 100, 1, 1, pc.breadth_drop * 100, " 个百分点");
+    auto* sRecover = dspin(1, 100, 1, 1, pc.recover_breadth * 100, " %");
+    auto* sWeakBars = ispin(1, 24, pc.confirm_bars, " 根 1h K线");
+    auto* sRecoverBars = ispin(1, 24, pc.recovery_bars, " 根 1h K线");
+    protection->addRow("保护启动：本轮净收益 ≥", sArm);
+    protection->addRow("广度转弱时允许回撤", sSoft);
+    protection->addRow("硬回撤退出（不等待广度）", sHard);
+    protection->addRow("原方向广度低于", sWeak);
+    protection->addRow("或广度较峰值下降 ≥", sDrop);
+    protection->addRow("转弱连续确认", sWeakBars);
+    protection->addRow("恢复：方向广度 ≥", sRecover);
+    protection->addRow("恢复连续确认", sRecoverBars);
+    protection->addRow(hint("无需等持仓数减少。广度使用固定候选集合、同一根已收盘 1h K线；数据不齐不判转弱。先暂停同向新增风险，软条件或硬回撤触发后退出该方向智能持仓，保留监控与交易所止损。恢复后只接受新的收盘突破。参数是研究起点。"));
+
+    auto* accumulation = group(pv, "空头净利润转 BTC 现货");
+    auto* cbAccumulate = new QCheckBox("启用空头利润积累 BTC（现货独立持有）"); cbAccumulate->setChecked(pc.accumulate);
+    auto* cbBtcTrend = new QCheckBox("等待 BTC 1h 已收盘上涨趋势许可（EMA 20 / 60）"); cbBtcTrend->setChecked(pc.wait_btc_up);
+    auto* sAllocation = dspin(1, 100, 1, 1, pc.allocation * 100, " %");
+    auto* sBatch = dspin(5, 1e7, 5, 2, pc.batch_usdt, " U");
+    auto* sMaxBatch = dspin(5, 1e7, 50, 2, pc.max_batch_usdt, " U");
+    auto* sCapital = dspin(0, 1e12, 100, 2, pc.capital_floor, " U", "首次核对时的合约权益");
+    auto* sSlippage = dspin(1, 100, 1, 1, pc.slippage_bps, " bps");
+    accumulation->addRow(cbAccumulate); accumulation->addRow(cbBtcTrend);
+    accumulation->addRow("累计空头净利润分配比例", sAllocation);
+    accumulation->addRow("最低累计执行金额", sBatch);
+    accumulation->addRow("单批金额上限", sMaxBatch);
+    accumulation->addRow("最低保留合约权益", sCapital);
+    accumulation->addRow("最大买入价格偏离", sSlippage);
+    accumulation->addRow(hint("首版支持普通主网、单向持仓、单资产 USDT 合约账户，需要现货交易与内部划转权限。只统计启用后新开并完整平仓的智能空单；部分平仓等待整笔结清。扣实际手续费和资金费，亏损先回补，整体策略净收益也需为正。非 USDT 合约手续费需核对，暂不自动购买。关闭只暂停新增购买，保留 BTC 与账本；不自动出售、不借款、不用于合约抵押。"));
+    auto* profitStatus = new QLabel(); profitStatus->setWordWrap(true); profitStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    const auto refreshProfit = [this, profitStatus] { profitStatus->setText(QString::fromStdString(smart_ ? smart_->profit_status() : "连接后显示利润保护与 BTC 积累状态")); };
+    refreshProfit(); pv->addWidget(profitStatus); pv->addStretch();
+    auto* profitTimer = new QTimer(&dlg); profitTimer->setInterval(3000);
+    connect(profitTimer, &QTimer::timeout, &dlg, refreshProfit); profitTimer->start();
+    tabs->addTab(profitPage, "利润保护 · BTC 积累");
+
     // ── 候选名单──────────────────────────────────────
     const auto rep = smart_ ? smart_->last_report() : SmartRunner::Report{};
     auto* candidateMonitor = make_candidate_monitor([this] {
@@ -581,6 +638,14 @@ void MainWindow::openSmartDialog() {
         c.dir_short = cbShort->isChecked();
         c.max_positions  = sMaxPos->value();
         c.rotate_when_full = cbRotate->isChecked();
+        c.profit.protect = cbProtect->isChecked(); c.profit.accumulate = cbAccumulate->isChecked();
+        c.profit.wait_btc_up = cbBtcTrend->isChecked(); c.profit.arm_usdt = sArm->value();
+        c.profit.soft_drawdown = sSoft->value() / 100; c.profit.hard_drawdown = sHard->value() / 100;
+        c.profit.weak_breadth = sWeak->value() / 100; c.profit.breadth_drop = sDrop->value() / 100;
+        c.profit.recover_breadth = sRecover->value() / 100; c.profit.confirm_bars = sWeakBars->value();
+        c.profit.recovery_bars = sRecoverBars->value(); c.profit.allocation = sAllocation->value() / 100;
+        c.profit.batch_usdt = sBatch->value(); c.profit.max_batch_usdt = sMaxBatch->value();
+        c.profit.capital_floor = sCapital->value(); c.profit.slippage_bps = sSlippage->value();
         t.interval = cbIv->currentText().toStdString();
         t.rule.donchian_period    = sDc->value();
         t.rule.atr_period         = sAtrP->value();

@@ -375,6 +375,7 @@ int main(int argc, char** argv) {
     std::mutex sym_q_mtx;
     std::set<std::string> sym_add_q, sym_del_q;
     std::atomic<bool> smart_busy{false};
+    std::atomic<bool> profit_busy{false};
     auto smart = std::make_shared<SmartRunner>(
         client, trend_engine, cfg.state_path + ".smart",
         [webhook](const std::string& m, bool warn) {
@@ -686,6 +687,13 @@ int main(int argc, char** argv) {
         //     到点检查每拍都做（只是比一下时间，很便宜；按分钟查会晚最多一分钟）
         {
             const int64_t now_ms = RestPriceFeed::now_ms();
+            smart->evaluate_profits(client->market_time_ms());
+            if (tick_n % 10 == 3 && !profit_busy.exchange(true)) {
+                fetch_pool->submit([smart, now_ms, &profit_busy] {
+                    try { smart->service_profits(now_ms); } catch (...) {}
+                    profit_busy.store(false);
+                });
+            }
             if (smart->due(now_ms) && !smart_busy.exchange(true)) {
                 fetch_pool->submit([smart, now_ms, &smart_busy]() {
                     try { smart->run_once(now_ms); }

@@ -83,7 +83,7 @@ public:
     //   「-4061 ⇒ 重新探测持仓模式并重发一次」。见 .cpp 里那段注释。
     //   裸版本【刻意不公开】：公开出去等于留了一条绕过那层自愈的路
     OrderResult place_market(const std::string& symbol, const std::string& side,
-                              double qty, bool reduce_only = false);
+                              double qty, bool reduce_only = false, const std::string& tag = {});
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
     OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
     // close_all_positions 删于 v5.9.9：零调用者，且内含 fetch_positions() 不判 ok
@@ -404,6 +404,27 @@ public:
     RateStatus rate_status() const;
 
     bool is_pm()        const { return cfg_.account_mode == AccountMode::PortfolioMargin; }
+    bool is_testnet() const { return cfg_.testnet; }
+    std::string account_fingerprint() const;
+    struct ProfitFill { std::string id, order_id, side; int64_t time = 0; double qty = 0, pnl = 0, fee = 0; };
+    bool profit_fills(const std::string& symbol, const std::string& order_id, double expected_qty,
+                      std::vector<ProfitFill>& fills, std::string& error);
+    bool profit_funding(const std::string& symbol, int64_t start, int64_t end, double& amount, std::string& error);
+    bool profit_owned_window(const std::string& symbol, int64_t start, int64_t end,
+                             const std::set<std::string>& owned_orders, std::string& error);
+    struct ProfitCash { bool ok = false; double equity = 0, available = 0, transferable = 0; std::string error; };
+    ProfitCash profit_cash();
+    struct ProfitTransfer { bool ok = false, rejected = false; std::string id, error; };
+    ProfitTransfer transfer_profit(double usdt);
+    ProfitTransfer query_profit_transfer(double usdt, int64_t sent_ms, const std::string& id);
+    struct SpotQuote { bool ok = false; double ask = 0, tick = 0, step = 0, min_qty = 0, min_notional = 0; std::string error; };
+    SpotQuote btc_spot_quote();
+    struct SpotPurchase {
+        bool ok = false, terminal = false, rejected = false;
+        double qty = 0, cost = 0; std::string error;
+    };
+    SpotPurchase buy_btc_profit(double qty, double limit_price, const std::string& tag);
+    SpotPurchase query_btc_profit(const std::string& tag);
     bool is_dual_mode() const override { return dual_mode_; }
 
     // ── ITradingClient 实现（引擎通过接口调用，实盘走真实下单）──────────────
@@ -411,6 +432,11 @@ public:
                                     double qty, bool reduce_only) override {
         auto r = place_market(symbol, side, qty, reduce_only);
         return { r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id };
+    }
+    OrderOutcome place_tagged_order(const std::string& symbol, const std::string& side,
+                                    double qty, bool reduce_only, const std::string& tag) override {
+        auto r = place_market(symbol, side, qty, reduce_only, tag);
+        return {r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id};
     }
     bool opening_order_terminal(const std::string& symbol, const std::string& id) override {
         if (id.empty()) return false;
@@ -441,7 +467,7 @@ private:
     // 持仓模式在运行期被改掉时，-4061 要靠重新探测 + 重发一次来自愈，
     // 绕过这一层会退回到"每笔单都被拒到重启为止"
     OrderResult place_market_once(const std::string& symbol, const std::string& side,
-                                  double qty, bool reduce_only);
+                                  double qty, bool reduce_only, const std::string& tag = {});
 
     // 签名端点的逻辑名。普通合约和统一账户的路径不是简单的前缀替换，
     // 所以用枚举查表，不做字符串拼接，免得漏改一处就打到错误的账户上。

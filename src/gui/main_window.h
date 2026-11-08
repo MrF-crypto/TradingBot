@@ -336,6 +336,7 @@ private:
     std::shared_ptr<Journal>     journal_;
     smart::Config                smartCfg_;
     std::atomic<bool>            smartBusy_{false};
+    std::atomic<bool>            profitBusy_{false};
     QPushButton*                 smartBtn_ = nullptr;
 
     // ── 日志 ──

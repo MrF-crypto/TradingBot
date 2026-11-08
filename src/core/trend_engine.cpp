@@ -548,6 +548,33 @@ int TrendEngine::close_all() {
     return (int)ids.size();
 }
 
+void TrendEngine::set_execution_cb(ExecutionCb cb) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_); execution_cb_ = std::move(cb);
+}
+bool TrendEngine::record_execution(ExecutionEvent& event) {
+    ExecutionCb cb;
+    { std::lock_guard<std::recursive_mutex> lk(mtx_); cb = execution_cb_; }
+    if (!cb) return true;
+    try { return cb(event); } catch (...) { return false; }
+}
+void TrendEngine::set_profit_gate(trend::Pos direction, std::string reason, int64_t fresh_after) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    (direction == trend::Pos::Long ? profit_long_gate_ : profit_short_gate_) = std::move(reason);
+    (direction == trend::Pos::Long ? profit_long_after_ : profit_short_after_) = fresh_after;
+}
+int TrendEngine::close_auto_direction(trend::Pos direction, const std::string& reason) {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        for (auto& [id, b] : bots_) {
+            if (!b.is_auto || b.pending || b.st.pos != direction || b.qty <= 0 || b.needs_reconcile) continue;
+            b.pending = true; ids.push_back(id);
+        }
+    }
+    for (const auto& id : ids) submit_close(id, reason, trend::Pos::Flat);
+    return static_cast<int>(ids.size());
+}
+
 void TrendEngine::remove_bot(const std::string& id) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
     auto it = bots_.find(id);
@@ -817,6 +844,14 @@ void TrendEngine::set_risk_limits(double total, double direction, double cost_bp
 
 std::string TrendEngine::risk_gate_block(const TrendBot& self, trend::Pos dir, double want,
                                         const TrendBot* releasing) const {
+    if (self.is_auto) {
+        const auto& reason = dir == trend::Pos::Long ? profit_long_gate_ : profit_short_gate_;
+        if (!reason.empty()) return reason;
+        const auto after = dir == trend::Pos::Long ? profit_long_after_ : profit_short_after_;
+        if (after > 0 && self.open_ms <= after && (self.bar_open_ms <= after || !self.following.closed_entry.ready ||
+            !(dir == trend::Pos::Long ? self.following.closed_entry.long_confirmed : self.following.closed_entry.short_confirmed)))
+            return "组合保护恢复后，等待新的收盘突破";
+    }
     if (!(std::isfinite(want) && want > 0)) return "计划风险数据不合法";
     for (const auto& [key, count] : untracked_seen_)
         if (count >= 2) return "交易所有未跟踪仓位，暂停新增风险";
@@ -1610,7 +1645,22 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 b.reserved_dir = dir;
                 b.rotation_reserved = false; // from here, persistence must treat an unfinished open as unknown
             }
-            auto r = client_->place_market_order(cfg.symbol, side_of(dir, false), qty, false);
+            ExecutionEvent execution;
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                const auto& b = bots_.at(id);
+                execution.bot_id = id; execution.symbol = cfg.symbol; execution.is_auto = b.is_auto;
+                execution.opening = true; execution.direction = dir == trend::Pos::Long ? 1 : -1;
+                execution.qty = qty; execution.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+            }
+            if (!record_execution(execution)) {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto& b = bots_.at(id); b.pending = false; b.reserved_risk = b.reserved_margin = 0;
+                b.reserved_dir = trend::Pos::Flat; b.last_action = "利润归集处理中或账本未就绪，暂停新增风险"; return;
+            }
+            auto r = client_->place_tagged_order(cfg.symbol, side_of(dir, false), qty, false, execution.key);
+            execution.result = r; execution.completed = true;
+            if (!record_execution(execution)) set_persistence_error("profit", "成交账本写入失败");
 
             // ⚠ 这个锁必须【显式加一层作用域】：底下要在成交后同步交易所侧灾难
             //   止损，而那是 HTTP。持着 mtx_ 做网络 IO 会把整个引擎卡住几百毫秒
@@ -2056,6 +2106,18 @@ void TrendEngine::verify_external_close(const std::string& id) {
             stop_id = before.disaster_stop_id;
             evidence = client_->verify_close(before.cfg.symbol, side_of(before.st.pos, false), stop_id);
         }
+        const auto& verified_fill = evidence.protective_fill;
+        if (evidence.position_known && evidence.remaining_qty == 0 && verified_fill.ok && !verified_fill.uncertain &&
+            std::isfinite(verified_fill.executed_qty) && verified_fill.executed_qty >= before.qty - std::max(1.0, before.qty) * 1e-12 &&
+            std::isfinite(verified_fill.avg_price) && verified_fill.avg_price > 0) {
+            ExecutionEvent e;
+            e.bot_id = id; e.symbol = before.cfg.symbol; e.is_auto = before.is_auto;
+            e.direction = before.st.pos == trend::Pos::Long ? 1 : -1;
+            e.qty = before.qty; e.entry = before.st.entry_price; e.completed = true;
+            e.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+            e.result = verified_fill;
+            if (!record_execution(e)) set_persistence_error("profit", "硬止损成交账本待核对");
+        }
         TrendTrade trade;
         bool emit = false, cancel_live_stop = false;
         {
@@ -2179,7 +2241,18 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reason
                     return;
                 }
             }
-            auto r = client_->place_market_order(cfg.symbol, side_of(pos, true), qty, true);
+            ExecutionEvent execution;
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                execution.bot_id = id; execution.symbol = cfg.symbol; execution.is_auto = bots_.at(id).is_auto;
+                execution.direction = pos == trend::Pos::Long ? 1 : -1; execution.qty = qty; execution.entry = entry;
+                execution.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+            }
+            // A ledger failure may block entries, never a protective reduce-only exit.
+            if (!record_execution(execution)) set_persistence_error("profit", "平仓账本待核对");
+            auto r = client_->place_tagged_order(cfg.symbol, side_of(pos, true), qty, true, execution.key);
+            execution.result = r; execution.completed = true;
+            if (!record_execution(execution)) set_persistence_error("profit", "平仓成交账本写入失败");
 
             bool closed_ok = false;
             double exit_px = price, closed_qty = 0;

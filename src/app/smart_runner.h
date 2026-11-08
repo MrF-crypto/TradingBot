@@ -17,6 +17,7 @@
 namespace ccbot {
 
 class TradingClient;
+class ProfitManager;
 
 // 智能模式的执行层：拉全市场数据 → 硬过滤 → 候选池决策 → 落到引擎上。
 // GUI 与 headless 共用这一份，两边只负责"什么时候调"和"界面/日志怎么显示"。
@@ -81,6 +82,9 @@ public:
     //   · 未启用时：空仓的自动 bot 移除（持仓中的等它走完）
     //   · 当日盈亏落盘（亏损限额跨重启要接得上）
     void housekeep(int64_t now_ms);
+    void evaluate_profits(int64_t now_ms);
+    void service_profits(int64_t now_ms);
+    std::string profit_status() const;
 
     // 品种加入/移除时通知应用层（订阅/退订价格、刷新界面）
     std::function<void(const std::string&)> on_symbol_added;
@@ -108,6 +112,7 @@ private:
     std::shared_ptr<TradingClient> client_;
     std::shared_ptr<TrendEngine>   engine_;
     std::shared_ptr<Journal>       journal_;
+    std::shared_ptr<ProfitManager> profits_;
     std::string                    state_path_;
     LogFn                          log_;
 

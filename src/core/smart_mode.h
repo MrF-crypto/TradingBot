@@ -1,5 +1,6 @@
 #pragma once
 #include "core/trend_engine.h"
+#include "core/profit_policy.h"
 
 #include <cstdint>
 #include <limits>
@@ -48,6 +49,7 @@ struct Config {
     double daily_loss_limit = 0;     // 当日亏损限额（U，0=关）
     double float_loss_limit = 0;     // 持仓浮亏限额（U，0=关）
     bool   pause_new        = false; // 应急：暂停全部 bot 开新仓（不删 bot、不动已有仓位）
+    profit::Config profit;
 
     // ── bot 模板（趋势跟踪）。symbol 留空，方向/反手/硬止损由 make_bot_config 强制 ──
     TrendConfig tmpl = default_template();

@@ -1,6 +1,7 @@
 #pragma once
 #include "core/trend_decision.h"
 #include "core/itrading_client.h"
+#include "core/execution_event.h"
 #include "core/engine_host.h"
 #include "core/thread_pool.h"
 
@@ -408,6 +409,10 @@ public:
     // 在途单（正在开 / 正在平）的跳过——它的结果回来之前再发平仓单不安全。
     // 返回发出平仓的笔数。不停 bot、不暂停开新仓（由调用方决定）
     int  close_all();
+    int close_auto_direction(trend::Pos direction, const std::string& reason);
+    void set_profit_gate(trend::Pos direction, std::string reason, int64_t fresh_after);
+    using ExecutionCb = std::function<bool(ExecutionEvent&)>;
+    void set_execution_cb(ExecutionCb cb);
     void remove_bot(const std::string& bot_id);
     // 已停止（暂停）的 bot 的硬止损补挂。挂单重试平时由 tick 驱动，而 tick 跳过
     // 暂停的 bot——于是暂停期间硬止损丢了就永远不补，仓位既没有本地止损也没有
@@ -723,6 +728,10 @@ private:
     std::map<std::string, TrendBot>   bots_;
     LogCb                           log_cb_;
     TradeCb                         trade_cb_;
+    ExecutionCb                     execution_cb_;
+    bool record_execution(ExecutionEvent& event);
+    std::string profit_long_gate_, profit_short_gate_;
+    int64_t profit_long_after_ = 0, profit_short_after_ = 0;
     FilterCb                        filter_cb_;
     int                             seq_ = 0;
     double                          max_total_margin_   = 0;   // 0=不限

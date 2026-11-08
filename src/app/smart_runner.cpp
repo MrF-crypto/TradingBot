@@ -1,5 +1,6 @@
 #include "core/atomic_file.h"
 #include "app/smart_runner.h"
+#include "app/profit_manager.h"
 #include "core/parallel.h"
 #include "net/trading_client.h"
 
@@ -218,12 +219,25 @@ void SmartRunner::seed_day_from_history(const std::vector<TrendTrade>& trades) {
     }
 }
 
-void SmartRunner::cancel() { cancelled_.store(true); }
+void SmartRunner::cancel() { cancelled_.store(true); if (profits_) profits_->cancel(); }
 
 SmartRunner::SmartRunner(std::shared_ptr<TradingClient> client, std::shared_ptr<TrendEngine> engine,
                          std::string state_path, LogFn log)
     : client_(std::move(client)), engine_(std::move(engine)),
-      state_path_(std::move(state_path)), log_(std::move(log)) {}
+      state_path_(std::move(state_path)), log_(std::move(log)) {
+    if (client_ && engine_) {
+        profits_ = std::make_shared<ProfitManager>(state_path_.empty() ? "" : state_path_ + ".profit", client_->account_fingerprint());
+        engine_->set_execution_cb([p = profits_](ExecutionEvent& e) { return p->record(e); });
+    }
+}
+
+void SmartRunner::evaluate_profits(int64_t now) {
+    if (!profits_ || cancelled_) return;
+    profits_->evaluate(*engine_, now);
+    if (log_) for (const auto& notice : profits_->take_notices()) log_(notice, false);
+}
+void SmartRunner::service_profits(int64_t now) { if (profits_ && !cancelled_) profits_->service(*client_, *engine_, client_->market_time_ms()); }
+std::string SmartRunner::profit_status() const { return profits_ ? profits_->status() : "尚未连接"; }
 
 void SmartRunner::set_config(const smart::Config& cfg) {
     {
@@ -237,6 +251,10 @@ void SmartRunner::set_config(const smart::Config& cfg) {
         apply_engine_gates_locked();
     }
     sync_exit_params(cfg);
+    if (profits_) {
+        profits_->configure(cfg.profit, cfg.enabled, client_->market_time_ms());
+        evaluate_profits(client_->market_time_ms());
+    }
 }
 
 // 持仓中的自动 bot 跟着设置换出场参数（空仓的由各自的扫描整套换掉）。

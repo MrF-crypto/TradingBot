@@ -22,6 +22,10 @@ public:
 
     virtual OrderOutcome place_market_order(const std::string& symbol, const std::string& side,
                                             double qty, bool reduce_only) = 0;
+    virtual OrderOutcome place_tagged_order(const std::string& symbol, const std::string& side,
+                                           double qty, bool reduce_only, const std::string& tag) {
+        return place_market_order(symbol, side, qty, reduce_only);
+    }
     // True only after a successful query proves the opening order terminal.
     // Unknown / unsupported is false, never inferred from an empty position snapshot.
     virtual bool opening_order_terminal(const std::string&, const std::string&) { return false; }

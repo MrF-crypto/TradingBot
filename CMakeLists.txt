@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.3.5 LANGUAGES CXX)
+project(TradingBot VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -110,8 +110,8 @@ set(CORE_SOURCES
     src/core/funding_ledger.cpp
     src/core/smart_mode.cpp
     src/core/journal.cpp
-    src/app/smart_runner.cpp
-    src/net/trading_client.cpp
+    src/app/smart_runner.cpp src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp
+    src/net/trading_client.cpp src/net/profit_api.cpp
     src/net/rate_gate.cpp
     # GUI 与 headless 统一使用 REST 行情。
     src/net/rest_price_feed.cpp
@@ -271,7 +271,7 @@ endif()
 
 # ── 资金费账本测试（去重/口径分离/落盘往返/回本价换算）──────────────────────
 add_executable(ccg_funding_tests tests/test_funding.cpp src/core/funding_ledger.cpp
-                                 src/net/trading_client.cpp
+                                 src/net/trading_client.cpp src/net/profit_api.cpp
                                  src/net/rate_gate.cpp)
 target_include_directories(ccg_funding_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_funding_tests PRIVATE ${CORE_LIBS})
@@ -285,7 +285,7 @@ endif()
 
 # ── 订单路径测试（超时恢复/部分成交/零成交/-1111重试）：用假HTTP响应复现故障 ──
 add_executable(ccg_order_tests tests/test_order_path.cpp
-                               src/net/trading_client.cpp src/net/rate_gate.cpp)
+                               src/net/trading_client.cpp src/net/profit_api.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_order_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_order_tests PRIVATE ${CORE_LIBS})
 if(WIN32)
@@ -314,7 +314,7 @@ endif()
 
 # ── 对时测试：往返过长的测量必须丢弃，诊断信息必须如实 ────────────────────────
 add_executable(ccg_timesync_tests tests/test_time_sync.cpp
-                                  src/net/trading_client.cpp src/net/rate_gate.cpp)
+                                  src/net/trading_client.cpp src/net/profit_api.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_timesync_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_timesync_tests PRIVATE ${CORE_LIBS})
 if(WIN32)
@@ -357,10 +357,10 @@ endif()
 
 # ── 智能模式执行层测试：假交易所 → 扫描 → 候选池决策落到引擎 ─────────────────
 add_executable(ccg_smart_runner_tests tests/test_smart_runner.cpp
-                                      src/app/smart_runner.cpp src/core/smart_mode.cpp
+                                      src/app/smart_runner.cpp src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp src/core/smart_mode.cpp
                                       src/core/journal.cpp
                                       src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
-                                      src/net/trading_client.cpp src/net/rate_gate.cpp)
+                                      src/net/trading_client.cpp src/net/profit_api.cpp src/net/rate_gate.cpp)
 target_include_directories(ccg_smart_runner_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(ccg_smart_runner_tests PRIVATE ${CORE_LIBS})
 if(WIN32)
@@ -397,7 +397,20 @@ endif()
 # 加目标时忘记跟一行是必然会发生的，而"忘了"的表现是那个目标静默失去警告保护。
 # 列表里的目标必须存在，否则 ccbot_harden 会报错——这正是想要的：
 # 删了目标忘了从这里摘掉，构建就会响
+add_executable(ccg_profit_tests tests/test_profit.cpp
+    src/core/smart_mode.cpp
+    src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp
+    src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
+    src/net/trading_client.cpp src/net/profit_api.cpp src/net/rate_gate.cpp)
+target_include_directories(ccg_profit_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(ccg_profit_tests PRIVATE ${CORE_LIBS})
+if(WIN32)
+    target_link_libraries(ccg_profit_tests PRIVATE crypt32 ws2_32 wsock32)
+    target_compile_definitions(ccg_profit_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 set(CCBOT_OWN_TARGETS
+    ccg_profit_tests
     ccbot_headless
     ccg_indicator_tests ccg_trend_tests ccg_trend_engine_tests ccg_trend_state_tests
     ccg_trend_stress_tests ccg_funding_tests ccg_order_tests ccg_pool_tests

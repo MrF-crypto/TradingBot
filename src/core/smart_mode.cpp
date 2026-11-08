@@ -1,4 +1,5 @@
 #include "core/smart_mode.h"
+#include "core/profit_json.h"
 #include "core/indicators.h"
 
 #include <simdjson.h>
@@ -287,6 +288,7 @@ std::string config_to_json(const Config& c) {
     o << "\"event_cooldown_sec\":" << c.event_cooldown_sec << ",";
     o << "\"event_move_atr\":" << c.event_move_atr << ",";
     o << "\"event_min_move_pct\":" << c.event_min_move_pct << ",";
+    o << "\"profit\":" << profit::config_json(c.profit) << ',';
     const auto& t = c.tmpl;
     o << "\"template\":{";
     o << "\"tf_enabled\":" << b(t.rule.following.enabled) << ",";
@@ -408,6 +410,10 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
     get_num(o, "daily_loss_limit", c.daily_loss_limit);
     get_num(o, "float_loss_limit", c.float_loss_limit);
     get_bool(o, "pause_new", c.pause_new);
+    if (o["profit"].error() != simdjson::NO_SUCH_FIELD) {
+        try { profit::read_config(o["profit"].value(), c.profit); }
+        catch (const std::exception& e) { if (err) *err = std::string("智能模式：") + e.what(); return false; }
+    }
     {
         simdjson::dom::element el;
         if (o["max_total_risk_usdt"].get(el) == simdjson::SUCCESS) {
@@ -670,6 +676,7 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
         c.event_cooldown_sec > 3600 || !(c.event_move_atr > 0) || !(c.event_min_move_pct > 0))
         return bad("异动轮询/冷却/阈值不合法");
     const auto& tm = c.tmpl;
+    if (c.profit.protect && tm.interval != "1h") return bad("组合广度保护首版要求智能模板周期为 1h");
     if (tm.interval != "15m" && tm.interval != "30m" && tm.interval != "1h" && tm.interval != "2h" && tm.interval != "4h")
         return bad("模板周期只支持 15m / 30m / 1h / 2h / 4h（扫描按 1h K线打分）");
     if (!(tm.budget_usdt > 0))                           return bad("模板 budget_usdt 必须大于 0");
