@@ -209,8 +209,10 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "rotation_scenarios.h"
 #include "resume_scenarios.h"
 #include "audit_engine_scenarios.h"
+#include "accounting_engine_scenarios.h"
 
 int main() {
+    test_accounting_engine_scenarios();
     test_audit_engine_scenarios();
     test_risk_budget_scenarios();
     test_reentry_scenarios();
@@ -1163,9 +1165,9 @@ int main() {
         check(b.trade_count == 0, "平仓失败不得记成交");
     }
 
-    // ── 平仓状态不明：reduceOnly 幂等，允许下个tick重试，且不得反手 ──────────
+    // ── 平仓状态不明：核对原订单，不重复提交或按过期信号反手 ──────────
     {
-        auto cli = std::make_shared<FakeClient>();
+        auto cli = std::make_shared<ReceiptClient>();
         TrendEngine eng(cli, inline_host());
         auto id = eng.add_bot(mk_cfg());
         feed(eng, id, 2.0, 110, 90);
@@ -1176,13 +1178,14 @@ int main() {
         eng.tick("TESTUSDT", 104.0);
         auto b = eng.get_bots()[0];
         check(cli->calls.size() == 2, "状态不明时不得反手");
-        check(b.state == TrendBot::State::Running, "平仓状态不明不应停bot（幂等可重试）");
-        check(!b.pending, "应允许下个tick重试");
+        check(b.state == TrendBot::State::Running, "平仓状态不明保留监控与止损");
+        check(!b.pending && !b.pending_close_key.empty(), "释放工作线程但保留原平仓订单核对标识");
 
-        cli->fill_price = 104.0;                // 重试成功
+        cli->receipt = {true, "M2", "", 104, b.qty, false, b.pending_close_key};
+        advance(16);
         eng.tick("TESTUSDT", 104.0);
-        check(cli->calls.size() == 4, "重试应发平仓+反手开仓两笔");
-        check(eng.get_bots()[0].st.pos == trend::Pos::Short, "重试成功后应已反手");
+        check(cli->calls.size() == 2 && cli->queries == 1, "核对只查询原订单，不重复发平仓或反手单");
+        check(eng.get_bots()[0].st.pos == trend::Pos::Flat, "迟到回执确认平仓后不执行过期反手");
     }
 
     // Rejection/verified-stop regressions are in audit_engine_scenarios.h.

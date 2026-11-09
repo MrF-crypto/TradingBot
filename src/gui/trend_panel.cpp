@@ -403,7 +403,7 @@ void MainWindow::fillTrendRow(int row, const TrendBot& b, RowTotals& t) {
     // ── 已实现（悬停带胜率与连续反手）──
     auto* real_it = mk(fmt_signed(b.realized_pnl), pnl_color(b.realized_pnl));
     {
-        QString tip = QString("已实现盈亏 %1U\n").arg(fmt_signed(b.realized_pnl));
+        QString tip = QString("已实现毛盈亏 %1U（未扣手续费与资金费）\n").arg(fmt_signed(b.realized_pnl));
         // 胜率：趋势跟随天然只有 30~40%，低不代表策略坏了。分子分母都摆出来，
         // 免得只看一个百分比就急着改参数
         if (b.trade_count > 0)
@@ -1562,6 +1562,11 @@ void MainWindow::save_trend_bots() {
         o["state"]           = (int)b.state;
         o["open_uncertain"] = b.open_uncertain || (b.pending && !b.rotation_reserved && b.st.pos == trend::Pos::Flat);
         o["uncertain_client_id"] = QString::fromStdString(b.uncertain_client_id);
+        o["uncertain_qty"] = b.uncertain_qty;
+        o["uncertain_stop"] = b.uncertain_stop;
+        o["pending_close_key"] = QString::fromStdString(b.pending_close_key);
+        o["pending_close_reason"] = QString::fromStdString(b.pending_close_reason);
+        o["pending_close_ms"] = static_cast<qint64>(b.pending_close_ms);
         o["reserved_risk"] = b.reserved_risk;
         o["reserved_margin"] = b.reserved_margin;
         o["reserved_dir"] = (int)b.reserved_dir;
@@ -1831,6 +1836,11 @@ void MainWindow::load_and_restore_trend() {
         b.is_auto = o["auto"].toBool(false);
         b.open_uncertain = o["open_uncertain"].toBool(false);
         b.uncertain_client_id = o["uncertain_client_id"].toString().toStdString();
+        b.uncertain_qty = o["uncertain_qty"].toDouble();
+        b.uncertain_stop = o["uncertain_stop"].toDouble();
+        b.pending_close_key = o["pending_close_key"].toString().toStdString();
+        b.pending_close_reason = o["pending_close_reason"].toString().toStdString();
+        b.pending_close_ms = o["pending_close_ms"].toVariant().toLongLong();
         b.reserved_risk = o["reserved_risk"].toDouble(0);
         b.reserved_margin = o["reserved_margin"].toDouble(0);
         b.reserved_dir = (trend::Pos)o["reserved_dir"].toInt(0);

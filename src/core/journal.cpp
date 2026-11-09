@@ -129,8 +129,7 @@ void Journal::prune_locked(int64_t now_ms) {
 void Journal::trade(const TrendTrade& t) {
     const int64_t close_ms = ms_of(t.close_time);
     const int64_t open_ms  = t.open_time.time_since_epoch().count() ? ms_of(t.open_time) : 0;
-    const double  fee = (std::fabs(t.entry_price) + std::fabs(t.exit_price)) *
-                        std::fabs(t.qty) * TrendEngine::kEstFeeRate;
+    const double  fee = t.estimated_fee(TrendEngine::kEstFeeRate);
     std::ostringstream l;
     l << utc_time(close_ms) << ","
       << (open_ms ? utc_time(open_ms) : std::string()) << ","
@@ -139,7 +138,7 @@ void Journal::trade(const TrendTrade& t) {
       << trend::strategy_name(t.strategy) << "," << csv_field(t.interval) << ","
       << (t.is_auto ? "自动" : "手动") << ","
       << num(t.entry_price, 10) << "," << num(t.exit_price, 10) << "," << num(t.qty, 10) << ","
-      << num(t.pnl, 8) << "," << num(fee, 6) << "," << num(t.pnl - fee, 8) << ","
+      << num(t.pnl, 8) << "," << num(fee, 6) << "," << num(t.estimated_net(TrendEngine::kEstFeeRate), 8) << ","
       << num(t.entry_dist_atr, 4) << ","
       << num(t.mfe_usd, 8) << "," << num(t.mae_usd, 8) << ","
       << num(t.mfe_pct, 4) << "," << num(t.mae_pct, 4) << ","

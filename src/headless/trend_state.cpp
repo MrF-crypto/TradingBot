@@ -98,6 +98,11 @@ SaveResult save_trend_state_locked(const std::string& path, const std::vector<Tr
            << "\"saved_hard_stop\":" << (b.cfg.use_disaster_stop ? "true" : "false") << ","
            << "\"open_uncertain\":" << ((b.open_uncertain || (b.pending && !b.rotation_reserved && b.st.pos == trend::Pos::Flat)) ? "true" : "false") << ","
            << "\"uncertain_client_id\":\"" << json_escape(b.uncertain_client_id) << "\","
+           << "\"uncertain_qty\":" << b.uncertain_qty << ","
+           << "\"uncertain_stop\":" << b.uncertain_stop << ","
+           << "\"pending_close_key\":\"" << json_escape(b.pending_close_key) << "\","
+           << "\"pending_close_reason\":\"" << json_escape(b.pending_close_reason) << "\","
+           << "\"pending_close_ms\":" << b.pending_close_ms << ","
            << "\"reserved_risk\":" << b.reserved_risk << ","
            << "\"reserved_margin\":" << b.reserved_margin << ","
            << "\"reserved_dir\":" << (int)b.reserved_dir << ","
@@ -300,6 +305,11 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         bool uncertain = false;
         if (o["open_uncertain"].get(uncertain) == simdjson::SUCCESS) b.open_uncertain = uncertain;
         b.uncertain_client_id = get_str(o, "uncertain_client_id", "");
+        b.uncertain_qty = get_num(o, "uncertain_qty", 0);
+        b.uncertain_stop = get_num(o, "uncertain_stop", 0);
+        b.pending_close_key = get_str(o, "pending_close_key", "");
+        b.pending_close_reason = get_str(o, "pending_close_reason", "");
+        b.pending_close_ms = static_cast<int64_t>(get_num(o, "pending_close_ms", 0));
         b.reserved_risk = get_num(o, "reserved_risk", 0);
         b.reserved_margin = get_num(o, "reserved_margin", 0);
         b.reserved_dir = (trend::Pos)(int)get_num(o, "reserved_dir", 0);

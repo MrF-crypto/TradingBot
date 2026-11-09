@@ -517,14 +517,14 @@ void MainWindow::refreshStats() {
     const double winRate = statTrades_ > 0 ? (double)statWins_ / statTrades_ * 100.0 : 0.0;
     statsLabel_->setTextFormat(Qt::RichText);
     statsLabel_->setText(
-        QString("盈利统计：共 %1 笔 | 胜率 %2% | 累计盈亏 %3")
+        QString("成交统计：共 %1 笔 | 毛盈利胜率 %2% | 累计毛盈亏 %3")
         .arg(statTrades_)
         .arg(winRate, 0, 'f', 1)
         .arg(colored_money(statPnl_)));
     statsLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
     statsLabel_->setToolTip(
         "所有 bot 的成交累计，包含已删除的 bot。\n"
-        "盈亏是毛盈亏：按成交价算，没有扣手续费和资金费（这两项见顶部栏）。\n"
+        "毛盈亏按成交价计算，未扣手续费和资金费。明细的预估净盈亏扣除估算手续费；实结净额见利润账本。\n"
         "你在 App 上手动平仓、或被强平的仓位，程序拿不到成交价，不在这里。");
 }
 
@@ -573,7 +573,7 @@ void MainWindow::openTradeHistoryDialog() {
 
     auto* statTable = new QTableWidget((int)stats.size(), 7);
     statTable->setHorizontalHeaderLabels(
-        {"品种","笔数","笔/周","胜率","累计盈亏","盈亏比","反手"});
+        {"品种","笔数","笔/周","毛盈利胜率","累计毛盈亏","毛盈亏比","反手"});
     statTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     statTable->verticalHeader()->setVisible(false);
     statTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -595,7 +595,7 @@ void MainWindow::openTradeHistoryDialog() {
         statTable->setItem(row, 2, mkc(s.cycles > 1 ? QString::number(perWeek, 'f', 1) : "--",
                                         QColor("#8b949e")));
         statTable->setItem(row, 3, mkc(QString("%1%").arg(winRate, 0, 'f', 0), QColor("#8b949e")));
-        statTable->setItem(row, 4, mkc(QString("%1$%2").arg(s.pnl >= 0 ? "+" : "")
+        statTable->setItem(row, 4, mkc(QString("%1$%2").arg(s.pnl >= 0 ? "+" : "-")
                                         .arg(std::abs(s.pnl), 0, 'f', 2),
                                         s.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
         statTable->setItem(row, 5, mkc(pr_ok ? QString::number(payoff, 'f', 2) : "--",
@@ -624,9 +624,12 @@ void MainWindow::openTradeHistoryDialog() {
     histTitle->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding-top:6px;");
     dv->addWidget(histTitle);
 
-    auto* table = new QTableWidget(0, 11);
+    auto* table = new QTableWidget(0, 13);
     table->setHorizontalHeaderLabels(
-        {"时间","品种","方向","开仓价","平仓价","数量","盈亏","浮盈亏最高","浮盈亏最低","反手","原因"});
+        {"时间","品种","方向","开仓价","平仓价","数量","毛盈亏","浮盈亏最高","浮盈亏最低","反手","原因","预估手续费","预估净盈亏"});
+    table->horizontalHeaderItem(6)->setToolTip("按已确认成交均价计算，未扣手续费和资金费；历史记录保持原值。");
+    table->horizontalHeaderItem(11)->setToolTip("按开平仓成交额和固定估算费率计算，与导出 CSV 一致。");
+    table->horizontalHeaderItem(12)->setToolTip("毛盈亏减预估手续费，不含资金费；实际成交费用与资金费以利润账本结算为准。");
     table->horizontalHeaderItem(7)->setToolTip(
         "持仓期间浮盈亏最好的那一刻。开仓那一刻是 0，所以不会是负数。\n"
         "和「盈亏」对比：最高 +$30、平仓 +$5 = 回吐了大部分利润。悬停看 R / ATR 倍数");
@@ -653,11 +656,15 @@ void MainWindow::openTradeHistoryDialog() {
                                   t.side == trend::Pos::Short ? QColor("#f85149")
                                   : t.side == trend::Pos::Long ? QColor("#3fb950")
                                                              : QColor("#8b949e")));
-        table->setItem(i, 3, mkc(QString("$%1").arg(t.entry_price, 0, 'f', 4), QColor("#8b949e")));
-        table->setItem(i, 4, mkc(QString("$%1").arg(t.exit_price,  0, 'f', 4), QColor("#8b949e")));
+        table->setItem(i, 3, mkc("$" + QString::number(t.entry_price, 'g', 12), QColor("#8b949e")));
+        table->setItem(i, 4, mkc("$" + QString::number(t.exit_price, 'g', 12), QColor("#8b949e")));
         table->setItem(i, 5, mkc(QString::number(t.qty, 'f', 4), QColor("#8b949e")));
-        table->setItem(i, 6, mkc(QString("%1$%2").arg(t.pnl >= 0 ? "+" : "").arg(std::abs(t.pnl), 0, 'f', 2),
+        table->setItem(i, 6, mkc(QString("%1$%2").arg(t.pnl >= 0 ? "+" : "-").arg(std::abs(t.pnl), 0, 'f', 2),
                                   t.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
+        table->setItem(i, 11, mkc(QString::number(t.estimated_fee(TrendEngine::kEstFeeRate), 'f', 2), QColor("#8b949e")));
+        const double net = t.estimated_net(TrendEngine::kEstFeeRate);
+        table->setItem(i, 12, mkc(QString("%1$%2").arg(net >= 0 ? "+" : "-").arg(std::abs(net), 0, 'f', 2),
+                                net >= 0 ? QColor("#3fb950") : QColor("#f85149")));
         // 浮盈亏最高 / 最低：负数红，0 和正数绿（与「盈亏」列同一套颜色）。
         // 老记录没有这两项（NaN）显示 "--"
         auto excursion = [&](double usd, double pct, double atr, double r, const char* name) {
@@ -994,7 +1001,7 @@ void MainWindow::buildUi() {
             row->addWidget(btnAddSym);
             row->addStretch();
 
-            statsLabel_ = new QLabel("盈利统计：共 0 笔 | 胜率 --% | 累计盈亏 $0.00");
+            statsLabel_ = new QLabel("成交统计：共 0 笔 | 毛盈利胜率 --% | 累计毛盈亏 $0.00");
             statsLabel_->setStyleSheet(
                 "QLabel{color:#8b949e;font-size:11px;padding:4px 8px;"
                 "background:#161b22;border:1px solid #21262d;border-radius:3px;}");

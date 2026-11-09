@@ -80,6 +80,9 @@ int main() {
             saved.cfg.rule.following.enabled = true;
             saved.disaster_stop_id = "protect-123"; saved.disaster_stop_price = 106;
             saved.open_uncertain = true; saved.uncertain_client_id = "opening-123";
+            saved.uncertain_qty = 2; saved.uncertain_stop = 105;
+            saved.pending_close_key = "closing-123"; saved.pending_close_reason = "止损确认";
+            saved.pending_close_ms = 1800000000123LL;
             saved.reserved_risk = 10; saved.reserved_margin = 50;
             saved.monitor.model_key = monitor_model_key(saved.cfg);
             saved.monitor.cursor_ms = saved.monitor.target_ms = 1800000000000LL;
@@ -91,6 +94,9 @@ int main() {
             check(loaded.size() == 1 && loaded[0].cfg.symbol == symbol && loaded[0].qty == 2 &&
                   loaded[0].st.stop == 105 && loaded[0].disaster_stop_id == "protect-123" &&
                   loaded[0].open_uncertain && loaded[0].uncertain_client_id == "opening-123" &&
+                  loaded[0].uncertain_qty == 2 && loaded[0].uncertain_stop == 105 &&
+                  loaded[0].pending_close_key == "closing-123" && loaded[0].pending_close_reason == "止损确认" &&
+                  loaded[0].pending_close_ms == 1800000000123LL &&
                   loaded[0].reserved_risk == 10 && loaded[0].reserved_margin == 50 &&
                   loaded[0].monitor.cursor_ms == saved.monitor.cursor_ms && loaded[0].monitor.trend_bars == 9 &&
                   loaded[0].reentry_after_ms == saved.reentry_after_ms &&

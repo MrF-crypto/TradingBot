@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <cmath>
 
 // 引擎依赖的交易接口（引擎只用这4个方法）。
 // 实盘由 TradingClient 实现；回测由 SimClient 实现模拟撮合——
@@ -16,6 +17,17 @@ struct OrderOutcome {
     std::string client_order_id{};
 };
 
+inline void require_execution_price(OrderOutcome& r) {
+    if (!std::isfinite(r.executed_qty) || r.executed_qty < 0 ||
+        !std::isfinite(r.avg_price) || r.avg_price < 0 ||
+        (r.executed_qty > 0 && r.avg_price <= 0)) {
+        if (!std::isfinite(r.executed_qty) || r.executed_qty < 0) r.executed_qty = 0;
+        if (!std::isfinite(r.avg_price) || r.avg_price < 0) r.avg_price = 0;
+        r.ok = false; r.uncertain = true;
+        r.error = "成交数量或均价未确认，等待原订单核对";
+    }
+}
+
 class ITradingClient {
 public:
     virtual ~ITradingClient() = default;
@@ -29,6 +41,11 @@ public:
     // True only after a successful query proves the opening order terminal.
     // Unknown / unsupported is false, never inferred from an empty position snapshot.
     virtual bool opening_order_terminal(const std::string&, const std::string&) { return false; }
+    // A read of the original order, never a new submission. ok implies terminal
+    // with a confirmed quantity and (for nonzero fills) actual average price.
+    virtual OrderOutcome confirmed_order(const std::string&, const std::string&) {
+        OrderOutcome r; r.uncertain = true; return r;
+    }
     virtual double round_qty(const std::string& symbol, double qty) = 0;
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;
     virtual bool   is_dual_mode() const = 0;

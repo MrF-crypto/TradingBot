@@ -152,7 +152,7 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
     const auto bots = engine.get_bots();
     if (!positions_ok) return;
     for (const auto& b : bots) {
-        if (b.pending || b.open_uncertain || b.needs_reconcile) { std::lock_guard<std::mutex> lk(mutex_); message_ = "在途交易／持仓核对优先"; return; }
+        if (b.pending || b.open_uncertain || !b.pending_close_key.empty() || b.needs_reconcile) { std::lock_guard<std::mutex> lk(mutex_); message_ = "在途交易／持仓核对优先"; return; }
     }
     for (const auto& [bot_id, cycle] : active) {
         double actual = 0;

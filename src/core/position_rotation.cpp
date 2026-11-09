@@ -43,6 +43,8 @@ bool fresh(const TrendBot& b, const EngineHost& host, bool quote) {
 
 void TrendEngine::set_rotation_enabled(bool enabled) {
     std::lock_guard<std::recursive_mutex> lk(mtx_);
+    if (rotation_enabled_ != enabled)
+        for (auto& [id, b] : bots_) b.rotation_retry_after = {};
     rotation_enabled_ = enabled;
     if (!enabled) rotation_queue_.clear();
     // An already submitted reduce-only order must finish; the worker rechecks this flag
@@ -61,6 +63,7 @@ bool TrendEngine::rotation_exit_eligible(const TrendBot& b, bool allow_pending) 
     const auto& h = b.rotation_health;
     if (!b.is_auto || b.cfg.rule.strategy != trend::Strategy::TrendFollowing || !b.cfg.rule.following.enabled ||
         b.needs_reconcile || b.monitor.recovering || b.state != TrendBot::State::Running || (b.pending && !allow_pending) || b.open_uncertain ||
+        !b.pending_close_key.empty() ||
         b.st.pos == trend::Pos::Flat || !(std::isfinite(b.qty) && b.qty > 0) ||
         !(std::isfinite(b.st.entry_price) && b.st.entry_price > 0 && std::isfinite(b.st.stop) && b.st.stop > 0) ||
         b.ext_gone_seen || b.opp_leg_noted ||
@@ -82,6 +85,7 @@ bool TrendEngine::rotation_exit_eligible(const TrendBot& b, bool allow_pending) 
 std::string TrendEngine::rotation_entry_block(const TrendBot& b, trend::Pos dir,
                                               int64_t signal_bar, trend::Inputs* out) const {
     if (!rotation_enabled_ || max_open_positions_ <= 0) return "满仓换仓已关闭或未设置持仓上限";
+    if (auto why = profit_entry_block(b, dir); !why.empty()) return why;
     if (!b.is_auto || b.cfg.rule.strategy != trend::Strategy::TrendFollowing || !b.cfg.rule.following.enabled ||
         b.needs_reconcile || b.monitor.recovering || b.state != TrendBot::State::Running || b.retiring || b.open_uncertain || !b.armed ||
         b.st.pos != trend::Pos::Flat || b.qty != 0 || (b.pending && rotation_.incoming != b.bot_id))
@@ -112,6 +116,7 @@ void TrendEngine::pump_rotation() {
                 it = rotation_queue_.erase(it);
                 continue;
             }
+            if (host_.now_steady() < bot->second.rotation_retry_after) { ++it; continue; }
             if (chosen == rotation_queue_.end() ||
                 std::tie(it->second.arrival, it->first) < std::tie(chosen->second.arrival, chosen->first)) chosen = it;
             ++it;
@@ -151,6 +156,20 @@ void TrendEngine::finish_rotation() {
     rotation_ = {};
 }
 
+void TrendEngine::cancel_rotation(const std::string& reason) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    if (auto it = bots_.find(rotation_.incoming); it != bots_.end()) {
+        auto& b = it->second;
+        b.last_action = "换仓预检等待：" + reason;
+        b.rotation_retry_after = host_.now_steady() + std::chrono::seconds(15);
+        if (b.rotation_notice_bar_ms != rotation_.bar_ms || b.rotation_notice != reason) {
+            b.rotation_notice_bar_ms = rotation_.bar_ms; b.rotation_notice = reason;
+            log("满仓换仓取消：" + b.cfg.symbol + " " + reason);
+        }
+    }
+    finish_rotation();
+}
+
 void TrendEngine::execute_rotation() {
     // A single worker owns the reservation until the full close and opening response finish.
     // No extra interval/daily quota. A failed attempt cannot consume more holdings for the
@@ -169,14 +188,14 @@ void TrendEngine::execute_rotation() {
             if (it == bots_.end()) { finish_rotation(); return; }
             auto& b = it->second;
             const auto why = rotation_entry_block(b, dir, rotation_.bar_ms, &in);
-            if (!why.empty()) { log("满仓换仓取消：" + why); finish_rotation(); return; }
+            if (!why.empty()) { cancel_rotation(why); return; }
             cfg = b.cfg;
             stop = trend::initial_stop(dir, in.price, cfg.rule, in);
         }
         // Quantity precision may fetch exchange rules. Never do that under the engine lock.
         const double qty = plan_qty(cfg, in.price, stop);
         if (!(qty > 0 && stop > 0) || !(dir == trend::Pos::Long ? stop < in.price : stop > in.price)) {
-            log("满仓换仓取消：新仓数量或初始止损无效"); finish_rotation(); return;
+            cancel_rotation("新仓数量或初始止损无效"); return;
         }
         std::string outgoing;
         {
@@ -185,7 +204,7 @@ void TrendEngine::execute_rotation() {
             trend::Inputs latest;
             if (it == bots_.end() || !rotation_entry_block(it->second, dir, rotation_.bar_ms, &latest).empty() ||
                 latest.price != in.price || latest.atr != in.atr) {
-                log("满仓换仓取消：数量预检期间信号或报价改变"); finish_rotation(); return;
+                cancel_rotation("数量预检期间信号或报价改变"); return;
             }
             auto& b = it->second;
             if (b.cfg.budget_usdt != cfg.budget_usdt || b.cfg.risk_usdt != cfg.risk_usdt ||
@@ -196,7 +215,7 @@ void TrendEngine::execute_rotation() {
             const double risk = qty * (std::fabs(in.price - stop) + in.price * risk_cost_rate_);
             if ((cfg.size_mode == TrendConfig::SizeMode::RiskBased && risk > cfg.risk_usdt + 1e-9) ||
                 (cfg.budget_usdt > 0 && qty * in.price > cfg.budget_usdt + 1e-9)) {
-                log("满仓换仓取消：新仓数量超出当前单笔预算"); finish_rotation(); return;
+                cancel_rotation("新仓数量超出当前单笔预算"); return;
             }
             rotation_.planned_qty = qty;
             rotation_.planned_price = in.price;
@@ -207,12 +226,12 @@ void TrendEngine::execute_rotation() {
             const auto gate = open_gate_block(b);
             if (gate.empty()) {
                 if (const auto risk_block = risk_gate_block(b, dir, risk); !risk_block.empty()) {
-                    log("满仓换仓取消：" + b.cfg.symbol + " " + risk_block); finish_rotation(); return;
+                    cancel_rotation(risk_block); return;
                 }
                 log("满仓换仓：已有自然释放的空位，按收盘信号入场，不平旧仓");
             } else {
                 if (!gate.starts_with("同时持仓品种数已达上限")) {
-                    log("满仓换仓取消：" + b.cfg.symbol + " " + gate); finish_rotation(); return;
+                    cancel_rotation(gate); return;
                 }
                 const TrendBot* best = nullptr;
                 for (const auto& [id, held] : bots_) {

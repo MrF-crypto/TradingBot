@@ -167,6 +167,39 @@ static double parse_dbl_str(simdjson::dom::element& obj, const char* key) {
     return d;
 }
 
+// Order evidence is stricter than display data: a missing value must not turn
+// into a zero fill or a price copied from the market quote.
+static bool order_decimal(simdjson::dom::element doc, const char* key, double& out) {
+    simdjson::dom::element value;
+    if (doc[key].get(value) != simdjson::SUCCESS) return false;
+    double number = 0;
+    if (value.get(number) != simdjson::SUCCESS) {
+        std::string_view text;
+        if (value.get(text) != simdjson::SUCCESS || text.empty()) return false;
+        try {
+            size_t used = 0;
+            number = std::stod(std::string(text), &used);
+            if (used != text.size()) return false;
+        } catch (...) { return false; }
+    }
+    if (!std::isfinite(number) || number < 0) return false;
+    out = number;
+    return true;
+}
+
+static bool order_execution(simdjson::dom::element doc, double& quantity, double& price) {
+    if (!order_decimal(doc, "executedQty", quantity)) return false;
+    if (quantity == 0) { price = 0; return true; }
+    if (order_decimal(doc, "avgPrice", price) && price > 0) return true;
+    double quote = 0;
+    if (order_decimal(doc, "cumQuote", quote) && quote > 0) {
+        price = quote / quantity;
+        return std::isfinite(price) && price > 0;
+    }
+    price = 0;
+    return false;
+}
+
 static bool binance_error(simdjson::dom::element& doc, std::string& err) {
     int64_t code = 0;
     if (doc["code"].get(code) == simdjson::SUCCESS && code < 0) {
@@ -850,13 +883,14 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
     int64_t oid = 0;
     get_or_keep(doc["orderId"], oid);
     r.order_id     = std::to_string(oid);
-    r.avg_price    = parse_dbl_str(doc, "avgPrice");
-    r.executed_qty = parse_dbl_str(doc, "executedQty");
+    const bool execution_known = order_execution(doc, r.executed_qty, r.avg_price);
     std::string_view status;
     if (doc["status"].get(status) == simdjson::SUCCESS)
         r.terminal = status == "FILLED" || status == "CANCELED" || status == "EXPIRED" ||
                      status == "EXPIRED_IN_MATCH" || status == "REJECTED";
-    r.ok = true;
+    r.ok = execution_known;
+    r.uncertain = !execution_known;
+    if (!execution_known) r.error = "成交数量或均价未确认，等待同一订单核对";
     return r;
 }
 
@@ -1019,15 +1053,23 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         int64_t oid = 0;
         get_or_keep(doc["orderId"], oid);
         r.order_id     = std::to_string(oid);
-        r.avg_price    = parse_dbl_str(doc, "avgPrice");
-        r.executed_qty = parse_dbl_str(doc, "executedQty");
+        const bool execution_known = order_execution(doc, r.executed_qty, r.avg_price);
         std::string_view status;
         if (doc["status"].get(status) == simdjson::SUCCESS)
             r.terminal = status == "FILLED" || status == "CANCELED" || status == "EXPIRED" ||
                          status == "EXPIRED_IN_MATCH" || status == "REJECTED";
-        r.ok = r.terminal;
-        r.uncertain = !r.terminal;
-        if (!r.terminal) r.error = "订单响应未确认终态，保留预留等待核对";
+        r.ok = r.terminal && execution_known;
+        r.uncertain = !r.ok;
+        if (r.terminal && !execution_known) {
+            // A terminal response with no average is not permission to substitute
+            // the pre-order mark price. Query the existing order, never POST again.
+            for (int query = 0; query < 3; ++query) {
+                auto recovered = query_order(sym, coid);
+                if (recovered.ok && recovered.terminal && !recovered.uncertain) return recovered;
+                if (query < 2) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            r.error = "已收到订单回执，但成交数量或均价尚未核实，保留预留等待核对";
+        } else if (!r.terminal) r.error = "订单响应未确认终态，保留预留等待核对";
         return r;
     }
     return r;  // 返回最后一次 -1111 错误

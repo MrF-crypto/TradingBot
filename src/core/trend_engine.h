@@ -131,6 +131,10 @@ struct TrendBot {
     trend::Pos reserved_dir = trend::Pos::Flat;
     bool open_uncertain = false;
     std::string uncertain_client_id;
+    double uncertain_qty = 0, uncertain_stop = 0;
+    std::string pending_close_key, pending_close_reason;
+    int64_t pending_close_ms = 0;
+    std::chrono::steady_clock::time_point close_last_query{};
     bool uncertain_terminal = false;
     std::chrono::steady_clock::time_point uncertain_terminal_time{};
     std::chrono::steady_clock::time_point uncertain_last_query{};
@@ -147,6 +151,9 @@ struct TrendBot {
         following::Config settings;
     } rotation_health;
     int64_t rotation_attempt_bar_ms = 0, rotation_noted_bar_ms = 0;
+    int64_t rotation_notice_bar_ms = 0;
+    std::string rotation_notice;
+    std::chrono::steady_clock::time_point rotation_retry_after{};
     struct MonitorEvent { int64_t at_ms = 0; std::string kind, text; };
     struct MonitorState {
         bool saved = false, recovering = false, fetch_failed = false;
@@ -340,6 +347,12 @@ struct TrendTrade {
     double      exit_price  = 0;
     double      qty         = 0;
     double      pnl         = 0;
+    // Gross execution P&L. Fees here are estimates; settled net belongs to the
+    // exchange-fill ledger. Keep every display/export on this same formula.
+    double estimated_fee(double rate) const {
+        return (std::fabs(entry_price) + std::fabs(exit_price)) * std::fabs(qty) * rate;
+    }
+    double estimated_net(double rate) const { return pnl - estimated_fee(rate); }
     std::string reason;
     bool        reversed    = false;     // 本次平仓后是否反手了
     std::chrono::system_clock::time_point close_time{};
@@ -691,6 +704,7 @@ private:
     std::string open_gate_block(const TrendBot& self, const TrendBot* releasing = nullptr) const;
     void start_reentry_wait(TrendBot& bot);
     const char* reentry_block(const TrendBot& bot, trend::Pos direction) const;
+    std::string profit_entry_block(const TrendBot& self, trend::Pos dir) const;
     std::string risk_gate_block(const TrendBot& self, trend::Pos dir, double risk,
                                 const TrendBot* releasing = nullptr) const;
     double max_total_risk_ = 0, max_direction_risk_ = 0, risk_cost_rate_ = 0;
@@ -720,6 +734,7 @@ private:
     void execute_rotation();
     void finish_rotation();
     std::string rotation_close_block(const TrendBot& outgoing) const;
+    void cancel_rotation(const std::string& reason);
 
     std::shared_ptr<ITradingClient> client_;
     std::shared_ptr<ThreadPool>     pool_;

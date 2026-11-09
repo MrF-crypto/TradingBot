@@ -443,6 +443,11 @@ public:
         const auto r = query_order(symbol, id);
         return r.terminal && !r.uncertain;
     }
+    OrderOutcome confirmed_order(const std::string& symbol, const std::string& id) override {
+        const auto r = query_order(symbol, id);
+        const bool confirmed = r.ok && r.terminal && !r.uncertain;
+        return {confirmed, r.order_id, r.error, r.avg_price, r.executed_qty, !confirmed, id};
+    }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
     CloseVerification verify_close(const std::string& symbol, const std::string& entry_side,

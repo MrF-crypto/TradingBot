@@ -149,6 +149,58 @@ void policy_tests() {
 }
 void integration_tests() {
     {
+        Fixture f("settlement-before-engine"); f.closed_short(); f.cfg.protect = true;
+        f.manager->configure(f.cfg, true, now);
+        TrendBot b; b.cfg.symbol = "ETHUSDT"; b.is_auto = true; b.qty = 10;
+        b.st.pos = trend::Pos::Short; b.st.entry_price = 100; b.st.stop = 120;
+        b.pending_close_key = "await-original-close"; b.pending_close_ms = now + 2000;
+        f.engine->restore_bot(b);
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        f.manager->evaluate(*f.engine, now + 400000);
+        check(f.manager->status().find("缺少匹配成交") == std::string::npos && f.fake->closes == 0,
+              "settlement preceding engine receipt recovery freezes protection without false inventory anomaly");
+        check(f.transfers == 0 && f.purchases == 0, "unresolved engine receipt prevents spending already settled short profit");
+    }
+    {
+        Fixture f("receipt-replay"); f.cfg.accumulate = false; f.manager->configure(f.cfg, true, now);
+        ExecutionEvent e; e.key = "replay-open"; e.symbol = "ETHUSDT"; e.bot_id = "owned";
+        e.direction = -1; e.opening = e.is_auto = e.completed = true; e.at_ms = now + 1000; e.qty = 10;
+        e.result = {true, "11", "", 100, 10, false, e.key};
+        check(f.manager->record(e), "priced opening receipt persisted");
+        f.manager->service(*f.client, *f.engine, now + 2000);
+        const auto settled = read(f.path);
+        check(settled.find("\"settled\":true,\"net\":-0.5") != std::string::npos, "exchange fee is settled before replay");
+        for (int i = 0; i < 20; ++i) check(f.manager->record(e), "identical receipt replay accepted idempotently");
+        auto late = e; late.result.ok = false; late.result.uncertain = true;
+        check(f.manager->record(late) && read(f.path) == settled, "late uncertain response cannot erase settled fees or reopen ledger work");
+        ProfitManager restored(f.path, f.client->account_fingerprint());
+        check(restored.record(e) && read(f.path) == settled, "restart preserves settlement when the original receipt is replayed");
+    }
+    {
+        Fixture f("receipt-position-window"); f.cfg.accumulate = false; f.cfg.protect = true;
+        f.manager->configure(f.cfg, true, now);
+        TrendBot b; b.cfg.symbol = "ETHUSDT"; b.is_auto = true; b.qty = 1;
+        b.st.pos = trend::Pos::Short; b.st.entry_price = 110; b.st.stop = 120;
+        f.engine->restore_bot(b);
+        f.engine->reconcile_positions({{"ETHUSDT", -1, 1, 110}}, std::chrono::milliseconds(0));
+        f.engine->tick("ETHUSDT", 100); f.manager->evaluate(*f.engine, now + 1);
+        int receipts = 0;
+        f.engine->set_execution_cb([&](auto& e) {
+            const bool saved = f.manager->record(e);
+            if (e.completed) {
+                ++receipts;
+                f.manager->evaluate(*f.engine, now + 2);
+                check(f.manager->status().find("缺少匹配成交") == std::string::npos,
+                      "receipt-before-position transition freezes valuation without false ledger mismatch");
+            }
+            return saved;
+        });
+        f.engine->close_auto_direction(trend::Pos::Short, "offline stop");
+        f.manager->evaluate(*f.engine, now + 3);
+        check(receipts == 1 && f.fake->closes == 1 && f.manager->status().find("缺少匹配成交") == std::string::npos,
+              "position and ledger converge after protected close without duplicate liquidation");
+    }
+    {
         smart::Config input, output; input.profit.protect = input.profit.accumulate = true; input.profit.allocation = .42;
         std::string error;
         check(smart::config_from_json(smart::config_to_json(input), output, &error) && output.profit.protect && output.profit.accumulate && near(output.profit.allocation, .42), "profit options round-trip through shared GUI/headless config");

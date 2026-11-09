@@ -11,11 +11,10 @@ macOS 桌面版优先使用 `TradingBot.app` 同级 `data/`；只读临时运行
 桌面版首次启动后设置测试网账户。无界面版将 `config.example.json` 复制为 `config.json` 并填写本机配置，参考 [Headless 说明](docs/HEADLESS.md)。下载文件可用同一 Release 的 `SHA256SUMS.txt` 核验。
 
 ```powershell
-.\ccbot_headless.exe --version
 .\TradingBot.exe --check-runtime
 ```
 
-这两个检查不会读取账户配置或提交订单。首版变化与验证范围见 [v1.0.0 发布说明](docs/releases/v1.0.0.md)。
+Linux 使用 `./ccbot_headless --version` 检查版本。这两个检查不会读取账户配置或提交订单。当前修复见 [v1.4.2 发布说明](docs/releases/v1.4.2.md)，首版变化与验证范围见 [v1.0.0 发布说明](docs/releases/v1.0.0.md)。
 
 ## 智能模式
 

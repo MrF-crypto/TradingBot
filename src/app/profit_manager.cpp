@@ -45,12 +45,28 @@ bool ProfitManager::record(ExecutionEvent& e) {
         // The durable sequence is also the clientOrderId. Never recycle it after restart.
         e.key = "tbp" + std::to_string(started_) + "_" + std::to_string(++sequence_);
     }
-    auto& entry = entries_[e.key];
+    bool merged = false;
     // Exchange-stop evidence can be delivered more than once after reconnection.
     if (e.completed && !e.result.order_id.empty()) {
         for (const auto& [key, old] : entries_) if (key != e.key && old.event.symbol == e.symbol &&
-            old.event.result.order_id == e.result.order_id && old.event.completed) { entries_.erase(e.key); return save_locked(); }
+            old.event.result.order_id == e.result.order_id && old.event.completed) {
+                entries_.erase(e.key);
+                e.key = key;
+                merged = true;
+                break;
+            }
     }
+    auto& entry = entries_[e.key];
+    const auto& old = entry.event;
+    if (!old.symbol.empty() && (old.symbol != e.symbol || old.direction != e.direction || old.opening != e.opening)) {
+        error_ = "成交回执与原订单归属不一致，保留原账本等待核对"; return false;
+    }
+    // Replays and late uncertain responses must not erase exchange-settled net P&L.
+    if (old.completed && old.result.ok && !old.result.uncertain &&
+        (!e.completed || !e.result.ok || e.result.uncertain ||
+         (e.result.ok && e.result.order_id == old.result.order_id &&
+          e.result.executed_qty == old.result.executed_qty && e.result.avg_price == old.result.avg_price)))
+        return merged ? save_locked() : true;
     // A late execution receipt can follow an earlier "order not found" query.
     // Never retain that query's settled flag or zero net amount for the real fill.
     entry = {}; entry.event = e;
@@ -90,10 +106,12 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
             const auto steady = std::chrono::steady_clock::now();
             std::map<std::string, const TrendBot*> by_symbol;
             std::map<std::string, double> actual;
+            std::set<std::string> in_flight;
             for (const auto& b : bots) if (b.is_auto) {
                 auto& candidate = by_symbol[b.cfg.symbol];
                 if (!candidate || b.state != TrendBot::State::Stopped || holding(b)) candidate = &b;
-                if (b.pending || b.open_uncertain || b.needs_reconcile) {
+                if (b.pending || b.open_uncertain || !b.pending_close_key.empty()) in_flight.insert(b.cfg.symbol);
+                if (b.pending || b.open_uncertain || !b.pending_close_key.empty() || b.needs_reconcile) {
                     const auto direction = b.st.pos != trend::Pos::Flat ? b.st.pos : b.reserved_dir;
                     if (direction != trend::Pos::Flat) { exposed[direction == trend::Pos::Long ? 0 : 1] = true; prices_ok[direction == trend::Pos::Long ? 0 : 1] = false; }
                 }
@@ -112,6 +130,10 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
             }
             for (const auto& [symbol, qty] : actual) { (void)qty; expected.try_emplace(symbol, 0); }
             for (const auto& [symbol, qty] : expected) {
+                // Receipt and engine position are updated in separate critical sections.
+                // Freeze protection calculations during that window, without labelling
+                // the expected transition as a broken ledger. Persistent mismatches still block.
+                if (in_flight.count(symbol)) continue;
                 const double present = actual[symbol];
                 if (std::fabs(present - qty) <= std::max({1e-8, std::fabs(qty) * 1e-8, std::fabs(present) * 1e-8})) continue;
                 for (const double signed_qty : {qty, present}) if (std::fabs(signed_qty) > 1e-8) {
