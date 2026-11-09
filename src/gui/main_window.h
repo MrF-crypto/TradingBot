@@ -156,7 +156,6 @@ private:
     // 持久化（程序旁 data/；Windows 保留 AppData 回退，macOS 不可写时停止启动）
     void migrate_appdata_if_needed();
     std::string cred_path()     const;
-    std::string bot_cfg_path()  const;
     std::string trade_path()   const;
     std::string settings_path() const;
     std::string log_path()      const;

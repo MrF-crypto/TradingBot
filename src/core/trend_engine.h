@@ -36,6 +36,7 @@
 namespace ccbot {
 
 struct TrendConfig {
+    bool operator==(const TrendConfig&) const = default;
     // 仓位大小的两种算法：
     //   Notional  —— 固定名义价值（budget_usdt 就是名义）
     //   RiskBased —— 固定【单笔风险】：
@@ -124,6 +125,9 @@ struct TrendBot {
     State       state   = State::Running;
     bool        pending = false;   // 有在途订单，本 tick 跳过
     bool        rotation_reserved = false; // only a slot reservation; no opening order sent yet
+    // Runtime-only network backoff; never consumes a candle or touches held stops.
+    std::chrono::steady_clock::time_point leverage_retry_after{};
+    bool leverage_failure_noted = false;
 
     // Reserve before sending an opening order. Uncertain outcomes retain the
     // reservation across restart until a fresh reconciliation proves exposure absent.

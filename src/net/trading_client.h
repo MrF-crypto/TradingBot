@@ -139,9 +139,6 @@ public:
                                  int donchian_period, int atr_period,
                                  const following::Config& following = {}, int64_t resume_after_ms = 0);
 
-    // 单独的 ATR 拉取（DCA 的 ATR 移动止损用）。公开接口，不占签名限流。
-    // fetch_atr 删于 v5.9.9：零调用者，它只服务已移除的网格 DCA
-
     // ── K线快照（③ 纯裸K 与 ② 抛物线SAR 用）────────────────────────────────
     // 当前根开盘价、刚收盘那根的收盘价、前两根的高低点，以及它【之前】N 根的
     // 最高/最低价。
@@ -388,7 +385,7 @@ public:
     // 只有网络出问题的那几秒才跑，也没法在实盘演练——所以必须能喂假响应。
     // 钩子返回 true 表示"这次由我应答"，false 则照常走真实网络。
     // 生产环境钩子为空，代码路径与未引入前完全一致
-    struct FakeReply { long code = 200; std::string headers; std::string body; };
+    struct FakeReply { long code = 200; std::string headers; std::string body; bool timed_out = false; };
     using TestHook = std::function<bool(const std::string& method, const std::string& path,
                                         const std::string& params, FakeReply& out)>;
     void set_test_hook(TestHook h) { test_hook_ = std::move(h); }
@@ -575,7 +572,8 @@ private:
     AccountInfo fetch_account_pm();
 
     // 带签名（需要 timestamp + HMAC）
-    std::string http_get (const std::string& path, std::string params = "");
+    std::string http_get (const std::string& path, std::string params = "",
+                         long* out_code = nullptr, int max_attempts = 2);
     // out_code：可选，带回 HTTP 状态码。
     //
     // ⚠ 存在的理由：响应体不是 JSON 时，光有 body 分不清到底出了什么事，而这几种
@@ -587,7 +585,7 @@ private:
     //   实测里同一个端点 5 秒内一次成功一次拿到 HTML，没有状态码就只能靠猜。
     //   用出参而不是成员变量：并发下的成员会串味，而这条信息要跟着那一次请求
     std::string http_post(const std::string& path, std::string params = "",
-                          long* out_code = nullptr);
+                          long* out_code = nullptr, bool* out_transient = nullptr);
     std::string http_del (const std::string& path, std::string params = "");
     // 公开行情。critical = 行情轮询（标记价 / 备用成交价）：走专用句柄，
     // 限流闸门按订单优先级放行（只在被封禁时等）——权重逼近上限时，非订单请求要等到下一分钟，

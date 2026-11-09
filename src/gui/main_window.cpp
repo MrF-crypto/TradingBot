@@ -271,10 +271,6 @@ std::string MainWindow::cred_path() const {
     return (portable_data_dir() + "/ccg_creds.dat").toStdString();
 }
 
-std::string MainWindow::bot_cfg_path() const {
-    return (portable_data_dir() + "/ccg_bots.json").toStdString();
-}
-
 std::string MainWindow::trade_path() const {
     return (portable_data_dir() + "/ccg_trades.json").toStdString();
 }

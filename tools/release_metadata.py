@@ -20,6 +20,9 @@ def main():
     args = ap.parse_args()
     version = 'v' + re.search(r'project\(TradingBot VERSION ([\d.]+)',
                              (ROOT / 'CMakeLists.txt').read_text(encoding='utf-8')).group(1)
+    manifest = json.loads((ROOT / 'vcpkg.json').read_text(encoding='utf-8'))
+    if manifest.get('version') != version[1:]:
+        raise RuntimeError('Dependency manifest version does not match the source version')
     ref = os.environ.get('GITHUB_REF', '')
     if ref.startswith('refs/tags/') and ref != 'refs/tags/' + version:
         raise RuntimeError('Git tag does not match the source version')

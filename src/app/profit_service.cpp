@@ -170,9 +170,22 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
     }
     const auto quote = client.btc_spot_quote();
     if (!quote.ok) { std::lock_guard<std::mutex> lk(mutex_); message_ = quote.error; return; }
+    // Caller holds mutex_; like evaluate(), take engine snapshots in this order.
+    // Network waits must not carry an old pause/config/ownership decision into a POST.
+    const auto spending_blocked = [&] {
+        if (!(cfg_ == cfg)) { message_ = "利润配置已改变，等待按新参数重新评估"; return true; }
+        if (engine.pause_new()) { message_ = "暂停开仓期间暂停新增 BTC 购买"; return true; }
+        for (const auto& b : engine.get_bots()) {
+            if (b.pending || b.open_uncertain || !b.pending_close_key.empty() || b.needs_reconcile) {
+                message_ = "在途交易／持仓核对优先"; return true;
+            }
+        }
+        return false;
+    };
     {
         std::lock_guard<std::mutex> lk(mutex_); btc_price_ = quote.ask;
         if (!smart_enabled_ || !cfg_.accumulate || cancelled_ || !error_.empty() || purchase_.phase != 0) return;
+        if (spending_blocked()) return;
         // Recompute after network I/O: a newly settled loss must shrink unused entitlement.
         double shorts, total; bool complete; totals_locked(shorts, total, complete);
         if (!complete) return;
@@ -186,6 +199,7 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
             std::lock_guard<std::mutex> lk(mutex_);
             double shorts, total; bool complete; totals_locked(shorts, total, complete);
             if (cancelled_ || !smart_enabled_ || !cfg_.accumulate || !complete || purchase_.phase != 0 ||
+                !error_.empty() || spending_blocked() ||
                 (cfg_.protect && (guards_[0].phase == profit::Phase::Exiting || guards_[1].phase == profit::Phase::Exiting)) ||
                 profit::entitlement(shorts, total, used_, 0, cfg_.allocation) + 1e-8 < amount) return;
             purchase_.phase = 1; purchase_.sent = client.market_time_ms(); purchase_.reserved = transfer;
@@ -211,6 +225,7 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
         std::lock_guard<std::mutex> lk(mutex_);
         double shorts, total; bool complete; totals_locked(shorts, total, complete);
         if (!smart_enabled_ || !cfg_.accumulate || cancelled_ || !complete || purchase_.phase != 0 ||
+            !error_.empty() || spending_blocked() ||
             (cfg_.protect && (guards_[0].phase == profit::Phase::Exiting || guards_[1].phase == profit::Phase::Exiting)) ||
             profit::entitlement(shorts, total, used_, 0, cfg_.allocation) + 1e-8 < amount) return;
         tag = "tbpbtc" + std::to_string(started_) + "_" + std::to_string(++sequence_);

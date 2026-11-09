@@ -37,7 +37,7 @@ static void test_unicode_symbol_scenarios() {
             if (path.find("exchangeInfo") != std::string::npos)
                 out.body = "{\"symbols\":[{\"symbol\":\"" + symbol + "\",\"filters\":[{\"filterType\":\"LOT_SIZE\",\"stepSize\":\"1\",\"minQty\":\"1\"},{\"filterType\":\"PRICE_FILTER\",\"tickSize\":\"0.01\"}]}]}";
             else if (path.find("klines") != std::string::npos) out.body = "[[1800000000000,\"100\",\"102\",\"99\",\"101\",\"100\"]]";
-            else if (path.find("leverage") != std::string::npos) out.body = "{\"leverage\":3}";
+            else if (path.find("leverage") != std::string::npos) out.body = "{\"symbol\":\"" + symbol + "\",\"leverage\":3}";
             else if (path.find("algo") != std::string::npos || path.find("Algo") != std::string::npos) out.body = "{\"algoId\":123,\"triggerPrice\":\"90.00\"}";
             else if (path.find("/order") != std::string::npos) out.body = "{\"orderId\":1,\"status\":\"FILLED\",\"avgPrice\":\"100\",\"executedQty\":\"1\"}";
             else if (path.find("premiumIndex") != std::string::npos) out.body = "{\"markPrice\":\"100\",\"lastFundingRate\":\"0.0001\"}";

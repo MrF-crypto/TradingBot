@@ -14,7 +14,7 @@ macOS 桌面版优先使用 `TradingBot.app` 同级 `data/`；只读临时运行
 .\TradingBot.exe --check-runtime
 ```
 
-Linux 使用 `./ccbot_headless --version` 检查版本。这两个检查不会读取账户配置或提交订单。当前修复见 [v1.4.2 发布说明](docs/releases/v1.4.2.md)，首版变化与验证范围见 [v1.0.0 发布说明](docs/releases/v1.0.0.md)。
+Linux 使用 `./ccbot_headless --version` 检查版本。这两个检查不会读取账户配置或提交订单。当前修复见 [v1.4.3 发布说明](docs/releases/v1.4.3.md)，首版变化与验证范围见 [v1.0.0 发布说明](docs/releases/v1.0.0.md)。
 
 ## 智能模式
 
@@ -120,4 +120,4 @@ python tools/check_suite_coverage.py
 
 许可证为 [MIT](LICENSE)，保留上游版权与许可声明。
 
-当前源码 **v1.4.1** 修正发布包布局：Windows、macOS 仅提供 GUI 及必要配套，无头程序只面向 Linux。详见 [v1.4.1 发布说明](docs/releases/v1.4.1.md)。继续包含 [v1.4.0 的组合利润保护与 BTC 积累](docs/releases/v1.4.0.md)、macOS 启动改进及此前行情、监控修复；本次不修改交易策略、止损、账户配置和数据恢复逻辑。正式下载以 GitHub Release 为准；`BUILD_VERIFICATION.json` 随 Release 单独提供源码、CI、依赖和附件摘要，`SHA256SUMS.txt` 用于核验压缩包。
+当前源码 **v1.4.3** 增加杠杆超时查询恢复，修复写入开仓意图及利润归集网络等待后的最终检查，并清理无调用的旧代码和多余系统库链接。详见 [v1.4.3 发布说明](docs/releases/v1.4.3.md)。继续包含此前的成交核对、利润保护、BTC 积累及断点恢复功能。Windows、macOS 仅提供 GUI 及必要运行文件，无头程序只面向 Linux。正式下载以 GitHub Release 为准；`BUILD_VERIFICATION.json` 随 Release 单独提供源码、CI、依赖和附件摘要，`SHA256SUMS.txt` 用于核验压缩包。

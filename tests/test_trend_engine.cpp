@@ -48,6 +48,7 @@ public:
     double qty_step     = 0.001;    // 取整步长
     int    leverage_calls = 0;
     bool   leverage_ok  = true;
+    std::function<void()> during_leverage;
 
     OrderOutcome place_market_order(const std::string&, const std::string& side,
                                     double qty, bool reduce_only) override {
@@ -112,6 +113,7 @@ public:
     }
     bool set_leverage(const std::string&, int) override {
         ++leverage_calls;
+        if (during_leverage) { auto fn = std::move(during_leverage); during_leverage = {}; fn(); }
         return leverage_ok;
     }
     bool is_dual_mode() const override { return false; }
@@ -209,11 +211,13 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "rotation_scenarios.h"
 #include "resume_scenarios.h"
 #include "audit_engine_scenarios.h"
+#include "leverage_engine_scenarios.h"
 #include "accounting_engine_scenarios.h"
 
 int main() {
     test_accounting_engine_scenarios();
     test_audit_engine_scenarios();
+    test_leverage_engine_scenarios();
     test_risk_budget_scenarios();
     test_reentry_scenarios();
     test_rotation_scenarios();

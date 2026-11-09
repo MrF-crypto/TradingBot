@@ -67,7 +67,7 @@ static void test_audit_engine_scenarios() {
         feed(engine,id,2,110,90); engine.tick(cfg.symbol,111);
         check(cli->calls.empty() && !bot_of(engine,cfg.symbol).pending,
               "leverage not confirmed: cancel entry before margin can exceed the configured cap");
-        cli->leverage_ok = true; engine.tick(cfg.symbol,111);
+        cli->leverage_ok = true; advance(30); engine.tick(cfg.symbol,111);
         check(cli->calls.size() == 1, "entry can retry after leverage is confirmed");
     }
     for (bool refresh_price : {false, true}) {

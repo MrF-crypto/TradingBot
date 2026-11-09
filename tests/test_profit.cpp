@@ -29,6 +29,7 @@ struct FakeClient : ITradingClient {
     bool is_dual_mode() const override { return false; }
 };
 struct Fixture {
+    int failures_at_start = failures;
     std::string path;
     std::shared_ptr<TradingClient> client;
     std::shared_ptr<FakeClient> fake = std::make_shared<FakeClient>();
@@ -42,11 +43,15 @@ struct Fixture {
     bool unrelated_transfer = false;
     bool lost_transfer = false, lost_purchase = false, non_usdt_fee = false, foreign_fill = false, half_fill = false;
     std::string order_tag;
+    std::function<void()> during_quote;
     explicit Fixture(const std::string& name) {
         path = "profit-test-" + name + ".json"; std::filesystem::remove(path);
         TradingClient::Config config; config.api_key = "offline-test-key"; config.api_secret = "offline-test-secret"; config.testnet = false;
         client = std::make_shared<TradingClient>(config);
         client->set_test_hook([this](const auto& method, const auto& endpoint, const auto& params, auto& reply) {
+            if (endpoint == "/api/v3/exchangeInfo?symbol=BTCUSDT" && during_quote) {
+                auto fn = std::move(during_quote); during_quote = {}; fn();
+            }
             reply.code = 200;
             if (endpoint == "/fapi/v1/multiAssetsMargin") reply.body = R"({"multiAssetsMargin":false})";
             else if (endpoint == "/fapi/v2/account" || endpoint == "/fapi/v3/account") reply.body = "{\"totalMarginBalance\":\"" + std::to_string(equity) + "\"}";
@@ -87,11 +92,17 @@ struct Fixture {
         manager->configure(cfg, true, now);
         manager->service(*client, *engine, now); // Capture the initial capital reserve before any gain.
     }
-    ~Fixture() { manager.reset(); std::filesystem::remove(path); }
+    ~Fixture() {
+        if (failures != failures_at_start && manager)
+            std::printf("[diagnostic] %s: %s; transfers=%d purchases=%d\n", path.c_str(), manager->status().c_str(), transfers, purchases);
+        manager.reset(); std::filesystem::remove(path);
+    }
     void closed_short(bool late_receipt = false) {
         ExecutionEvent open; open.bot_id = "bot"; open.symbol = "ETHUSDT"; open.is_auto = true; open.direction = -1;
         open.opening = true; open.qty = 10; open.at_ms = now + 1000;
-        check(manager->record(open), "opening intent persisted before submission");
+        const bool saved = manager->record(open);
+        if (!saved) std::printf("[diagnostic] %s: %s\n", path.c_str(), manager->status().c_str());
+        check(saved, "opening intent persisted before submission");
         if (late_receipt) manager->service(*client, *engine, now + 1500);
         open.completed = true; open.result.ok = true; open.result.order_id = "11"; open.result.executed_qty = 10; open.result.avg_price = 100;
         manager->record(open);
@@ -347,6 +358,21 @@ void integration_tests() {
 }
 }
 int main() {
+    for (bool funded : {false, true}) for (int scenario = 0; scenario < 4; ++scenario) {
+        Fixture f("late-gate-" + std::to_string(funded) + "-" + std::to_string(scenario)); f.closed_short();
+        if (funded) f.manager->service(*f.client, *f.engine, now + 400000);
+        TrendConfig bot_cfg; bot_cfg.symbol = "OTHERUSDT";
+        const auto id = f.engine->add_bot(bot_cfg);
+        f.during_quote = [&] {
+            if (scenario == 0) f.engine->set_pause_new(true);
+            if (scenario == 1) f.engine->set_pending_for_test(id, true);
+            if (scenario == 2) { f.cfg.capital_floor = 2000; f.manager->configure(f.cfg, true, now + 420000); }
+            if (scenario == 3) { f.cfg.max_batch_usdt = 5; f.manager->configure(f.cfg, true, now + 420000); }
+        };
+        f.manager->service(*f.client, *f.engine, now + 430000);
+        check(f.transfers == (funded ? 1 : 0) && f.purchases == 0,
+              "profit spending rechecks pause/pending/config after quote HTTP");
+    }
     try { policy_tests(); integration_tests(); }
     catch (const std::exception& e) { std::printf("EXCEPTION %s\n", e.what()); ++failures; }
     return failures ? 1 : 0;

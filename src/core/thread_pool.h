@@ -6,7 +6,6 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
-#include <atomic>
 #include <chrono>
 #include <stdexcept>
 
@@ -52,14 +51,8 @@ public:
 
     // 阻塞到"队列空 且 没有在途任务"。
     //
-    // 存在的理由：任务的 lambda 捕获的是调用方的 this（引擎、GUI 窗口），而这些
-    // 对象销毁时【不会】自动等任务跑完——CcgEngine 里 pool_ 的声明位置又在
-    // mtx_/bots_ 之前，意味着线程池 join 的时候那两个成员早就析构了，在途任务
-    // 一访问就是 use-after-free。
-    //
-    // 更实际的一面：退出前等在途订单落地，那笔成交才会被写进状态文件。否则
-    // 关窗口瞬间正在成交的单子本地无记录，只能靠下次启动对账去认领，
-    // 而认领会丢掉层数信息（按交易所均价重建成单层）。
+    // 任务可能借用引擎和界面对象，调用方须在销毁它们前排空线程池，
+    // 并在成交结果落地后保存断点。GUI/headless 统一通过 shutdown_pools 执行。
     //
     // timeout_ms 是兜底：一笔 HTTP 最长 15 秒，卡死的任务不该让关窗口变成假死。
     // 超时返回 false，调用方可以据此决定是否强退

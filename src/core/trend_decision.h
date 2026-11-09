@@ -66,6 +66,7 @@ enum class ReverseMode {
 enum class Direction { Both, LongOnly, ShortOnly };
 
 struct Config {
+    bool operator==(const Config&) const = default;
     following::Config following;
     Strategy strategy = Strategy::TrendFollowing;
     Direction direction = Direction::Both;

@@ -3,6 +3,39 @@
 #include <thread>
 
 static void test_audit_state_scenarios() {
+#ifdef _WIN32
+    {
+        const std::string locked_path = "audit_locked_checkpoint.json";
+        const std::filesystem::path native_path(locked_path);
+        auto before = mk_bot("BTCUSDT", trend::Pos::Long, 100, 111, 95, 1);
+        check(save_trend_state(locked_path, {before}).ok, "create checkpoint before Windows sharing test");
+        auto handle = CreateFileW(native_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(handle != INVALID_HANDLE_VALUE, "hold checkpoint without delete sharing");
+        if (handle != INVALID_HANDLE_VALUE) {
+            std::thread reader([handle] { Sleep(80); CloseHandle(handle); });
+            auto after = before; after.st.stop = 96;
+            const auto saved = save_trend_state(locked_path, {after}); reader.join();
+            const auto restored = load_trend_state(locked_path, {before.cfg});
+            check(saved.ok && restored.size() == 1 && restored[0].st.stop == 96,
+                  "short-lived Windows reader no longer fails a durable checkpoint save");
+        }
+        handle = CreateFileW(native_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(handle != INVALID_HANDLE_VALUE, "hold checkpoint for bounded failure test");
+        if (handle != INVALID_HANDLE_VALUE) {
+            const auto start = std::chrono::steady_clock::now();
+            const auto failed = save_trend_state(locked_path, {before});
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            CloseHandle(handle);
+            const auto restored = load_trend_state(locked_path, {before.cfg});
+            check(!failed.ok && !failed.error.empty() && elapsed < std::chrono::seconds(3) &&
+                  restored.size() == 1 && restored[0].st.stop == 96,
+                  "persistent Windows sharing denial returns failure and preserves the last checkpoint");
+        }
+        std::filesystem::remove(native_path);
+    }
+#endif
     const std::string path = "audit_state_test.json";
     auto initial = mk_bot("BTCUSDT", trend::Pos::Long,100,111,95,1);
     initial.ds_vanished_id = "77";

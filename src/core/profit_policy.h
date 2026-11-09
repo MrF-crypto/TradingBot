@@ -7,6 +7,7 @@
 namespace ccbot::profit {
 // Research defaults. The switches deliberately default to off.
 struct Config {
+    bool operator==(const Config&) const = default;
     bool protect = false, accumulate = false, wait_btc_up = true;
     double arm_usdt = 100, soft_drawdown = 0.20, hard_drawdown = 0.35;
     double weak_breadth = 0.45, breadth_drop = 0.15, recover_breadth = 0.60;

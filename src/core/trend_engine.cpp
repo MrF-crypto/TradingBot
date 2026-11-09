@@ -182,6 +182,8 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.bot_id  = "sar" + std::to_string(++seq_);
     if (snap.pending && !snap.rotation_reserved && snap.st.pos == trend::Pos::Flat) snap.open_uncertain = true;
     snap.rotation_reserved = false;
+    snap.leverage_retry_after = {};
+    snap.leverage_failure_noted = false;
     if (snap.open_uncertain) snap.state = TrendBot::State::Stopped;
     snap.pending = false;              // 落盘时的在途标记一律作废
     // 信号一律作废重拉：落盘的 ATR 可能是几小时前的，而止损线的距离由它决定。
@@ -1083,6 +1085,8 @@ const char* TrendEngine::reentry_block(const TrendBot& b, trend::Pos direction) 
 
 // 账户级闸门。返回空串 = 放行，否则给出拦截原因；调用方已持 mtx_。
 std::string TrendEngine::open_gate_block(const TrendBot& self, const TrendBot* releasing) const {
+    if (host_.now_steady() < self.leverage_retry_after)
+        return "杠杆尚未确认，等待30秒后重新评估";
     if (!persistence_errors_.empty())
         return "状态保存失败，暂停新开仓：" + persistence_errors_.begin()->first;
     for (const auto& [id, bot] : bots_)
@@ -1220,6 +1224,10 @@ void TrendEngine::tick(const std::string& symbol, double price) {
             b.current_price = price;
             b.price_time = host_.now_steady();
             if (b.pending)                         continue;
+            if (b.st.pos == trend::Pos::Flat && host_.now_steady() < b.leverage_retry_after) {
+                b.last_decision = "空仓 | 杠杆尚未确认，等待30秒后重新评估";
+                continue;
+            }
 
             // 信号新鲜度：过期的快照不参与【开新仓】。已持仓不受影响——
             // trend::step 在 atr<=0 时会沿用上一条止损线，保护不会因数据断流而撤销
@@ -1544,6 +1552,7 @@ void TrendEngine::submit_open(const std::string& id, trend::Pos dir, bool from_r
 void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_reverse) {
         try {
             TrendConfig cfg;
+            TrendConfig requested_cfg;
             // 这里不再需要 atr：v4.4.0 起 plan_qty 按【真实止损线】算等风险数量，
             // 而初始止损线在下面用 trend::initial_stop 直接算好（它自己取 si.atr）
             double price = 0, init_stop = 0;
@@ -1556,12 +1565,90 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
             double edge_up = 0, edge_dn = 0;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
+                const auto it = bots_.find(id);
+                if (it == bots_.end()) return;
+                requested_cfg = cfg = it->second.cfg;
+                rotation_open = rotation_.incoming == id;
+            }
+            // Called with mtx_ held, both after leverage confirmation and after
+            // quantity rounding (which may fetch exchange metadata over HTTP).
+            const auto entry_block = [&](const TrendBot& b) -> std::string {
+                if (!(b.cfg == requested_cfg)) return "等待期间配置已改变";
+                if (b.state != TrendBot::State::Running || b.retiring || b.st.pos != trend::Pos::Flat ||
+                    b.open_uncertain || !b.pending_close_key.empty()) return "当前状态不允许开仓";
+                if (!trend::allows(cfg.rule, dir)) return "当前配置不允许该方向";
+                if (const auto why = reentry_block(b, dir); *why) return why;
+                if (auto why = open_gate_block(b); !why.empty()) return why;
+                if (auto why = profit_entry_block(b, dir); !why.empty()) return why;
+                const auto quote_age = host_.now_steady() - b.price_time;
+                if (quote_age < std::chrono::steady_clock::duration::zero() || quote_age > std::chrono::seconds(15))
+                    return "下单前报价已过期，等待最新报价";
+                if (!rotation_open && cfg.rule.strategy == trend::Strategy::TrendFollowing &&
+                    (!from_reverse || cfg.rule.following.enabled)) {
+                    trend::Inputs si;
+                    si.price = b.current_price; si.atr = b.atr; si.dc_ok = b.dc_ok;
+                    si.dc_up = b.dc_up; si.dc_dn = b.dc_dn; si.following = b.following;
+                    si.box_atr = b.box_atr; si.vol_ratio = b.vol_ratio;
+                    si.er_ok = b.er_ok; si.er = b.er; si.range_pace = b.range_pace;
+                    si.bar_open_ms = b.bar_open_ms;
+                    const auto age = host_.now_steady() - b.sig_time;
+                    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
+                    const bool bar_current = !cfg.rule.following.enabled ||
+                        (b.bar_open_ms > 0 && now >= b.bar_open_ms && now - b.bar_open_ms <
+                         static_cast<int64_t>(TrendConfig::bar_seconds(cfg.interval)) * 1000);
+                    const bool signal = dir == trend::Pos::Long ? trend::entry_long(si, cfg.rule) : trend::entry_short(si, cfg.rule);
+                    if (!b.sig_ok || !trend::data_ready(si, cfg.rule) || !signal || trend::entry_block(si, cfg.rule, dir == trend::Pos::Long) ||
+                        trend::bar_already_used(b.st, cfg.rule, si) ||
+                        age < std::chrono::steady_clock::duration::zero() || age > std::chrono::seconds(cfg.effective_max_age_sec()) ||
+                        !bar_current || (cfg.rule.following.enabled && !(b.following.settings == b.signal_following_config())))
+                        return "下单前信号已改变或过期，等待重新评估";
+                }
+                return {};
+            };
+            // Margin limits depend on the actual exchange leverage. The client
+            // queries ambiguous outcomes and performs at most one setting retry.
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(id);
+                if (it == bots_.end()) return;
+                if (auto why = entry_block(it->second); !why.empty()) {
+                    it->second.pending = false;
+                    it->second.last_action = "开仓取消：" + why;
+                    return;
+                }
+            }
+            if (!client_->set_leverage(cfg.symbol, cfg.leverage)) {
+                const std::string why = client_->last_error();
+                bool say_it = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lk(mtx_);
+                    auto it = bots_.find(id);
+                    if (it != bots_.end()) {
+                        auto& b = it->second;
+                        b.pending = false;
+                        b.leverage_retry_after = host_.now_steady() + std::chrono::seconds(30);
+                        b.last_action = "目标杠杆未确认，30秒后重新评估";
+                        say_it = !b.leverage_failure_noted;
+                        b.leverage_failure_noted = true;
+                    }
+                }
+                if (say_it) log("⚠ " + cfg.symbol + " 杠杆未确认（目标 " + std::to_string(cfg.leverage) + "x" +
+                    (why.empty() ? std::string() : "：" + why) + "），本次不开仓，30秒后重新评估；持续失败不重复提示");
+                return;
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto it = bots_.find(id);
                 if (it == bots_.end()) return;
                 auto& b = it->second;
-                cfg   = b.cfg;
+                b.leverage_retry_after = {};
+                b.leverage_failure_noted = false;
+                if (auto why = entry_block(b); !why.empty()) {
+                    b.pending = false;
+                    b.last_action = "开仓取消：" + why;
+                    return;
+                }
                 price = b.current_price;
-                rotation_open = rotation_.incoming == id;
                 trend::Inputs confirmed;
                 if (rotation_open) {
                     const auto why = rotation_.opening ? rotation_entry_block(b, dir, rotation_.bar_ms, &confirmed)
@@ -1581,8 +1668,8 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                     if (rotation_open) { edge_up = confirmed.dc_up; edge_dn = confirmed.dc_dn; }
                     else if (b.dc_ok) { edge_up = b.dc_up; edge_dn = b.dc_dn; }
                 }
-                // 初始止损线在【持锁时】按当前快照算好带出去：下单是异步的，
-                // 等回来再算的话快照可能已经换了一根K线，止损线会和成交价错配
+                // Re-snapshot AFTER leverage recovery: do not size from the price,
+                // channel or ATR captured before a slow network confirmation.
                 trend::Inputs si;
                 si.price      = price;
                 si.atr        = rotation_open ? confirmed.atr : b.atr;
@@ -1591,23 +1678,6 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 si.psar_prev_high = b.psar_prev_high;
                 si.psar_prev_low  = b.psar_prev_low;
                 init_stop = trend::initial_stop(dir, price, cfg.rule, si);
-            }
-
-            // Margin limits use the configured leverage. If it cannot be confirmed,
-            // cancel this entry; an unknown exchange setting cannot satisfy that limit.
-            if (!client_->set_leverage(cfg.symbol, cfg.leverage)) {
-                const std::string why = client_->last_error();
-                {
-                    std::lock_guard<std::recursive_mutex> lk(mtx_);
-                    auto it = bots_.find(id);
-                    if (it != bots_.end()) {
-                        it->second.pending = false;
-                        it->second.last_action = "开仓取消：无法确认目标杠杆";
-                    }
-                }
-                log("⚠ " + cfg.symbol + " 杠杆设置失败（目标 " + std::to_string(cfg.leverage) + "x" +
-                    (why.empty() ? std::string() : "：" + why) + "），本次不开仓，等待重新确认");
-                return;
             }
 
             bool need_ds_sync = false;   // 成交后要不要挂灾难止损（派发在锁外）
@@ -1642,12 +1712,10 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 return;
             }
 
-            {
-                std::lock_guard<std::recursive_mutex> lk(mtx_);
-                auto it = bots_.find(id);
-                if (it == bots_.end()) return;
-                auto& b = it->second;
-                std::string why = reentry_block(b, dir);
+            // Metadata lookup and durable journal writes can both yield to newer
+            // signals or controls. Reuse the same final plan checks after each.
+            const auto planned_entry_block = [&](const TrendBot& b) -> std::string {
+                std::string why = entry_block(b);
                 if (why.empty() && rotation_open) {
                     trend::Inputs latest;
                     why = rotation_entry_block(b, dir, rotation_.bar_ms, &latest);
@@ -1658,39 +1726,33 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                         trend::initial_stop(dir, latest.price, b.cfg.rule, latest) != init_stop))
                         why = "换仓下单前信号或报价已改变";
                 }
-                if (why.empty()) why = open_gate_block(b);
-                const auto quote_age = host_.now_steady() - b.price_time;
-                if (why.empty() && (quote_age < std::chrono::steady_clock::duration::zero() ||
-                                    quote_age > std::chrono::seconds(15)))
-                    why = "下单前报价已过期，等待最新报价";
-                if (why.empty() && !rotation_open && b.signal_following_config().enabled) {
+                if (why.empty() && !rotation_open) {
                     trend::Inputs si;
-                    si.price = b.current_price; si.atr = b.atr; si.dc_ok = b.dc_ok;
-                    si.dc_up = b.dc_up; si.dc_dn = b.dc_dn; si.following = b.following;
-                    si.box_atr = b.box_atr; si.vol_ratio = b.vol_ratio;
-                    si.er_ok = b.er_ok; si.er = b.er; si.range_pace = b.range_pace;
-                    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(host_.now_wall().time_since_epoch()).count();
-                    const auto age = std::chrono::duration_cast<std::chrono::seconds>(host_.now_steady() - b.sig_time).count();
-                    const bool signal = dir == trend::Pos::Long ? trend::entry_long(si, cfg.rule) : trend::entry_short(si, cfg.rule);
-                    const char* blocked = trend::entry_block(si, cfg.rule, dir == trend::Pos::Long);
-                    if (!b.sig_ok || !signal || blocked || age > cfg.effective_max_age_sec() ||
-                        b.bar_open_ms <= 0 || now < b.bar_open_ms ||
-                        now - b.bar_open_ms >= static_cast<int64_t>(TrendConfig::bar_seconds(cfg.interval)) * 1000 ||
-                        std::fabs(si.price - price) > std::max(1e-9, price * risk_cost_rate_))
+                    si.atr = b.atr; si.swing_low = b.swing_low; si.swing_high = b.swing_high;
+                    si.psar_prev_high = b.psar_prev_high; si.psar_prev_low = b.psar_prev_low;
+                    if (std::fabs(b.current_price - price) > std::max(1e-9, price * risk_cost_rate_) ||
+                        trend::initial_stop(dir, price, cfg.rule, si) != init_stop)
                         why = "下单前信号或报价已改变，等待重新评估";
                 }
 
                 const double risk = qty * (std::fabs(price - init_stop) + price * risk_cost_rate_);
-                if (why.empty() && rotation_open && cfg.size_mode == TrendConfig::SizeMode::RiskBased &&
-                    risk > cfg.risk_usdt + 1e-9) why = "换仓下单前成本变化，超出单笔风险预算";
+                if (why.empty() && cfg.size_mode == TrendConfig::SizeMode::RiskBased &&
+                    risk > cfg.risk_usdt + 1e-9) why = "下单前成本变化，超出单笔风险预算";
                 if (why.empty()) why = risk_gate_block(b, dir, risk);
-                if (!why.empty() || b.state == TrendBot::State::Stopped || b.retiring) {
+                return why;
+            };
+            {
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto it = bots_.find(id);
+                if (it == bots_.end()) return;
+                auto& b = it->second;
+                if (auto why = planned_entry_block(b); !why.empty()) {
                     b.pending = false;
                     b.last_action = "开仓取消：" + why;
                     if (rotation_open) log(b.cfg.symbol + " 换仓" + b.last_action);
                     return;
                 }
-                b.reserved_risk = risk;
+                b.reserved_risk = qty * (std::fabs(price - init_stop) + price * risk_cost_rate_);
                 b.reserved_margin = qty * price / std::max(1, cfg.leverage);
                 b.reserved_dir = dir;
                 b.uncertain_stop = init_stop;
@@ -1709,9 +1771,27 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 auto& b = bots_.at(id); b.pending = false; b.reserved_risk = b.reserved_margin = 0;
                 b.reserved_dir = trend::Pos::Flat; b.last_action = "利润归集处理中或账本未就绪，暂停新增风险"; return;
             }
+            std::string canceled;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
-                auto& b = bots_.at(id); b.uncertain_client_id = execution.key; b.open_ms = execution.at_ms;
+                auto& b = bots_.at(id);
+                canceled = planned_entry_block(b);
+                if (canceled.empty()) {
+                    b.reserved_risk = qty * (std::fabs(price - init_stop) + price * risk_cost_rate_);
+                    b.uncertain_client_id = execution.key; b.open_ms = execution.at_ms;
+                }
+            }
+            if (!canceled.empty()) {
+                // The intent is durable, but no order was sent. Complete that same
+                // intent as canceled so restart/settlement won't search for a phantom order.
+                execution.completed = true; execution.result.error = "发送前取消：" + canceled;
+                if (!record_execution(execution)) set_persistence_error("profit", "取消开仓账本写入失败");
+                std::lock_guard<std::recursive_mutex> lk(mtx_);
+                auto& b = bots_.at(id);
+                b.pending = false; b.reserved_risk = b.reserved_margin = b.uncertain_stop = 0;
+                b.reserved_dir = trend::Pos::Flat; b.uncertain_client_id.clear();
+                b.last_action = "开仓取消：" + canceled;
+                return;
             }
             auto r = client_->place_tagged_order(cfg.symbol, side_of(dir, false), qty, false, execution.key);
             require_execution_price(r);

@@ -38,7 +38,7 @@ inline SaveResult write_atomic_file(const std::string& filename, std::string_vie
     const auto fail = [&](const std::string& operation, const std::error_code& error) {
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
-        return SaveResult{false, operation + ": " + error.message()};
+        return SaveResult{false, operation + " [" + std::to_string(error.value()) + "]: " + error.message()};
     };
 #ifdef _WIN32
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
@@ -62,8 +62,16 @@ inline SaveResult write_atomic_file(const std::string& filename, std::string_vie
         return fail("同步断点", error);
     }
     CloseHandle(file);
-    if (!MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        return fail("替换断点", std::error_code(GetLastError(), std::system_category()));
+    // A reader without FILE_SHARE_DELETE can briefly block replacement (for
+    // example an indexer). Retry ONLY the rename of this already-flushed file.
+    // Never truncate/delete the previous checkpoint, and bound total delay to 310ms.
+    for (int attempt = 0; ; ++attempt) {
+        if (MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) break;
+        const DWORD error = GetLastError();
+        if (attempt == 5 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED))
+            return fail("替换断点", std::error_code(error, std::system_category()));
+        Sleep(static_cast<DWORD>(10u << attempt));
+    }
 #else
     const int file = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (file < 0) return {false, "创建临时文件: " + std::error_code(errno, std::generic_category()).message()};

@@ -506,7 +506,8 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
     return r;
 }
 
-std::string TradingClient::http_get(const std::string& path, std::string params) {
+std::string TradingClient::http_get(const std::string& path, std::string params,
+                                  long* out_code, int max_attempts) {
     tl_net_err.clear();
     std::string resp, rhdr;
     const std::string base_params = params;
@@ -524,7 +525,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
     // 重试要【重新过闸、重新签名】：时间戳必须是新的
     std::unique_lock<std::mutex> lk;
     CurlSlot* slot = nullptr;
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
         gate_->acquire(false);
         params = base_params;
         if (!params.empty()) {
@@ -537,7 +538,8 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
             FakeReply fr;
             if (test_hook_("GET", path, params, fr)) {
                 gate_->observe(fr.code, fr.headers, fr.body);
-                tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
+                tl_net_err = describe_net(fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK, fr.code, fr.body);
+                if (out_code) *out_code = fr.code;
                 return fr.body;
             }
         }
@@ -556,13 +558,14 @@ std::string TradingClient::http_get(const std::string& path, std::string params)
         long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
         gate_->observe(code, rhdr, resp);
         tl_net_err = describe_net(rc, code, resp);
+        if (out_code) *out_code = code;
         if (!transient_net(rc, code)) break;
     }
     return resp;
 }
 
 std::string TradingClient::http_post(const std::string& path, std::string params,
-                                     long* out_code) {
+                                     long* out_code, bool* out_transient) {
     tl_net_err.clear();
     const bool spot = path.rfind("/api/", 0) == 0 || path.rfind("/sapi/", 0) == 0;
     std::string url = (spot ? (cfg_.testnet ? std::string("https://testnet.binance.vision") : std::string("https://api.binance.com")) : base_) + path;
@@ -589,8 +592,10 @@ std::string TradingClient::http_post(const std::string& path, std::string params
         FakeReply fr;
         if (test_hook_("POST", path, params, fr)) {
             gate_->observe(fr.code, fr.headers, fr.body);
-            tl_net_err = describe_net(CURLE_OK, fr.code, fr.body);
+            const auto rc = fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK;
+            tl_net_err = describe_net(rc, fr.code, fr.body);
             if (out_code) *out_code = fr.code;
+            if (out_transient) *out_transient = transient_net(rc, fr.code);
             return fr.body;
         }
     }
@@ -609,6 +614,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     gate_->observe(code, rhdr, resp);
     tl_net_err = describe_net(rc, code, resp);
     if (out_code) *out_code = code;
+    if (out_transient) *out_transient = transient_net(rc, code);
     return resp;
 }
 
@@ -1102,23 +1108,76 @@ bool TradingClient::fetch_position_mode(bool* ok) {
 // ——"拉取失败当成确实没有"。v5.9.3 正是用这条理由删掉了 close_position，漏了它。
 // 埋着已知缺陷的死代码比没有代码更糟：下一个要"全平"的人会找到它并继承这个 bug。
 bool TradingClient::set_leverage(const std::string& sym, int lev) {
-    // Reconfirm each entry: another client may have changed leverage since the last one.
-    auto resp = http_post(ep(Ep::Leverage),
-        "symbol=" + url::encode(sym) + "&leverage=" + std::to_string(lev));
-    simdjson::dom::parser p;
-    simdjson::dom::element doc;
-    auto ps = simdjson::padded_string(resp);
-    if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
-        tl_net_err = net_why(tl_net_err);   // 网络层的原因已经在里面
-        return false;
+    if (sym.empty() || lev <= 0) { tl_net_err = "目标杠杆参数无效"; return false; }
+    // No cache: another client can change leverage between entries. Only this
+    // idempotent setting may be retried; market-order POSTs must never be replayed.
+    const std::string symbol_param = "symbol=" + url::encode(sym);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        long code = 0;
+        bool transient = false;
+        auto resp = http_post(ep(Ep::Leverage), symbol_param + "&leverage=" + std::to_string(lev),
+                              &code, &transient);
+        simdjson::dom::parser p;
+        simdjson::dom::element doc;
+        auto ps = simdjson::padded_string(resp);
+        const bool parsed = p.parse(ps).get(doc) == simdjson::SUCCESS;
+        const bool transport_ok = tl_net_err.empty() && code == 200;
+        // Explicit business rejection (including auth/limits) is not repaired by
+        // repeatedly sending the same setting. Unknown-result/system errors need a read-back.
+        int64_t error_code = 0;
+        if (parsed && doc["code"].get(error_code) == simdjson::SUCCESS && error_code < 0) {
+            binance_error(doc, tl_net_err);
+            if (error_code != -1007 && error_code != -1006 && error_code != -1001 && error_code != -1000) return false;
+            transient = true;
+        } else if (transport_ok && parsed) {
+            double confirmed = 0;
+            std::string_view symbol;
+            if (doc["symbol"].get(symbol) == simdjson::SUCCESS && symbol == sym &&
+                order_decimal(doc, "leverage", confirmed) && confirmed == lev) return true;
+            tl_net_err = "交易所未确认目标杠杆";
+        }
+        if (!transient || (code >= 400 && code < 500)) {
+            if (tl_net_err.empty()) tl_net_err = "交易所未确认目标杠杆";
+            return false;
+        }
+        const std::string set_error = net_why(tl_net_err);
+
+        // Query before retrying: a timeout may have happened AFTER the change.
+        // Read raw positionRisk rows, including flat positions. fetch_positions()
+        // filters those out, and v3 omits leverage. Both Futures and PM expose v2/v1.
+        long query_code = 0;
+        auto query = http_get(ep(Ep::PositionRisk), symbol_param + "&recvWindow=5000", &query_code, 1);
+        simdjson::dom::parser qp;
+        simdjson::dom::element qdoc;
+        auto qs = simdjson::padded_string(query);
+        bool confirmed = false;
+        if (query_code == 200 && tl_net_err.empty() && qp.parse(qs).get(qdoc) == simdjson::SUCCESS) {
+            simdjson::dom::array rows;
+            if (qdoc.get_array().get(rows) == simdjson::SUCCESS) {
+                bool found = false, valid = true;
+                for (auto row : rows) {
+                    std::string_view symbol;
+                    double actual = 0;
+                    if (row["symbol"].get(symbol) != simdjson::SUCCESS) { valid = false; break; }
+                    if (symbol != sym) continue;
+                    found = true;
+                    if (!order_decimal(row, "leverage", actual) || actual != lev) { valid = false; break; }
+                }
+                confirmed = found && valid; // hedge sides must agree; empty/missing is not evidence
+            }
+        }
+        if (confirmed) { tl_net_err.clear(); return true; }
+        // Do not retry through a ban, authentication failure or other explicit 4xx.
+        if (query_code >= 400 && query_code < 500) {
+            tl_net_err = "杠杆查询被拒绝（HTTP " + std::to_string(query_code) + "）";
+            return false;
+        }
+        const std::string query_error = tl_net_err.empty() ? "未查到一致的目标倍数" : tl_net_err;
+        tl_net_err = "设置：" + set_error + "；查询：" + query_error +
+                     (attempt == 1 ? "；有限重试已用尽" : "");
+        if (attempt == 0 && !test_hook_) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    if (binance_error(doc, tl_net_err)) return false;
-    int64_t confirmed = 0;
-    if (doc["leverage"].get(confirmed) != simdjson::SUCCESS || confirmed != lev) {
-        tl_net_err = "交易所未确认目标杠杆";
-        return false;
-    }
-    return true;
+    return false;
 }
 
 ITradingClient::CloseVerification TradingClient::verify_close(
@@ -1627,15 +1686,6 @@ std::vector<TradingClient::Bar> TradingClient::fetch_klines(
     return out;
 }
 
-// fetch_indicators（BOLL+RSI）、fetch_trend（EMA200 趋势态）与它们共用的
-// closes_of 随网格DCA 一并删除：那三样只服务 DCA 的首单信号与趋势过滤，
-// v5.0.0 删掉 DCA 之后就是零调用者了。
-//
-// ⚠ 删它们的时候踩了个坑，记下来：这两个死函数在文件里【不相邻】，中间夹着
-//   下面这三个还在用的（trend_signal / atr / bar_pattern）。按行号一整段切会
-//   把中间那三个一起带走，而且编译期发现不了——是链接期才报未解析符号。
-//   删函数要逐个定边界，别信"它们看起来是连在一起的"。
-
 // K线周期 → 秒（"5m" / "1h" / "4h" / "1d" / "1w"）。认不出返回 0（不折算量比）
 static int interval_seconds(const std::string& iv) {
     if (iv.size() < 2) return 0;
@@ -1787,9 +1837,6 @@ TradingClient::TrendSnapshot TradingClient::fetch_trend_signal(
     if (!out.ok) out.error = "当前K线指标未就绪或已跨周期，等待下一次刷新";
     return out;
 }
-
-// fetch_atr 删于 v5.9.9：零调用者。它自己的注释写着"DCA 的 ATR 移动止损用"，
-// 而网格 DCA 在 v4.7.1 就整体移除了。趋势策略的 ATR 走 fetch_trend_signal。
 
 TradingClient::BarSnapshot TradingClient::fetch_bar_pattern(
         const std::string& sym, const std::string& interval, int swing_bars) {
