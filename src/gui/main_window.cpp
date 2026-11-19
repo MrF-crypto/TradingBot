@@ -1,4 +1,5 @@
 #include "gui/main_window.h"
+#include "gui/trade_history.h"
 #include "version.h"
 #include "core/key_store.h"
 #include "core/app_logic.h"
@@ -27,6 +28,8 @@
 #include <QScrollBar>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QStatusBar>
 #include <QMenu>
 #include <QAction>
 #include <QListWidgetItem>
@@ -354,9 +357,7 @@ void MainWindow::load_settings() {
 static qint64 tp_to_ms(std::chrono::system_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
 }
-static std::chrono::system_clock::time_point ms_to_tp(qint64 ms) {
-    return std::chrono::system_clock::time_point(std::chrono::milliseconds(ms));
-}
+
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -384,36 +385,12 @@ void MainWindow::save_trades(bool force) {
         }
         lastTradeSaveMs_ = now;
     }
-    tradesDirty_ = false;
-
     QJsonArray arr;
-    for (const auto& t : trades_) {
-        QJsonObject o;
-        o["symbol"]      = QString::fromStdString(t.symbol);
-        // "side" 而不是原来的 "direction"：值域也变了（0=Flat 1=Long 2=Short，
-        // 来自 trend::Pos），沿用旧键名会让老文件的 0/1/2 被按新含义读出来——
-        // 多空显示整体错位。换个键名，老值自然落到 read 的默认分支上
-        o["side"]        = (int)t.side;
-        o["entry_price"] = t.entry_price;
-        o["exit_price"]  = t.exit_price;
-        o["qty"]         = t.qty;
-        o["pnl"]         = t.pnl;
-        o["reversed"]    = t.reversed;
-        o["reason"]      = QString::fromStdString(t.reason);
-        o["close_time_ms"] = tp_to_ms(t.close_time);
-        // 浮盈亏最高 / 最低。NaN 不写（JSON 里没有 NaN），读回来缺键即 NaN
-        auto put = [&o](const char* k, double v) { if (std::isfinite(v)) o[k] = v; };
-        put("mfe_usd", t.mfe_usd); put("mae_usd", t.mae_usd);
-        put("mfe_pct", t.mfe_pct); put("mae_pct", t.mae_pct);
-        put("mfe_atr", t.mfe_atr); put("mae_atr", t.mae_atr);
-        put("mfe_r",   t.mfe_r);   put("mae_r",   t.mae_r);
-        arr.append(o);
-    }
+    for (const auto& t : trades_) arr.append(trade_history_json(t));
     QSaveFile f(QString::fromStdString(trade_path()));   // 原子保存，崩溃不损坏交易明细
-    if (f.open(QIODevice::WriteOnly)) {
-        f.write(QJsonDocument(arr).toJson());
-        f.commit();
-    }
+    const auto bytes = QJsonDocument(arr).toJson();
+    tradesDirty_ = !f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size() || !f.commit();
+    if (tradesDirty_) statusBar()->showMessage("交易明细保存失败，将重试：" + f.errorString());
 }
 
 void MainWindow::load_trades() {
@@ -422,32 +399,7 @@ void MainWindow::load_trades() {
     auto doc = QJsonDocument::fromJson(f.readAll());
     if (!doc.isArray()) return;
     trades_.clear();
-    for (const auto& v : doc.array()) {
-        auto o = v.toObject();
-        TrendTrade t;
-        t.symbol      = o["symbol"].toString().toStdString();
-        // 老文件（网格DCA 时代）只有 "direction"，没有 "side"。这里刻意【不去
-        // 迁移】那个值：两者值域不同（0/1/2 分别是 Long/Short/Both 与
-        // Flat/Long/Short），硬翻译只会把历史记录的多空标错。缺 side 时落到
-        // Flat，界面显示为 "--"——"不知道"比"标错"好
-        t.side        = (trend::Pos)o["side"].toInt((int)trend::Pos::Flat);
-        t.entry_price = o["entry_price"].toDouble();
-        t.exit_price  = o["exit_price"].toDouble();
-        t.qty         = o["qty"].toDouble();
-        t.pnl         = o["pnl"].toDouble();
-        t.reversed    = o["reversed"].toBool(false);
-        t.reason      = o["reason"].toString().toStdString();
-        t.close_time  = ms_to_tp((qint64)o["close_time_ms"].toDouble());
-        // 老记录没有这几个键：保持 NaN，界面显示 "--"
-        auto get = [&o](const char* k) {
-            return o.contains(k) ? o[k].toDouble() : std::numeric_limits<double>::quiet_NaN();
-        };
-        t.mfe_usd = get("mfe_usd"); t.mae_usd = get("mae_usd");
-        t.mfe_pct = get("mfe_pct"); t.mae_pct = get("mae_pct");
-        t.mfe_atr = get("mfe_atr"); t.mae_atr = get("mae_atr");
-        t.mfe_r   = get("mfe_r");   t.mae_r   = get("mae_r");
-        trades_.push_back(t);
-    }
+    for (const auto& v : doc.array()) trades_.push_back(read_trade_history_json(v.toObject()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,9 +589,9 @@ void MainWindow::openTradeHistoryDialog() {
     histTitle->setStyleSheet("color:#58a6ff;font-size:11px;font-weight:bold;padding-top:6px;");
     dv->addWidget(histTitle);
 
-    auto* table = new QTableWidget(0, 13);
+    auto* table = new QTableWidget(0, 14);
     table->setHorizontalHeaderLabels(
-        {"时间","品种","方向","开仓价","平仓价","数量","毛盈亏","浮盈亏最高","浮盈亏最低","反手","原因","预估手续费","预估净盈亏"});
+        {"时间","品种","方向","开仓价","平仓成交均价","数量","毛盈亏","浮盈亏最高","浮盈亏最低","反手","平仓规则","预估手续费","预估净盈亏","触发行情价"});
     table->horizontalHeaderItem(6)->setToolTip("按已确认成交均价计算，未扣手续费和资金费；历史记录保持原值。");
     table->horizontalHeaderItem(11)->setToolTip("按开平仓成交额和固定估算费率计算，与导出 CSV 一致。");
     table->horizontalHeaderItem(12)->setToolTip("毛盈亏减预估手续费，不含资金费；实际成交费用与资金费以利润账本结算为准。");
@@ -649,10 +601,20 @@ void MainWindow::openTradeHistoryDialog() {
     table->horizontalHeaderItem(8)->setToolTip(
         "持仓期间浮盈亏最差的那一刻。开仓那一刻是 0，所以不会是正数。\n"
         "赚钱的单子最低也到过 -1R 附近 = 止损放得刚好；远没到 = 止损可以收紧。悬停看 R / ATR 倍数");
-    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    auto* header = table->horizontalHeader();
+    header->setSectionResizeMode(QHeaderView::Interactive);
+    header->resizeSection(0, 130);
+    header->resizeSection(2, 48);
+    header->resizeSection(9, 44);
+    header->resizeSection(10, 160);
+    header->moveSection(header->visualIndex(10), 3);
+    header->moveSection(header->visualIndex(13), 4);
+    header->moveSection(header->visualIndex(4), 5);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
     table->verticalHeader()->setVisible(false);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    dv->addWidget(table);
+    dv->addWidget(table, 2);
 
     table->setRowCount((int)history.size());
     for (int i = 0; i < (int)history.size(); ++i) {
@@ -670,7 +632,7 @@ void MainWindow::openTradeHistoryDialog() {
                                   : t.side == trend::Pos::Long ? QColor("#3fb950")
                                                              : QColor("#8b949e")));
         table->setItem(i, 3, mkc("$" + QString::number(t.entry_price, 'g', 12), QColor("#8b949e")));
-        table->setItem(i, 4, mkc("$" + QString::number(t.exit_price, 'g', 12), QColor("#8b949e")));
+        table->setItem(i, 4, mkc(QString::fromStdString(exit_fill_text(t.exit_price, t.reason)), QColor("#8b949e")));
         table->setItem(i, 5, mkc(QString::number(t.qty, 'f', 4), QColor("#8b949e")));
         table->setItem(i, 6, mkc(QString("%1$%2").arg(t.pnl >= 0 ? "+" : "-").arg(std::abs(t.pnl), 0, 'f', 2),
                                   t.pnl >= 0 ? QColor("#3fb950") : QColor("#f85149")));
@@ -698,10 +660,33 @@ void MainWindow::openTradeHistoryDialog() {
         table->setItem(i, 8, excursion(t.mae_usd, t.mae_pct, t.mae_atr, t.mae_r, "最低"));
         table->setItem(i, 9, mkc(t.reversed ? "是" : "--",
                                   t.reversed ? QColor("#d29922") : QColor("#8b949e")));
-        table->setItem(i, 10, mkc(QString::fromStdString(t.reason), QColor("#8b949e")));
+        table->setItem(i, 10, mkc(QString::fromStdString(exit_rule_label(t.exit_evidence, t.reason)), QColor("#e6edf3")));
+        table->setItem(i, 13, mkc(QString::fromStdString(exit_price_text(t.exit_evidence.trigger_price)), QColor("#8b949e")));
     }
 
+    auto* detail = new QLabel(&dlg);
+    detail->setTextFormat(Qt::PlainText);
+    detail->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    detail->setWordWrap(true);
+    dv->addWidget(detail);
+    connect(table, &QTableWidget::currentCellChanged, &dlg, [detail, &history](int selected, int, int, int) {
+        if (selected < 0 || selected >= static_cast<int>(history.size())) { detail->clear(); return; }
+        detail->setText(trade_history_details(history[history.size() - 1 - selected]));
+    });
+    if (!history.empty()) table->setCurrentCell(0, 0);
+
     auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Close);
+    auto* exportButton = btnBox->addButton("导出交易明细 CSV", QDialogButtonBox::ActionRole);
+    exportButton->setEnabled(!history.empty());
+    connect(exportButton, &QPushButton::clicked, &dlg, [&] {
+        const QString path = QFileDialog::getSaveFileName(&dlg, "导出交易明细",
+            "TradingBot-trades-" + QDate::currentDate().toString("yyyyMMdd") + ".csv", "CSV (*.csv)");
+        if (path.isEmpty()) return;
+        QSaveFile file(path);
+        const auto bytes = QByteArray::fromHex("efbbbf") + trade_history_csv(history);
+        if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
+            QMessageBox::warning(&dlg, "导出失败", file.errorString());
+    });
     dv->addWidget(btnBox);
     connect(btnBox, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     connect(btnBox, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -1323,11 +1308,6 @@ void MainWindow::onConnect() {
             });
             // 失败原因（超时 / 连接中断 / 返回的不是 JSON……）拼进那条日志
             ticker_->on_fetch_error([this]() { return client_ ? client_->last_error() : std::string(); });
-            ticker_->start();
-
-            slowTickCount_  = 0;   // 保证"首tick立即对账/对时"在（罕见的）重连后依然成立
-            tick_timer_->start();
-
             log(QString("连接成功 | %1 | 权益 $%2 | 可用 $%3%4")
                 .arg(connNetName_)
                 .arg(info.total_equity, 0, 'f', 2)
@@ -1339,8 +1319,6 @@ void MainWindow::onConnect() {
             // 恢复上次保存的 Bot
             load_and_restore_trend();
             if (trendStateBlocked_) {
-                tick_timer_->stop();
-                ticker_->stop();
                 trend_engine_.reset();
                 setConnState(ConnState::Failed);
                 return;
@@ -1348,6 +1326,9 @@ void MainWindow::onConnect() {
             // 智能模式：运行器持有引擎指针，随引擎一起重建
             startSmartRunner();
             save_trend_bots(); // 首次入场前验证断点可写；失败仅暂停新增风险。
+            ticker_->start();
+            slowTickCount_ = 0;
+            tick_timer_->start();
             funding_.load(funding_path());   // 资金费账本（品种级，与 bot 生命周期无关）
 
             // 启动对账：本地跟踪的仓位 vs 交易所实际持仓。外部手动平过仓/强平过的话，
@@ -2025,14 +2006,15 @@ void MainWindow::onTick() {
     //   于是白撤白挂一轮 —— 又是"没拿到当成没有"那个老毛病
     if (slowTickCount_ % 20 == 0 && trend_engine_ && client_ &&
         !stopOrderCheckBusy_.exchange(true)) {
-        run_async([this]() {
+        run_async([this, engine = trend_engine_, client = client_]() {
+            auto expected = engine->capture_stop_orders();
             bool ok = false;
-            auto live = client_->fetch_open_algo_ids(&ok);
+            auto live = client->fetch_open_algo_ids(&ok);
             stopOrderCheckBusy_.store(false);
             if (!ok) return;            // 这一轮不核对，下一分钟再来
-            QMetaObject::invokeMethod(this, [this, live = std::move(live)]() {
-                if (!trend_engine_) return;
-                auto issues = trend_engine_->reconcile_stop_orders(live);
+            QMetaObject::invokeMethod(this, [this, engine, client, expected = std::move(expected), live = std::move(live)]() {
+                if (trend_engine_ != engine || client_ != client) return;
+                auto issues = engine->reconcile_stop_orders(expected, live);
                 if (issues.empty()) return;
                 for (const auto& i : issues)
                     log("保护单核对: " + QString::fromStdString(i), "WARN");

@@ -1,4 +1,5 @@
 #include "net/trading_client.h"
+#include "core/client_order_id.h"
 #include "net/rate_gate.h"
 #include "net/url_encoding.h"
 #include "core/indicators.h"
@@ -661,11 +662,16 @@ static double parse_dbl_str_opt(simdjson::dom::element obj, const char* key, boo
     std::string_view v;
     if (obj[key].get(v) == simdjson::SUCCESS) {
         if (v.empty()) return 0.0;
-        try { double d = std::stod(std::string(v)); found = true; return d; }
+        try {
+            size_t used = 0;
+            const double d = std::stod(std::string(v), &used);
+            found = used == v.size() && std::isfinite(d);
+            return found ? d : 0.0;
+        }
         catch (...) { return 0.0; }
     }
     double d = 0;
-    if (obj[key].get(d) == simdjson::SUCCESS) { found = true; return d; }
+    if (obj[key].get(d) == simdjson::SUCCESS && std::isfinite(d)) { found = true; return d; }
     return 0.0;
 }
 
@@ -675,7 +681,8 @@ TradingClient::AccountInfo TradingClient::fetch_account() {
 
 TradingClient::AccountInfo TradingClient::fetch_account_futures() {
     AccountInfo info;
-    auto resp = http_get(ep(Ep::Account), "recvWindow=5000");
+    long status = 0;
+    auto resp = http_get(ep(Ep::Account), "recvWindow=5000", &status);
     if (resp.empty()) { info.error = "无响应（" + net_why(last_error()) + "）"; return info; }
 
     simdjson::dom::parser p;
@@ -688,7 +695,8 @@ TradingClient::AccountInfo TradingClient::fetch_account_futures() {
     if (binance_error(doc, info.error)) return info;
 
     info.total_equity   = parse_dbl_str(doc, "totalMarginBalance");
-    info.available      = parse_dbl_str(doc, "availableBalance");
+    info.available      = parse_dbl_str_opt(doc, "availableBalance", info.available_verified);
+    info.available_verified = info.available_verified && status == 200;
     info.unrealized_pnl = parse_dbl_str(doc, "totalUnrealizedProfit");
     info.ok = true;
     return info;
@@ -704,7 +712,8 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
     simdjson::dom::parser p1, p2;
 
     // ① UM 子账户：未实现盈亏，以及 totalAvailableBalance 缺失时的兜底
-    auto um_resp = http_get(ep(Ep::Account), "recvWindow=5000");
+    long um_status = 0;
+    auto um_resp = http_get(ep(Ep::Account), "recvWindow=5000", &um_status);
     if (um_resp.empty()) {
         info.error = "统一账户无响应（papi，" + net_why(last_error()) + "）";
         return info;
@@ -743,7 +752,8 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
     }
 
     // ② 全账户：uniMMR + 权益 + 可用
-    auto acc_resp = http_get(ep(Ep::PmAccount), "recvWindow=5000");
+    long acc_status = 0;
+    auto acc_resp = http_get(ep(Ep::PmAccount), "recvWindow=5000", &acc_status);
     double pm_equity = 0, pm_avail = 0;
     bool has_pm_eq = false, has_pm_av = false;
     if (!acc_resp.empty()) {
@@ -761,6 +771,7 @@ TradingClient::AccountInfo TradingClient::fetch_account_pm() {
 
     info.total_equity = has_pm_eq ? pm_equity : um_equity;
     info.available    = has_pm_av ? pm_avail  : um_avail;
+    info.available_verified = has_pm_av ? acc_status == 200 : has_um_av && um_status == 200;
 
     // 两个接口都没给出权益 —— 宁可报连接失败，也不要在界面上显示"权益 $0"：
     // 那会让人以为账户是空的，或者误判风控还有多少余量
@@ -842,26 +853,6 @@ static std::string pos_side_param(bool dual, const std::string& side, bool reduc
     return "&positionSide=" + std::string(is_long_side ? "LONG" : "SHORT");
 }
 
-// 生成本程序专属的 clientOrderId（幂等性标识）：cb-<运行码>-<序号>。
-// 运行码 = 启动时刻毫秒时间戳的36进制（跨重启天然唯一）+ 2位随机（防同毫秒双进程）。
-// 若跨重启碰撞，超时查单恢复会按 origClientOrderId 查到【历史订单】的成交并错误入账，
-// 所以唯一性不是洁癖，是记账正确性的前提
-static std::string make_client_order_id() {
-    static const std::string run_tag = [] {
-        auto ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        static const char cs[] = "0123456789abcdefghijklmnopqrstuvwxyz";
-        std::string s;
-        for (uint64_t v = ms; v > 0; v /= 36) s += cs[v % 36];
-        std::srand((unsigned)(ms ^ (ms >> 17)));
-        s += cs[std::rand() % 36];
-        s += cs[std::rand() % 36];
-        return s;
-    }();
-    static std::atomic<int> seq{0};
-    return "cb-" + run_tag + "-" + std::to_string(seq++);
-}
-
 TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
                                                        const std::string& client_order_id) {
     OrderResult r;
@@ -883,14 +874,26 @@ TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
         // 只有 -2013（订单不存在）是"确认没到交易所"的可靠答案；其他业务错误
         // （-1021时间戳超窗/-1003限流/-1022签名…）说明【查询本身】没成功，
         // 订单状态依然未知——绝不能让恢复路径误判为"确认未成交"然后放行重试
-        r.uncertain = (r.error.find("[-2013]") == std::string::npos);
-        r.terminal = !r.uncertain;
+        int64_t code = 0;
+        r.not_found = doc["code"].get(code) == simdjson::SUCCESS && code == -2013;
+        r.uncertain = !r.not_found;
+        r.terminal = r.not_found;
         return r;
     }
 
     int64_t oid = 0;
-    get_or_keep(doc["orderId"], oid);
-    r.order_id     = std::to_string(oid);
+    auto matches = [&](const char* key, const std::string& expected) {
+        std::string_view echoed;
+        const auto err = doc[key].get(echoed);
+        return err == simdjson::NO_SUCH_FIELD || (err == simdjson::SUCCESS && echoed == expected);
+    };
+    if (!get_or_keep(doc["orderId"], oid) || oid <= 0 || !matches("symbol", sym) ||
+        !matches("clientOrderId", client_order_id)) {
+        r.uncertain = true;
+        r.error = "查单回执与原订单不匹配，等待核对";
+        return r;
+    }
+    r.order_id = std::to_string(oid);
     const bool execution_known = order_execution(doc, r.executed_qty, r.avg_price);
     std::string_view status;
     if (doc["status"].get(status) == simdjson::SUCCESS)
@@ -1233,6 +1236,9 @@ ITradingClient::CloseVerification TradingClient::verify_close(
     result.protective_fill.order_id = std::to_string(order_id);
     result.protective_fill.avg_price = price;
     result.protective_fill.executed_qty = qty;
+    bool threshold_known = false;
+    const double threshold = parse_dbl_str_opt(algo, "triggerPrice", threshold_known);
+    if (threshold_known && std::isfinite(threshold) && threshold > 0) result.threshold_price = threshold;
     return result;
 }
 
@@ -1609,13 +1615,15 @@ bool TradingClient::cancel_disaster_stop(const std::string& sym,
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
-    std::string err;
-    if (binance_error(doc, err)) {
-        // -2011 Unknown order：单子已经不在了（已触发/已被交易所自动撤销），
-        // 对调用方而言目的已达成，算成功——否则会陷入无意义的重试
-        return err.find("-2011") != std::string::npos;
-    }
-    return true;
+    int64_t code = 0;
+    std::string_view code_str;
+    if (get_or_keep(doc["code"], code)) return code == 200 || code == -2011;
+    if (get_or_keep(doc["code"], code_str)) return code_str == "200" || code_str == "-2011";
+    int64_t id = 0;
+    std::string_view status;
+    return get_or_keep(doc["algoId"], id) && std::to_string(id) == order_id &&
+           get_or_keep(doc["algoStatus"], status) &&
+           (status == "CANCELED" || status == "FINISHED" || status == "EXPIRED");
 }
 
 // ── K线拉取+解析（统一入口）─────────────────────────────────────────────────
@@ -1948,8 +1956,9 @@ double sv_num(simdjson::dom::element e, const char* k) {
 }
 } // namespace
 
-std::vector<TradingClient::MarketSymbol> TradingClient::fetch_exchange_symbols(bool* ok) {
+std::vector<TradingClient::MarketSymbol> TradingClient::fetch_exchange_symbols(bool* ok, bool* complete) {
     if (ok) *ok = false;
+    if (complete) *complete = false;
     std::vector<MarketSymbol> out;
     auto resp = http_get_public("/fapi/v1/exchangeInfo");
     if (resp.empty()) return out;
@@ -1982,6 +1991,10 @@ std::vector<TradingClient::MarketSymbol> TradingClient::fetch_exchange_symbols(b
         out.push_back(std::move(m));
     }
     if (ok) *ok = !out.empty();
+    if (complete) *complete = !out.empty() && out.size() == arr.size() &&
+        std::all_of(out.begin(), out.end(), [](const auto& m) {
+            return !m.quote.empty() && !m.contract_type.empty() && !m.status.empty();
+        });
     return out;
 }
 
@@ -2090,8 +2103,10 @@ std::set<std::string> TradingClient::fetch_open_algo_ids(bool* ok) {
     if (ok) *ok = false;
     // 不带 symbol ⇒ 返回全部品种（权重 40）。一次拿全比逐品种查省往返，
     // 而这个核对每分钟才做一次，40 的权重完全吃得下
-    auto resp = http_get(ep(Ep::AlgoOpenOrders), "recvWindow=5000");
-    if (resp.empty()) return out;
+    long status = 0;
+    bool transient = false;
+    auto resp = http_get(ep(Ep::AlgoOpenOrders), "recvWindow=5000", &status, 2, &transient);
+    if (status != 200 || transient || resp.empty()) return out;
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;

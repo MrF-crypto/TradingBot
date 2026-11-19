@@ -22,7 +22,7 @@ struct FakeClient : ITradingClient {
     int closes = 0, opens = 0;
     OrderOutcome place_market_order(const std::string&, const std::string&, double qty, bool reduce) override {
         if (reduce) ++closes; else ++opens;
-        OrderOutcome r; r.ok = true; r.order_id = "1"; r.executed_qty = qty; r.avg_price = 100; return r;
+        OrderOutcome r; r.ok = true; r.order_id = std::to_string(closes + opens); r.executed_qty = qty; r.avg_price = 100; return r;
     }
     double round_qty(const std::string&, double qty) override { return qty; }
     bool set_leverage(const std::string&, int) override { return true; }
@@ -37,13 +37,15 @@ struct Fixture {
     std::shared_ptr<TrendEngine> engine;
     std::shared_ptr<ProfitManager> manager;
     profit::Config cfg;
-    double equity = 1000, transfer_amount = 0, order_qty = 0, order_cost = 0;
-    int transfers = 0, purchases = 0, unknown = 0;
+    double equity = 1000, available = 900, transfer_amount = 0, order_qty = 0, order_cost = 0;
+    int transfers = 0, purchases = 0, unknown = 0, account_reads = 0;
     int64_t transfer_time = 0;
     bool unrelated_transfer = false;
     bool lost_transfer = false, lost_purchase = false, non_usdt_fee = false, foreign_fill = false, half_fill = false;
     std::string order_tag;
     std::function<void()> during_quote;
+    std::function<void()> during_account;
+    std::function<std::string(const std::string&, const std::string&)> luna_evidence;
     explicit Fixture(const std::string& name) {
         path = "profit-test-" + name + ".json"; std::filesystem::remove(path);
         TradingClient::Config config; config.api_key = "offline-test-key"; config.api_secret = "offline-test-secret"; config.testnet = false;
@@ -53,8 +55,19 @@ struct Fixture {
                 auto fn = std::move(during_quote); during_quote = {}; fn();
             }
             reply.code = 200;
+            if (luna_evidence && method == "GET" && param(params, "symbol") == "LUNA2USDT" &&
+                (endpoint == "/fapi/v2/positionRisk" || endpoint == "/fapi/v1/userTrades")) {
+                reply.body = luna_evidence(endpoint, param(params, "orderId"));
+                return true;
+            }
             if (endpoint == "/fapi/v1/multiAssetsMargin") reply.body = R"({"multiAssetsMargin":false})";
-            else if (endpoint == "/fapi/v2/account" || endpoint == "/fapi/v3/account") reply.body = "{\"totalMarginBalance\":\"" + std::to_string(equity) + "\"}";
+            else if (endpoint == "/fapi/v2/account" || endpoint == "/fapi/v3/account") {
+                ++account_reads;
+                const std::string balance = available == -2 ? "900oops" : std::to_string(available);
+                reply.body = available == -1 ? "{bad reply" :
+                    "{\"totalMarginBalance\":\"" + std::to_string(equity) + "\",\"availableBalance\":\"" + balance + "\"}";
+                if (during_account) { auto fn = std::move(during_account); during_account = {}; fn(); }
+            }
             else if (endpoint == "/fapi/v3/balance") reply.body = "[{\"asset\":\"USDT\",\"balance\":\"" + std::to_string(equity) + "\",\"crossUnPnl\":\"0\",\"availableBalance\":\"900\",\"maxWithdrawAmount\":\"900\"}]";
             else if (endpoint == "/fapi/v3/positionRisk" || endpoint == "/fapi/v2/positionRisk") reply.body = "[]";
             else if (endpoint == "/fapi/v1/order") { reply.code = 400; reply.body = R"({"code":-2013,"msg":"Order does not exist"})"; }
@@ -113,7 +126,13 @@ struct Fixture {
     }
 };
 
+#include "profit_breadth_scenarios.h"
+
 void policy_tests() {
+    breadth_recovery_tests();
+    breadth_replacement_tests();
+    delayed_breadth_vote_tests();
+    new_breadth_sample_tests();
     profit::Config c; c.protect = true;
     check(profit::valid(c), "default policy valid and accumulation disabled");
     check(near(profit::entitlement(100, 100, 0, 0, .3), 30), "profit allocation uses cumulative budget");
@@ -165,6 +184,149 @@ void policy_tests() {
     check(!flat.active && flat.breadth_peak >= flat.breadth, "normal flat reset preserves valid checkpoint invariants");
 }
 #include "profit_recovery_scenarios.h"
+
+void recovered_long_profit_services() {
+    Fixture f("long-recovery-services");
+    f.cfg.protect = true;
+    f.manager->configure(f.cfg, true, now);
+    int64_t clock = now + hour;
+    f.client->set_wall_clock_for_test([&] { return clock; });
+    bool close_available = false;
+    f.luna_evidence = [&](const std::string& endpoint, const std::string& order) -> std::string {
+        if (endpoint == "/fapi/v2/positionRisk")
+            return R"([{"symbol":"LUNA2USDT","positionSide":"BOTH","positionAmt":"0"}])";
+        // Synthetic fills. Sizes, times and prices are illustrative.
+        const std::string buy = R"({"symbol":"LUNA2USDT","id":201,"orderId":21,"positionSide":"BOTH","side":"BUY","qty":"2000","price":"0.50","quoteQty":"1000","realizedPnl":"0","commission":"0.4","commissionAsset":"USDT","time":)" + std::to_string(now + 1000) + "}";
+        const std::string sell = R"({"symbol":"LUNA2USDT","id":202,"orderId":22,"positionSide":"BOTH","side":"SELL","qty":"2000","price":"0.46","quoteQty":"920","realizedPnl":"-80","commission":"0.4","commissionAsset":"USDT","time":)" + std::to_string(now + 2000) + "}";
+        if (order == "21" || (order.empty() && !close_available)) return "[" + buy + "]";
+        if (order.empty()) return "[" + buy + "," + sell + "]";
+        return "[]";
+    };
+    // A second live long lets us observe the guard react to quotes across reconciliation.
+    TrendBot held; held.is_auto = true; held.cfg.symbol = "HELDUSDT"; held.qty = 1;
+    held.st.pos = trend::Pos::Long; held.st.entry_price = 100; held.st.stop = 80;
+    f.engine->restore_bot(held);
+    f.engine->reconcile_positions({{"HELDUSDT", 1, 1, 100}}, std::chrono::milliseconds(0));
+    f.engine->tick("HELDUSDT", 100);
+    f.manager->evaluate(*f.engine, now);
+    const auto long_profit = [&] {
+        simdjson::dom::parser parser;
+        const auto state = parser.parse(simdjson::padded_string(read(f.path))).value();
+        return profit::number(state["guards"].at(0).value(), "profit");
+    };
+    const double before_gap = long_profit();
+    f.closed_short(); // Settles for +99 USDT, the only eligible source of BTC funds.
+    ExecutionEvent open;
+    open.bot_id = "luna"; open.symbol = "LUNA2USDT"; open.direction = 1;
+    open.is_auto = open.opening = open.completed = true; open.qty = 2000; open.at_ms = now + 1000;
+    open.result = {true, "21", "", 0.50, open.qty, false, ""};
+    check(f.manager->record(open), "persist LUNA2 long in portfolio with earned short profits");
+    f.engine->tick("HELDUSDT", 110);
+    f.manager->evaluate(*f.engine, clock);
+    f.manager->service(*f.client, *f.engine, clock);
+    check(near(long_profit(), before_gap) && f.manager->recovered_trades().empty() &&
+          f.transfers == 0 && f.purchases == 0, "unproven long close freezes long valuation and BTC spending");
+
+    close_available = true;
+    clock += hour;
+    f.manager->service(*f.client, *f.engine, clock);
+    f.manager->evaluate(*f.engine, clock);
+    check(f.manager->recovered_trades().size() == 1 && long_profit() < before_gap - 65,
+          "reconciled long guard includes the actual long loss and current remaining position");
+    const double restored = long_profit();
+    f.engine->tick("HELDUSDT", 111);
+    f.manager->evaluate(*f.engine, ++clock);
+    check(near(long_profit() - restored, 1 - TrendEngine::kEstFeeRate), "long guard tracks fresh prices after reconciliation");
+    f.manager->service(*f.client, *f.engine, clock);
+    check(f.transfers == 1 && near(f.transfer_amount, 99 - 80 - .8),
+          "settled long loss and both fees cap the resumed short-profit transfer");
+    f.manager->service(*f.client, *f.engine, ++clock);
+    check(f.purchases == 1 && f.order_cost <= f.transfer_amount && f.unknown == 0,
+          "the verified transfer funds one capped BTC order through the offline wallet");
+}
+
+void wallet_pending_entry_tests() {
+    const auto wire = [](Fixture& f) {
+        f.engine->set_execution_cb([&f](ExecutionEvent& e) { return f.manager->record(e, f.client.get()); });
+    };
+    const auto breakout = [](Fixture& f, const std::string& symbol) {
+        TrendConfig c; c.symbol = symbol; c.budget_usdt = 100; c.leverage = 1; c.use_disaster_stop = false;
+        const auto id = f.engine->add_bot(c, true);
+        f.engine->update_signal(id, 2, 2, true, 110, 90, now / hour * hour);
+        f.engine->tick(symbol, 100);
+        f.engine->tick(symbol, 111);
+    };
+    {
+        Fixture f("wallet-pending-restart"); f.lost_transfer = f.unrelated_transfer = true;
+        f.closed_short();
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
+        f.manager->configure(f.cfg, true, now + 410000);
+        f.manager->service(*f.client, *f.engine, now + 430000);
+        f.manager->service(*f.client, *f.engine, now + 460000);
+        wire(f);
+        f.available = 125; // 100 initial margin plus fees fits only before reserving 29.70.
+        breakout(f, "TIGHTUSDT");
+        f.available = -1; // malformed response
+        breakout(f, "NOBALUSDT");
+        f.available = -2; // numeric prefix followed by invalid data
+        breakout(f, "BADBALUSDT");
+        check(f.fake->opens == 0, "unavailable or insufficient unreserved futures balance defers the opening");
+        f.available = 200;
+        f.during_account = [&] { breakout(f, "FIRSTUSDT"); };
+        breakout(f, "SECONDUSDT");
+        check(f.fake->opens == 1,
+              "two signals overlapping the same balance read cannot spend the same free margin");
+        simdjson::dom::parser p; auto state = p.parse(simdjson::padded_string(read(f.path))).value();
+        check(profit::integer(state["purchase"], "phase") == 1 && near(profit::number(state["purchase"], "reserved"), 29.7) &&
+              f.transfers == 1 && f.purchases == 0 && !f.unknown,
+              "a real qualifying futures breakout leaves the unresolved transfer intact and never resubmits it");
+    }
+    {
+        Fixture f("wallet-pending-margin-restart"); f.lost_transfer = f.unrelated_transfer = true;
+        f.closed_short();
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        ExecutionEvent pending; pending.bot_id = "sending"; pending.symbol = "SENDINGUSDT";
+        pending.is_auto = pending.opening = true; pending.qty = 1; pending.direction = 1;
+        pending.at_ms = now + 410000; pending.required_margin = 140;
+        check(f.manager->record(pending, f.client.get()), "persist futures margin before submitting an order");
+        f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
+        f.manager->configure(f.cfg, true, now + 420000);
+        wire(f); f.available = 175;
+        breakout(f, "MARGINWAITUSDT");
+        check(f.fake->opens == 0, "after restart an unresolved futures order still reserves its initial margin");
+        pending.completed = true;
+        check(f.manager->record(pending), "a terminal no-fill releases the reserved futures margin");
+        breakout(f, "FREEMARGINUSDT");
+        check(f.fake->opens == 1, "a newly affordable breakout proceeds while the transfer remains unresolved");
+        const int reads = f.account_reads;
+        f.available = -1;
+        f.engine->tick("FREEMARGINUSDT", 75);
+        check(f.fake->closes == 1 && f.account_reads == reads && f.transfers == 1 && f.purchases == 0,
+              "a protective exit needs no margin lookup or wallet confirmation");
+    }
+    {
+        Fixture f("wallet-pending-order");
+        f.closed_short(); f.lost_purchase = true;
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        f.manager->service(*f.client, *f.engine, now + 430000);
+        f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
+        f.manager->configure(f.cfg, true, now + 440000);
+        wire(f);
+        f.available = -1; // Spot USDT was already transferred; no extra futures balance read is required.
+        const int reads = f.account_reads;
+        breakout(f, "SPOTWAITUSDT");
+        check(f.fake->opens == 1 && f.account_reads == reads && f.purchases == 1 && f.transfers == 1 && !f.unknown,
+              "a pending spot order after restart leaves futures trading independent");
+    }
+    {
+        Fixture f("wallet-stale-transfer-room"); f.closed_short(); wire(f);
+        f.during_quote = [&] { breakout(f, "DURINGQUOTEUSDT"); };
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        check(f.fake->opens == 1 && f.transfers == 0 && f.purchases == 0,
+              "a futures fill during wallet preparation invalidates the old transfer-room snapshot");
+    }
+}
 
 void integration_tests() {
     {
@@ -326,8 +488,21 @@ void integration_tests() {
         f.manager.reset(); f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
         f.manager->configure(f.cfg, true, now + 2000);
         check(read(f.path) == before, "restart/configure does not reset protection peak or progress");
+        TrendTrade closed;
+        f.engine->set_trade_cb([&](const TrendTrade& tr) { closed = tr; });
         f.engine->tick("ETHUSDT", 105); f.manager->evaluate(*f.engine, now + 3000);
         check(f.fake->closes == 1, "persisted peak still triggers exit after restart without waiting for breadth");
+        check(closed.exit_evidence.rule == "组合利润触及硬回撤线" &&
+              closed.exit_evidence.parameters.find("硬回撤阈值 20%") != std::string::npos &&
+              closed.exit_evidence.trigger_ms == now + 3000 && !closed.exit_evidence.threshold_price &&
+              !closed.exit_evidence.trigger_price && closed.exit_price > 0,
+              "portfolio exit freezes its account threshold and actual fill without pretending a symbol price triggered it");
+        const auto captured = read(f.path);
+        f.manager.reset(); f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
+        f.cfg.hard_drawdown = .8;
+        f.manager->configure(f.cfg, true, now + 4000);
+        check(captured.find("硬回撤阈值 20%") != std::string::npos && read(f.path).find("硬回撤阈值 20%") != std::string::npos,
+              "restart and a template edit preserve the original portfolio trigger");
     }
     {
         Fixture f("external-adjustment"); f.cfg.accumulate = false; f.cfg.protect = true; f.cfg.arm_usdt = 1;
@@ -410,7 +585,7 @@ int main() {
         check(f.transfers == (funded ? 1 : 0) && f.purchases == 0,
               "profit spending rechecks pause/pending/config after quote HTTP");
     }
-    try { policy_tests(); integration_tests(); profit_recovery_tests(); }
+    try { policy_tests(); integration_tests(); profit_recovery_tests(); recovered_long_profit_services(); wallet_pending_entry_tests(); }
     catch (const std::exception& e) { std::printf("EXCEPTION %s\n", e.what()); ++failures; }
     return failures ? 1 : 0;
 }

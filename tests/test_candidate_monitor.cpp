@@ -14,9 +14,11 @@
 #include "core/monitor_state.h"
 #include <cstdio>
 #include "data_directory_scenarios.h"
+#include "trade_history_scenarios.h"
 
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
+    if (!test_trade_history_scenarios()) { std::puts("FAIL: trade history evidence and CSV"); return 1; }
     const bool data_paths_ok = test_data_directory_scenarios();
     ccg::CandidateSnapshot snapshot; snapshot.connected = true;
     const auto now = QDateTime::currentMSecsSinceEpoch();

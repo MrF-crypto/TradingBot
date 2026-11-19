@@ -11,5 +11,7 @@ struct ExecutionEvent {
     int64_t at_ms = 0;
     double qty = 0, entry = 0;
     OrderOutcome result;
+    // Initial futures margin and estimated opening fee, after sizing and leverage confirmation.
+    double required_margin = 0;
 };
 }

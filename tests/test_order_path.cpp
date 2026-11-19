@@ -66,22 +66,35 @@ int main() {
     for (const auto mode : {TradingClient::AccountMode::Futures, TradingClient::AccountMode::PortfolioMargin}) {
         auto cfg = test_cfg(); cfg.account_mode = mode;
         TradingClient tc(cfg);
-        std::string status = "NEW", used_path;
+        std::string status = "NEW", qty = "0", price = "0", error, used_path;
         tc.set_test_hook([&](const std::string&, const std::string& path,
                             const std::string&, TradingClient::FakeReply& out) {
             used_path = path;
-            out.body = "{\"orderId\":1,\"status\":\"" + status + "\",\"executedQty\":\"0\",\"avgPrice\":\"0\"}";
+            out.body = error.empty() ? "{\"orderId\":1,\"status\":\"" + status + "\",\"executedQty\":\"" +
+                qty + "\",\"avgPrice\":\"" + price + "\"}" : error;
             return true;
         });
-        check(!tc.opening_order_terminal("BTCUSDT", "pending-id"), "NEW order cannot release risk reservation");
+        check(tc.confirmed_order("BTCUSDT", "pending-id").uncertain, "NEW order cannot release risk reservation");
         check(used_path.find(mode == TradingClient::AccountMode::Futures ? "/fapi/v1/order" : "/papi/v1/um/order") != std::string::npos,
               "order recovery uses the correct account-mode endpoint");
-        status = "PARTIALLY_FILLED";
-        check(!tc.opening_order_terminal("BTCUSDT", "pending-id"), "partial nonterminal order stays reserved");
+        status = "PARTIALLY_FILLED"; qty = "1"; price = "110";
+        auto result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(result.uncertain && !result.not_found && result.executed_qty == 1, "partial nonterminal order keeps reservation and known quantity");
         status = "FILLED";
-        check(tc.opening_order_terminal("BTCUSDT", "pending-id"), "FILLED order has confirmed terminal status");
-        status = "EXPIRED";
-        check(tc.opening_order_terminal("BTCUSDT", "pending-id"), "EXPIRED order has confirmed terminal status");
+        result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(result.ok && !result.uncertain && result.executed_qty == 1 && result.avg_price == 110, "FILLED order returns one confirmed fill snapshot");
+        status = "EXPIRED"; qty = "0"; price = "0";
+        result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(result.ok && !result.uncertain && result.executed_qty == 0, "EXPIRED order has confirmed zero execution");
+        error = R"({"code":-1022,"msg":"signature rejected [-2013]"})";
+        result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(result.uncertain && !result.not_found, "a failed query cannot resemble an authoritative not-found result");
+        error = R"({"code":-2013,"msg":"Order does not exist"})";
+        result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(!result.ok && result.not_found, "checkpoint written before an unsent order can be reconciled by exact missing ID");
+        error = R"({"orderId":2,"clientOrderId":"other-id","status":"FILLED","avgPrice":"110","executedQty":"1"})";
+        result = tc.confirmed_order("BTCUSDT", "pending-id");
+        check(!result.ok && result.uncertain && result.executed_qty == 0, "mismatched receipts cannot supply a probe fill or stop quantity");
     }
 
     std::printf("── 用例1：下单超时，但订单其实已成交 ──\n");
@@ -598,17 +611,33 @@ int main() {
               "合法 JSON 但没有 symbols：算查成了，不是网络问题");
     }
 
+    {
+        auto acknowledged = [](const std::string& body) {
+            TradingClient tc(test_cfg());
+            tc.set_test_hook([&](const std::string&, const std::string&, const std::string&, TradingClient::FakeReply& out) {
+                out.body = body; return true;
+            });
+            return tc.cancel_disaster_stop("TESTUSDT", "123");
+        };
+        check(acknowledged(R"({"code":"200","msg":"success"})") && acknowledged(R"({"code":-2011})") &&
+              acknowledged(R"({"algoId":123,"algoStatus":"CANCELED"})"), "撤单成功或确切不存在可以解除旧单归属");
+        check(!acknowledged("{}") && !acknowledged("[]") && !acknowledged(R"({"code":"-1001"})") &&
+              !acknowledged(R"({"algoId":456,"algoStatus":"CANCELED"})") &&
+              !acknowledged(R"({"algoId":123,"algoStatus":"NEW"})"), "未知回执、错单号和活跃委托不能冒充撤单成功");
+    }
     std::printf("── 用例15：活跃条件单列表（核对保护单还在不在的输入）──\n");
     {
         // 与持仓快照同一个道理：空列表既可能是"确实没有活跃单"，也可能是这次
         // 没查成。混起来的后果是一次网络抖动让【所有】仓位的保护单被判成已消失，
         // 于是白撤白挂一轮，而 closePosition 同方向只允许一张，新的还可能挂不上
-        auto probe = [](const char* body, bool* ok_out) {
+        auto probe = [](const char* body, bool* ok_out, long status = 200, bool timed_out = false) {
             TradingClient tc(test_cfg());
             tc.set_test_hook([&](const std::string&, const std::string& path,
                                  const std::string&, TradingClient::FakeReply& out) {
                 if (path.find("AlgoOrders") != std::string::npos ||
-                    path.find("algo") != std::string::npos) { out.body = body; return true; }
+                    path.find("algo") != std::string::npos) {
+                    out.body = body; out.code = status; out.timed_out = timed_out; return true;
+                }
                 return false;
             });
             return tc.fetch_open_algo_ids(ok_out);
@@ -624,6 +653,10 @@ int main() {
         ok = false;
         v = probe("[]", &ok);
         check(ok && v.empty(), "合法空数组 ⇒ ok=true 且确实没有活跃单");
+        probe("[]", &ok, 503);
+        check(!ok, "网关故障返回空数组不代表已撤销保护单");
+        probe("[]", &ok, 200, true);
+        check(!ok, "中断的响应不用于核对保护单");
 
         ok = false;
         v = probe(R"([{"algoId":2146760,"symbol":"BTCUSDT","algoStatus":"NEW"},)"

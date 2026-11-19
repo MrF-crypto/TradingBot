@@ -29,6 +29,8 @@ class ProfitManager;
 // 并且"这轮没拿到数据"时归为未知而不是不合格）
 struct MarketScan {
     smart::ScanOutcome outcome;
+    bool complete_catalog = false;
+    std::set<std::string> listed, settled;
     int universe = 0;        // USDT 永续总数
     int passed_gate = 0;     // 过了不需要K线的门槛
     int eligible = 0;        // 特征算得出且 ATR% 合格
@@ -84,6 +86,8 @@ public:
     void housekeep(int64_t now_ms);
     void evaluate_profits(int64_t now_ms);
     void service_profits(int64_t now_ms);
+    bool needs_breadth_quotes() const;
+    void refresh_breadth();
     std::string profit_status() const;
     std::vector<TrendTrade> recovered_trades() const;
 

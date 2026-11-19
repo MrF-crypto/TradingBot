@@ -28,7 +28,7 @@ std::string RestPriceFeed::Health::badge() const {
     if (fail_streak >= kUnhealthyFails) return "⚠行情连续拉取失败";
     if (fresh < symbols) return std::string(fresh ? "⚠部分行情异常：" : "⚠全部品种行情异常：") +
         std::to_string(symbols - fresh) + "/" + std::to_string(symbols);
-    return "行情✓";
+    return on_fallback ? "行情·备用成交价" : "行情✓";
 }
 
 std::string RestPriceFeed::Health::summary() const {
@@ -36,6 +36,7 @@ std::string RestPriceFeed::Health::summary() const {
     if (!running)            { o << "未启动"; return o.str(); }
     if (last_ok_ms == 0)     { o << "尚未取到行情"; if (fail_streak) o << "（已失败" << fail_streak << "轮）"; return o.str(); }
     o << "轮询中 " << symbols << "个品种";
+    if (on_fallback) o << " 最近有效来源：备用成交价";
     if (fresh < symbols)  o << " 陈旧" << (symbols - fresh);
     if (age_ms > 2000)    o << " 上次成功" << (age_ms / 1000) << "秒前";
     if (fail_streak > 0)  o << " 连续失败" << fail_streak << "轮";
@@ -109,59 +110,53 @@ void RestPriceFeed::unsubscribe(const std::string& symbol) {
 // ── 轮询主循环 ────────────────────────────────────────────────────────────────
 // 没有看门狗、没有重连、没有退避升级。原因见头文件：轮询没有"连接"这个中间状态，
 // 每一轮的成败是直接观测到的，不需要任何机制去推断"对面是不是已经死了"。
+bool RestPriceFeed::update_prices(const std::unordered_map<std::string, double>& prices, bool fallback) {
+    if (prices.empty()) return false;
+    const auto valid = [](double p) { return std::isfinite(p) && p > 0; };
+    const auto t = now_ms();
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (subs_.empty())
+        return std::any_of(prices.begin(), prices.end(), [&](const auto& kv) { return valid(kv.second); });
+    bool updated = false;
+    for (const auto& s : subs_) {
+        const auto it = prices.find(s);
+        if (it == prices.end() || !valid(it->second)) continue;
+        auto& tick = cache_.at(s);
+        tick.mark_price = it->second;
+        tick.mark_ms = tick.ws_mark_ms = t;
+        tick.from_fallback = fallback;
+        updated = true;
+    }
+    return updated;
+}
+
 void RestPriceFeed::loop() {
     int64_t next_chg = 0;   // 下一次拉 24h 涨跌的时刻（0 = 立刻）
+    int primary_misses = 0;
 
     while (running_.load()) {
         const int64_t t0 = now_ms();
 
         // ① 标记价：一次全取，与品种数无关
-        bool ok = false;
+        bool ok = fetch_marks_ && update_prices(fetch_marks_(), false);
         bool used_fallback = false;
         std::string why;   // 主源这一轮失败的原因
-        if (fetch_marks_) {
-            auto all = fetch_marks_();
-            if (all.empty()) {
-                ErrFn ef;
-                { std::lock_guard<std::mutex> lk(mtx_); ef = err_fn_; }
-                if (ef) why = ef();
-            }
-
-            // ② 主源连续失败到"健康灯该转红"的程度，就启用备用源。
-            //
-            // ⚠ 在它之前，所有价格都来自 premiumIndex 这一个端点 —— 它挂了就全挂，
-            //   而"退回单品种查询"退的还是同一个端点，同一个故障下一起死。
-            //   备用源走 /fapi/v1/ticker/price，不同路径、不同权重池。
-            //
-            // ⚠ 口径变了：备用源给的是【成交价】，不是标记价。成交价不抗插针，
-            //   拿它推移动止损比标记价更容易被打掉。所以它只在主源真的不行时才上，
-            //   而且切换必须报出来 —— 悄悄换掉风控赖以生存的价格口径是不可接受的。
-            //   阈值与 kUnhealthyFails 一致：健康灯转红的同一刻启用备用口径
-            if (all.empty() && fetch_fallback_ &&
-                fail_streak_.load() >= kUnhealthyFails) {
-                all = fetch_fallback_();
-                used_fallback = !all.empty();
-            }
-
-            if (!all.empty()) {
-                ok = true;
-                const int64_t t = now_ms();
-                std::lock_guard<std::mutex> lk(mtx_);
-                for (const auto& s : subs_) {
-                    auto it = all.find(s);
-                    if (it == all.end() || !std::isfinite(it->second) || !(it->second > 0)) continue;
-                    auto& c = cache_[s];
-                    c.symbol        = s;
-                    c.mark_price    = it->second;
-                    c.mark_ms       = t;
-                    c.ws_mark_ms    = t;   // 与 mark_ms 恒等，见头文件
-                    c.from_fallback = used_fallback;
-                }
+        if (ok) {
+            primary_misses = 0;
+        } else {
+            primary_misses = std::min(primary_misses + 1, kUnhealthyFails);
+            ErrFn ef;
+            { std::lock_guard<std::mutex> lk(mtx_); ef = err_fn_; }
+            if (ef) why = ef();
+            // Backup success refreshes quotes without resetting the primary failure streak.
+            if (fetch_fallback_ && (primary_misses >= kUnhealthyFails || on_fallback_.load())) {
+                used_fallback = update_prices(fetch_fallback_(), true);
+                ok = used_fallback;
             }
         }
 
         // 切换进/出备用源各报一次
-        if (used_fallback != on_fallback_.exchange(used_fallback)) {
+        if (ok && used_fallback != on_fallback_.exchange(used_fallback)) {
             if (used_fallback)
                 say("⚠ 标记价拉不到，已切到【备用价格源】（/fapi/v1/ticker/price）。\n"
                     "    ⚠ 口径变了：这是【成交价】而不是标记价。标记价带指数成分、"
@@ -255,6 +250,7 @@ void RestPriceFeed::set_mark_price(const std::string& symbol, double price) {
     c.mark_price = price;
     c.mark_ms    = t;
     c.ws_mark_ms = t;
+    c.from_fallback = false;
 }
 
 RestPriceFeed::Health RestPriceFeed::health() const {
@@ -263,6 +259,7 @@ RestPriceFeed::Health RestPriceFeed::health() const {
     h.last_ok_ms  = last_ok_ms_.load();
     h.age_ms      = h.last_ok_ms ? (now_ms() - h.last_ok_ms) : 0;
     h.fail_streak = fail_streak_.load();
+    h.on_fallback = on_fallback_.load();
     const int64_t t = now_ms();
     std::lock_guard<std::mutex> lk(mtx_);
     h.symbols = subs_.size();

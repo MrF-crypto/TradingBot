@@ -38,7 +38,9 @@ public:
 
     std::function<void()> during_order;
     bool opening_terminal = false;
-    bool opening_order_terminal(const std::string&, const std::string&) override { return opening_terminal; }
+    OrderOutcome confirmed_order(const std::string&, const std::string&) override {
+        OrderOutcome r; r.uncertain = true; r.not_found = opening_terminal; return r;
+    }
     double fill_price   = 100.0;
     bool   fail_next    = false;    // 下一笔直接失败
     bool   uncertain_next = false;  // 下一笔状态不明
@@ -85,8 +87,11 @@ public:
     // 失败时给的 retryable 由 ds_fail_retryable 控制：重试阶梯的用例要能
     // 分别构造"可重试"与"参数错误直接放弃"两条路
     bool ds_fail_retryable = true;
+    bool ds_cancel_ok = true;
+    std::function<void()> during_stop;
     StopPlacement place_disaster_stop(const std::string&, double stop_price,
                                       const std::string&, double) override {
+        if (during_stop) { auto fn = std::move(during_stop); during_stop = {}; fn(); }
         if (ds_place_fails) {
             stop_log.push_back({"place_fail", stop_price, ""});
             StopPlacement p; p.error = "boom"; p.retryable = ds_fail_retryable;
@@ -99,7 +104,7 @@ public:
     }
     bool cancel_disaster_stop(const std::string&, const std::string& id) override {
         stop_log.push_back({"cancel", 0, id});
-        return true;
+        return ds_cancel_ok;
     }
     int ds_count(const std::string& kind) const {
         int n = 0;
@@ -213,8 +218,12 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "audit_engine_scenarios.h"
 #include "leverage_engine_scenarios.h"
 #include "accounting_engine_scenarios.h"
+#include "stop_reconciliation_scenarios.h"
+#include "exit_evidence_scenarios.h"
 
 int main() {
+    test_exit_evidence_scenarios();
+    test_stop_reconciliation_scenarios();
     test_accounting_engine_scenarios();
     test_audit_engine_scenarios();
     test_leverage_engine_scenarios();
@@ -827,7 +836,7 @@ int main() {
         const double q   = eng.get_bots()[0].qty;
 
         eng.stop_bot(id);
-        auto iss = eng.reconcile_stop_orders({});          // 交易所挂单列表里没有它了
+        auto iss = eng.reconcile_stop_orders(eng.capture_stop_orders(), {});          // 交易所挂单列表里没有它了
         check(!iss.empty() && eng.get_bots()[0].disaster_stop_id.empty(), "暂停中硬止损不见了：清掉单号");
         eng.tick("TESTUSDT", 109.0);
         check(cli->ds_count("place") == 1, "  暂停的 bot 不吃 tick，tick 不会补挂");
@@ -841,6 +850,7 @@ int main() {
         cli->close_verification.protective_fill.ok = true;
         cli->close_verification.protective_fill.executed_qty = q;
         cli->close_verification.protective_fill.avg_price = dsp - .25;
+        cli->close_verification.threshold_price = dsp - .01;
         advance(10);
         reconcile(eng, {});
         check(trades.empty(), "  第 1 轮存疑：先不记账");
@@ -850,6 +860,11 @@ int main() {
         const double want = (dsp - .25 - 110.0) * q;
         check(trades.size() == 1 && trades[0].reason.find("硬止损") != std::string::npos,
               "第 2 轮确认：按硬止损记一笔成交（不再是'外部已平'、一笔都不记）");
+        check(trades.size() == 1 && trades[0].exit_evidence.rule == "交易所硬止损" &&
+              !trades[0].exit_evidence.trigger_price && trades[0].exit_evidence.threshold_price == dsp - .01 &&
+              trades[0].exit_evidence.parameters.find("参考止损线=") != std::string::npos &&
+              trades[0].exit_price == dsp - .25,
+              "硬止损核对使用交易所条件单阈值和实际均价，未观测到的触发行情留空");
         check(std::fabs(b.realized_pnl - want) < 1e-9 && b.trade_count == 1,
               "  按实际成交价记账，不能用触发价代替");
         check(eng.day_pnl().realized < want + 1e-9, "  进当日亏损（含估算手续费）");
@@ -2319,19 +2334,20 @@ int main() {
         eng.tick("TESTUSDT", 110.0);
         const std::string ds_id = eng.get_bots()[0].disaster_stop_id;
         check(!ds_id.empty(), "先正常挂上一张保护单");
+        const double original_stop = eng.get_bots()[0].disaster_stop_price;
 
         // 它还在 ⇒ 什么都不该动
-        auto none = eng.reconcile_stop_orders({ds_id});
+        auto none = eng.reconcile_stop_orders(eng.capture_stop_orders(), {ds_id});
         check(none.empty(), "单子还在活跃列表里 ⇒ 不报也不动");
         check(eng.get_bots()[0].disaster_stop_id == ds_id, "  单号原样保留");
 
         // 它不在了 ⇒ 清掉本地记录并标红，让每 tick 的重挂逻辑接手
-        auto gone = eng.reconcile_stop_orders({"99999"});
+        auto gone = eng.reconcile_stop_orders(eng.capture_stop_orders(), {"99999"});
         check(gone.size() == 1, "单子不在活跃列表里 ⇒ 报一条");
         check(eng.get_bots()[0].disaster_stop_id.empty(),
               "  清掉本地单号 —— 不清的话 try_place_hard_stop 第一道守卫就 return，"
               "永远不会重挂");
-        check(eng.get_bots()[0].disaster_stop_price == 0, "  触发价一并清掉");
+        check(eng.get_bots()[0].disaster_stop_price == original_stop, "  保留开仓时冻结的保护价用于补挂");
         check(eng.get_bots()[0].ds_unprotected,
               "  标成无保护：此刻确实没有进程外保护，界面该标红");
         check(eng.get_bots()[0].ds_attempts == 0,
@@ -2354,13 +2370,13 @@ int main() {
         auto id = eng.add_bot(cfg);
 
         // 空仓：没有仓位就没有要保护的东西
-        check(eng.reconcile_stop_orders({}).empty(), "空仓时不报");
+        check(eng.reconcile_stop_orders(eng.capture_stop_orders(), {}).empty(), "空仓时不报");
 
         feed(eng, id, 2.0, 110, 90);
         cli->fill_price = 110.0;
         eng.tick("TESTUSDT", 110.0);
         eng.set_pending_for_test(id, true);
-        check(eng.reconcile_stop_orders({}).empty(),
+        check(eng.reconcile_stop_orders(eng.capture_stop_orders(), {}).empty(),
               "在途(pending)时不报：订单可能已在交易所生效而本地还没入账");
         eng.set_pending_for_test(id, false);
     }
@@ -2374,7 +2390,7 @@ int main() {
         feed(eng, id, 2.0, 110, 90);
         cli->fill_price = 110.0;
         eng.tick("TESTUSDT", 110.0);
-        check(eng.reconcile_stop_orders({}).empty(),
+        check(eng.reconcile_stop_orders(eng.capture_stop_orders(), {}).empty(),
               "未开启委托止损的 bot 不参与核对");
     }
 

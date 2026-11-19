@@ -22,8 +22,8 @@ namespace ccbot {
 
 // 只存运行时状态，不存策略参数——参数每次都从配置文件重新读
 SaveResult save_trend_state(const std::string& path, const std::vector<TrendBot>& bots);
-// Production callers capture their snapshot inside the serialized writer, so an older
-// snapshot cannot overtake a newer one. Reports errors to the engine's entry gate.
+// Route periodic snapshots through the same engine checkpoint ordering as probe saves.
+// The file writer only takes the file lock. Errors reach the engine's entry gate.
 SaveResult save_trend_state(const std::string& path, TrendEngine& engine);
 
 // 按 symbol 匹配配置里的 bot，把落盘的运行时状态拼回一个新的 TrendBot
@@ -36,7 +36,8 @@ SaveResult save_trend_state(const std::string& path, TrendEngine& engine);
 // 空仓的自动 bot 直接丢弃。
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
-                                   const TrendConfig* auto_tmpl = nullptr);
+                                   const TrendConfig* auto_tmpl = nullptr,
+                                   const std::string& expected_account = {});
 
 // 读 headless 的成交 CSV（ccbot_trades.csv）。只用来补算当日已实现（启动时
 // 状态文件里没有今天的数）。时间列是本地时间 "YYYY-MM-DD HH:MM:SS"，按本地时区

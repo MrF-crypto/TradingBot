@@ -46,9 +46,8 @@ bool local_flat(const std::vector<TrendBot>& bots, const std::string& symbol) {
          b.rotation_reserved || !b.pending_close_key.empty() || b.reserved_dir != trend::Pos::Flat)) return false;
     return true;
 }
-// For each independent cycle, require the full original position to be opened,
-// then fully closed before the next recorded opening. A later long can prove
-// the flat boundary, but only missing short closes are eligible for recovery.
+// Each cycle starts at its owned opening order and must be fully closed
+// before the next recorded opening, including a change of direction.
 std::string prove_cycle(const Cycle& cycle, std::span<const TradingClient::HistoryFill> history,
                         int64_t before_flat_query, bool hedge, RecoveredCycle& result) {
     const auto& open = cycle.opening;
@@ -82,7 +81,7 @@ std::string prove_cycle(const Cycle& cycle, std::span<const TradingClient::Histo
     }
     double recovered = 0;
     for (const auto& [id, order] : closes) recovered += order.qty;
-    if ((!closes.empty() && !short_side) || !same_qty(recovered, cycle.remaining)) return "缺失回执的数量不能完整核实";
+    if (!same_qty(recovered, cycle.remaining)) return "缺失回执的数量不能完整核实";
     result.entry_price = opening.value / opening.qty;
     result.missing = std::move(closes);
     return {};
@@ -112,7 +111,7 @@ void ProfitManager::recover_external_close(TradingClient& client, TrendEngine& e
     {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!tracking_ || damaged_ || cancelled_ || !error_.empty()) return;
-        if (inventory_ok_[1]) {
+        if (inventory_discrepancies_.empty()) {
             recovery_wait_.clear(); recovery_checks_.clear();
             return;
         }
@@ -161,8 +160,9 @@ void ProfitManager::recover_external_close(TradingClient& client, TrendEngine& e
         int64_t oldest = 0;
         for (const auto& [sym, series] : cycles) {
             const auto mismatch = inventory_discrepancies_.find(sym);
-            if (mismatch == inventory_discrepancies_.end() || !mismatch->second[1] ||
-                series.empty() || series.front().opening.e.direction != -1 || ambiguous.count(sym) || !local_flat(bots, sym)) continue;
+            if (series.empty() || mismatch == inventory_discrepancies_.end() ||
+                !mismatch->second[series.front().opening.e.direction > 0 ? 0 : 1] ||
+                ambiguous.count(sym) || !local_flat(bots, sym)) continue;
             auto check = recovery_checks_.find(sym);
             const int64_t previous = check == recovery_checks_.end() ? 0 : check->second.last;
             if (previous && now >= previous && now < check->second.next) continue;
@@ -211,7 +211,7 @@ void ProfitManager::recover_external_close(TradingClient& client, TrendEngine& e
                 recovery_wait_[symbol] = "成交编号与其他回执冲突"; return;
             }
             Entry item;
-            item.event = {key, opening.bot_id, symbol, false, true, true, -1, fill.last,
+            item.event = {key, opening.bot_id, symbol, false, true, true, opening.direction, fill.last,
                           fill.qty, recovered[i].entry_price,
                           {true, order_id, {}, fill.value / fill.qty, fill.qty, false, {}}};
             item.settled = true; item.net = fill.gross - fill.fee;
@@ -235,7 +235,16 @@ void ProfitManager::recover_external_close(TradingClient& client, TrendEngine& e
         return;
     }
     recovery_wait_.erase(symbol);
-    notices_.push_back(symbol + " 外部平空已核对并补录 " + std::to_string(corrections.size()) + " 笔平仓委托");
+    recovery_checks_.erase(symbol);
+    for (size_t i = 0; i < target.size(); ++i) {
+        const auto& missing = recovered[i].missing;
+        if (missing.empty()) continue;
+        double qty = 0, value = 0;
+        for (const auto& item : missing) { qty += item.second.qty; value += item.second.value; }
+        const auto side = target[i].opening.e.direction > 0 ? " 外部平多" : " 外部平空";
+        notices_.push_back(symbol + side + "已核对并补录 " + std::to_string(missing.size()) +
+            " 笔平仓委托，" + format_exit_evidence({}, value / qty, "外部平仓（具体规则未记录）"));
+    }
 }
 
 std::vector<TrendTrade> ProfitManager::recovered_trades() const {
@@ -246,8 +255,10 @@ std::vector<TrendTrade> ProfitManager::recovered_trades() const {
         if (entry.recovery_open_key.empty()) continue;
         const auto& open = entries_.at(entry.recovery_open_key);
         auto& t = cycles[entry.recovery_open_key];
-        t.symbol = entry.event.symbol; t.is_auto = true; t.side = trend::Pos::Short;
-        t.reason = "外部平空（交易所成交已核对）";
+        t.symbol = entry.event.symbol; t.is_auto = true;
+        t.side = open.event.direction > 0 ? trend::Pos::Long : trend::Pos::Short;
+        t.reason = t.side == trend::Pos::Long ? "外部平多（交易所成交已核对）" : "外部平空（交易所成交已核对）";
+        t.exit_evidence.rule = "外部平仓（具体规则未记录）";
         t.entry_price = entry.event.entry;
         using Time = std::chrono::system_clock::time_point;
         t.open_time = Time(std::chrono::milliseconds(open.first_fill));

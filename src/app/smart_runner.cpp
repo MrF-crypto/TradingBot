@@ -75,7 +75,7 @@ bool gate_universe(TradingClient& c, const smart::Config& cfg,
         const auto e = c.last_error();
         return e.empty() ? std::string() : "：" + e;
     };
-    const auto metas = c.fetch_exchange_symbols(&ok_meta);
+    const auto metas = c.fetch_exchange_symbols(&ok_meta, &r.complete_catalog);
     if (!ok_meta) { r.error = "交易规则拉取失败" + net_cause(); return false; }
     const auto t24 = c.fetch_all_24h(&ok_t24);
     if (!ok_t24) { r.error = "24h 行情拉取失败" + net_cause(); return false; }
@@ -90,6 +90,10 @@ bool gate_universe(TradingClient& c, const smart::Config& cfg,
         m.onboard_ms = mm.onboard_ms; m.delivery_ms = mm.delivery_ms; m.tick = mm.tick;
         m.underlying_type = mm.underlying_type;
         if (m.quote != "USDT" || m.contract_type != "PERPETUAL") continue;
+        if (!r.listed.insert(m.symbol).second) r.complete_catalog = false;
+        if (m.status == "CLOSE" || m.status == "CLOSED" || m.status == "SETTLED" ||
+            m.status == "DELIVERED" || m.status == "DELIVERING" || m.status == "SETTLING" ||
+            (m.delivery_ms > 0 && m.delivery_ms <= now_ms)) r.settled.insert(m.symbol);
         ++r.universe;
         seen.insert(m.symbol);
         const bool member = pool_syms.count(m.symbol) > 0;
@@ -227,7 +231,7 @@ SmartRunner::SmartRunner(std::shared_ptr<TradingClient> client, std::shared_ptr<
       state_path_(std::move(state_path)), log_(std::move(log)) {
     if (client_ && engine_) {
         profits_ = std::make_shared<ProfitManager>(state_path_.empty() ? "" : state_path_ + ".profit", client_->account_fingerprint());
-        engine_->set_execution_cb([p = profits_](ExecutionEvent& e) { return p->record(e); });
+        engine_->set_execution_cb([p = profits_, c = client_](ExecutionEvent& e) { return p->record(e, c.get()); });
     }
 }
 
@@ -238,6 +242,8 @@ void SmartRunner::evaluate_profits(int64_t now) {
 }
 void SmartRunner::service_profits(int64_t now) { if (profits_ && !cancelled_) profits_->service(*client_, *engine_, client_->market_time_ms()); }
 std::string SmartRunner::profit_status() const { return profits_ ? profits_->status() : "尚未连接"; }
+bool SmartRunner::needs_breadth_quotes() const { return profits_ && !cancelled_ && profits_->needs_breadth_quotes(); }
+void SmartRunner::refresh_breadth() { if (profits_ && !cancelled_) profits_->refresh_breadth(*client_); }
 std::vector<TrendTrade> SmartRunner::recovered_trades() const {
     return profits_ ? profits_->recovered_trades() : std::vector<TrendTrade>{};
 }
@@ -255,7 +261,7 @@ void SmartRunner::set_config(const smart::Config& cfg) {
     }
     sync_exit_params(cfg);
     if (profits_) {
-        profits_->configure(cfg.profit, cfg.enabled, client_->market_time_ms());
+        profits_->configure(cfg.profit, cfg.enabled, client_->market_time_ms(), cfg.tmpl);
         evaluate_profits(client_->market_time_ms());
     }
 }
@@ -500,13 +506,17 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (log_) log_("⚠ " + s, true);
 
     // ── 汇总 ──
-    std::set<std::string> with_bot;
+    std::set<std::string> with_bot, eligible_hourly;
     for (const auto& b : engine_->get_bots()) {
         with_bot.insert(b.cfg.symbol);
         if (!b.is_auto) continue;
+        if (!b.retiring && b.state == TrendBot::State::Running && b.cfg.interval == "1h" &&
+            scan.outcome.candidates.count(b.cfg.symbol)) eligible_hourly.insert(b.cfg.symbol);
         ++rep.monitored;
         if (b.qty > 0) ++rep.holding;
     }
+    if (profits_ && scan.complete_catalog)
+        profits_->update_breadth_market(scan.listed, scan.settled, eligible_hourly, client_->market_time_ms());
     rep.candidates = candidate_rows(scan.outcome.candidates, with_bot);
     if (journal_) journal_->scan(now_ms, scan.outcome.candidates, with_bot, scan.oi);
     rep.ok = true;

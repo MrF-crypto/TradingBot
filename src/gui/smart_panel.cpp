@@ -110,6 +110,13 @@ void MainWindow::smartTick() {
     if (!smart_) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     smart_->evaluate_profits(client_ ? client_->market_time_ms() : now);
+    if (slowTickCount_ % 5 == 1 && smart_->needs_breadth_quotes() && !breadthBusy_.exchange(true)) {
+        auto sr = smart_;
+        run_async([this, sr] {
+            try { sr->refresh_breadth(); } catch (...) {}
+            breadthBusy_.store(false);
+        });
+    }
     if (slowTickCount_ % 10 == 3 && !profitBusy_.exchange(true)) {
         auto sr = smart_;
         run_async([this, sr, now] {

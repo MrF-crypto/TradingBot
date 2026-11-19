@@ -127,10 +127,12 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
     }
 
     profit::Config cfg; double amount = 0, cash_spot = 0;
+    uint64_t execution_revision = 0;
     {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!smart_enabled_ || !cfg_.accumulate || cancelled_) return;
         cfg = cfg_;
+        execution_revision = execution_revision_;
         if (cfg_.protect && (guards_[0].phase == profit::Phase::Exiting || guards_[1].phase == profit::Phase::Exiting)) { message_ = "组合保护退出优先，暂缓利润分配"; return; }
         double shorts, total; bool complete; totals_locked(shorts, total, complete);
         if (!complete) { message_ = "等待成交与资金费结算"; return; }
@@ -176,6 +178,7 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
     // Network waits must not carry an old pause/config/ownership decision into a POST.
     const auto spending_blocked = [&] {
         if (!(cfg_ == cfg)) { message_ = "利润配置已改变，等待按新参数重新评估"; return true; }
+        if (execution_revision != execution_revision_) { message_ = "交易期间账户余额发生变化，重新核对利润预算"; return true; }
         if (engine.pause_new()) { message_ = "暂停开仓期间暂停新增 BTC 购买"; return true; }
         for (const auto& b : engine.get_bots()) {
             if (b.pending || b.open_uncertain || !b.pending_close_key.empty() || b.needs_reconcile) {

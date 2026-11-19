@@ -1,5 +1,6 @@
 #include "headless/trend_state.h"
 #include "core/app_logic.h"
+#include "core/exit_evidence_json.h"
 #include "core/monitor_state.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -83,6 +84,11 @@ SaveResult save_trend_state_locked(const std::string& path, const std::vector<Tr
     for (const auto& b : bots) {
         if (!first) ss << ",";
         first = false;
+        if (b.ds_account_only) {
+            ss << "{\"checkpoint_kind\":\"stop_breaker\",\"ds_probe_after_ms\":" << b.ds_probe_after_ms
+               << ",\"ds_probe_account\":\"" << json_escape(b.ds_probe_account) << "\"}";
+            continue;
+        }
         smart::Config saved_template;
         saved_template.tmpl = b.cfg;
         saved_template.dir_long = b.cfg.rule.direction != trend::Direction::ShortOnly;
@@ -102,6 +108,9 @@ SaveResult save_trend_state_locked(const std::string& path, const std::vector<Tr
            << "\"uncertain_stop\":" << b.uncertain_stop << ","
            << "\"pending_close_key\":\"" << json_escape(b.pending_close_key) << "\","
            << "\"pending_close_reason\":\"" << json_escape(b.pending_close_reason) << "\","
+           << (b.pending_close_evidence.empty() ? "" : "\"pending_close_evidence\":" + exit_evidence_json(b.pending_close_evidence) + ",")
+           << (b.stop_evidence.empty() ? "" : "\"stop_evidence\":" + exit_evidence_json(b.stop_evidence) + ",")
+           << (b.hard_stop_evidence.empty() ? "" : "\"hard_stop_evidence\":" + exit_evidence_json(b.hard_stop_evidence) + ",")
            << "\"pending_close_ms\":" << b.pending_close_ms << ","
            << "\"reserved_risk\":" << b.reserved_risk << ","
            << "\"reserved_margin\":" << b.reserved_margin << ","
@@ -148,7 +157,12 @@ SaveResult save_trend_state_locked(const std::string& path, const std::vector<Tr
            // 单号必须跨重启存活：遗留一张触发价对不上的孤儿单会让
            // 下次挂新单被拒（closePosition 同方向只能有一张）
            << "\"disaster_stop_id\":\"" << b.disaster_stop_id << "\","
+           << "\"ds_cancel_id\":\"" << json_escape(b.ds_cancel_id) << "\","
+           << "\"ds_probe\":" << (b.ds_probe ? "true" : "false") << ","
+           << "\"ds_probe_after_ms\":" << b.ds_probe_after_ms << ","
+           << (b.ds_probe_account.empty() ? "" : "\"ds_probe_account\":\"" + json_escape(b.ds_probe_account) + "\",")
            << "\"ds_vanished_id\":\"" << json_escape(b.ds_vanished_id) << "\","
+           << "\"ds_vanished_price\":" << b.ds_vanished_price << ","
            << "\"disaster_stop_price\":" << b.disaster_stop_price << ","
            << "\"cooldown_left\":"   << b.st.cooldown_left << ","
            << "\"qty\":"          << b.qty << ","
@@ -171,8 +185,12 @@ SaveResult save_trend_state(const std::string& path, const std::vector<TrendBot>
 }
 
 SaveResult save_trend_state(const std::string& path, TrendEngine& engine) {
-    std::lock_guard<std::mutex> lock(state_save_mutex);
-    const auto result = save_trend_state_locked(path, engine.get_bots());
+    SaveResult result{true, {}};
+    const bool saved = engine.save_checkpoint([&](const std::vector<TrendBot>& bots) {
+        result = save_trend_state(path, bots);
+        return result.ok;
+    });
+    if (!saved && result.error.empty()) result = {false, "趋势断点保存失败"};
     engine.set_persistence_error("趋势断点", result.error);
     return result;
 }
@@ -182,15 +200,28 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
     std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
     if (!f) return out;
     std::string line;
-    bool header = true;
+    std::getline(f, line); // Both generations share this header.
+    std::vector<std::string> cols;
+    std::string field;
+    bool quoted = false;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (header) { header = false; continue; }
-        // 列：time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers
-        std::vector<std::string> cols;
-        size_t start = 0;
-        for (size_t i = 0; i <= line.size(); ++i)
-            if (i == line.size() || line[i] == ',') { cols.push_back(line.substr(start, i - start)); start = i + 1; }
+        // New reasons use standard CSV escaping, including multiline fields. Old
+        // writers emitted unquoted commas in reason, so number columns stay right-aligned.
+        if (!quoted) { cols.clear(); field.clear(); }
+        for (size_t i = 0; i < line.size(); ++i) {
+            const char c = line[i];
+            if (quoted && c == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') { field += c; ++i; }
+                else quoted = false;
+            } else if (!quoted && c == ',') {
+                cols.push_back(field); field.clear();
+            } else if (!quoted && c == '"' && field.empty()) {
+                quoted = true;
+            } else field += c;
+        }
+        if (quoted) { field += '\n'; continue; }
+        cols.push_back(field);
         if (cols.size() < 9) continue;
         const size_t n = cols.size();
         TrendTrade t;
@@ -210,6 +241,8 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
         t.close_time = std::chrono::system_clock::from_time_t(tt);
         t.symbol = cols[1];
         t.side   = (cols[2].find("short") != std::string::npos) ? trend::Pos::Short : trend::Pos::Long;
+        t.reason = cols[3];
+        for (size_t i = 4; i < n - 5; ++i) t.reason += ',' + cols[i];
         out.push_back(std::move(t));
     }
     return out;
@@ -217,11 +250,17 @@ std::vector<TrendTrade> load_trades_csv(const std::string& path) {
 
 std::vector<TrendBot> load_trend_state(const std::string& path,
                                    const std::vector<TrendConfig>& cfgs,
-                                   const TrendConfig* auto_tmpl) {
+                                   const TrendConfig* auto_tmpl, const std::string& expected_account) {
     std::vector<TrendBot> out;
 
-    std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
-    if (!f) return out;
+    const std::filesystem::path file(std::u8string(path.begin(), path.end()));
+    std::ifstream f(file, std::ios::binary);
+    if (!f) {
+        std::error_code ec;
+        if (std::filesystem::exists(file, ec) || ec)
+            throw std::runtime_error("无法读取已有状态文件，保留原文件并停止恢复");
+        return out;
+    }
     std::ostringstream buf;
     buf << f.rdbuf();
     const std::string raw = buf.str();
@@ -236,11 +275,33 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
     for (auto elem : arr) {
         simdjson::dom::object o;
         if (elem.get(o) != simdjson::SUCCESS) throw std::runtime_error("状态条目格式无效，停止恢复");
+        std::string_view kind;
+        const auto kind_err = o["checkpoint_kind"].get(kind);
+        if (kind_err != simdjson::NO_SUCH_FIELD) {
+            TrendBot account;
+            account.ds_probe_after_ms = get_i64(o, "ds_probe_after_ms", 0);
+            account.ds_probe_account = get_str(o, "ds_probe_account", "");
+            if (kind_err != simdjson::SUCCESS || kind != "stop_breaker" || arr.size() != 1 || o.size() != 3 ||
+                account.ds_probe_after_ms <= 0 || account.ds_probe_account.empty() ||
+                (!expected_account.empty() && account.ds_probe_account != expected_account))
+                throw std::runtime_error("账户熔断断点无效或不属于当前账户，保留原文件并停止恢复");
+            account.ds_account_only = true;
+            out.push_back(std::move(account));
+            continue;
+        }
 
         const std::string sym = app::normalize_symbol(get_str(o, "symbol", "")).symbol;
         if (sym.empty()) throw std::runtime_error("状态条目缺少品种，停止恢复");
         if (!symbol_text::intact(sym))
             throw std::runtime_error("品种名称损坏，保留原文件并停止恢复；请核对持仓及委托后按 docs/SYMBOL_RECOVERY.zh-CN.md 修复");
+
+        // Inspect every persisted owner before config or strategy filtering can discard this row.
+        std::string_view probe_account;
+        const auto account_err = o["ds_probe_account"].get(probe_account);
+        if (account_err != simdjson::SUCCESS && account_err != simdjson::NO_SUCH_FIELD)
+            throw std::runtime_error("ds_probe_account 状态字段损坏，保留原文件并停止恢复");
+        if (!expected_account.empty() && !probe_account.empty() && probe_account != expected_account)
+            throw std::runtime_error(sym + " 的止损保护断点属于其他账户，保留原文件并停止启动");
 
         bool is_auto = false;
         {
@@ -265,6 +326,15 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         // 自动 bot 例外：它本来就不在配置里，参数取智能模式模板
         const TrendConfig* cfg = nullptr;
         TrendConfig auto_cfg;
+        const auto retired_stop = get_str(o, "ds_cancel_id", "");
+        bool saved_probe = false;
+        const auto probe_err = o["ds_probe"].get(saved_probe);
+        if (probe_err != simdjson::SUCCESS && probe_err != simdjson::NO_SUCH_FIELD)
+            throw std::runtime_error("ds_probe 状态字段损坏，保留原文件并停止恢复");
+        int64_t probe_after_ms = 0;
+        const auto after_err = o["ds_probe_after_ms"].get(probe_after_ms);
+        if ((after_err != simdjson::SUCCESS && after_err != simdjson::NO_SUCH_FIELD) || probe_after_ms < 0)
+            throw std::runtime_error("ds_probe_after_ms 状态字段损坏，保留原文件并停止恢复");
         bool saved_uncertain = false;
         const auto uncertain_err = o["open_uncertain"].get(saved_uncertain);
         if (uncertain_err != simdjson::SUCCESS && uncertain_err != simdjson::NO_SUCH_FIELD)
@@ -272,7 +342,8 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         if (is_auto) {
             if (auto_tmpl) {
                 auto_cfg = *auto_tmpl;
-            } else if (saved_pos == (int)trend::Pos::Flat && !saved_uncertain && reentry_after == 0) {
+            } else if (saved_pos == (int)trend::Pos::Flat && !saved_uncertain && reentry_after == 0 &&
+                       retired_stop.empty() && !saved_probe && probe_after_ms <= 0) {
                 continue;
             }
             simdjson::dom::element saved_config;
@@ -295,6 +366,12 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         } else {
             for (const auto& c : cfgs) if (c.symbol == sym) { cfg = &c; break; }
         }
+        const bool recovery_only = !cfg && (!retired_stop.empty() || saved_probe || probe_after_ms > 0);
+        if (recovery_only) {
+            auto_cfg.symbol = sym;
+            auto_cfg.use_disaster_stop = true;
+            cfg = &auto_cfg;
+        }
         if (!cfg) continue;
 
         TrendBot b;
@@ -309,11 +386,19 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.uncertain_stop = get_num(o, "uncertain_stop", 0);
         b.pending_close_key = get_str(o, "pending_close_key", "");
         b.pending_close_reason = get_str(o, "pending_close_reason", "");
+        const auto read_evidence = [&](const char* field, ExitEvidence& result) {
+            simdjson::dom::element value;
+            if (o[field].get(value) == simdjson::SUCCESS)
+                read_exit_evidence_json(simdjson::minify(value), result);
+        };
+        read_evidence("pending_close_evidence", b.pending_close_evidence);
+        read_evidence("stop_evidence", b.stop_evidence);
+        read_evidence("hard_stop_evidence", b.hard_stop_evidence);
         b.pending_close_ms = static_cast<int64_t>(get_num(o, "pending_close_ms", 0));
         b.reserved_risk = get_num(o, "reserved_risk", 0);
         b.reserved_margin = get_num(o, "reserved_margin", 0);
         b.reserved_dir = (trend::Pos)(int)get_num(o, "reserved_dir", 0);
-        b.state = (TrendBot::State)(int)get_num(o, "state", 0);
+        b.state = recovery_only ? TrendBot::State::Stopped : (TrendBot::State)(int)get_num(o, "state", 0);
 
         const int pos = (int)get_num(o, "pos", (double)(int)trend::Pos::Flat);
         b.st.pos = (pos == (int)trend::Pos::Long)  ? trend::Pos::Long
@@ -339,7 +424,12 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.st.last_entry_bar_ms = get_i64(o, "last_entry_bar_ms", 0);
         b.st.consec_reverses = (int)get_num(o, "consec_reverses", 0);
         b.disaster_stop_id    = get_str(o, "disaster_stop_id", "");
+        b.ds_cancel_id        = retired_stop;
+        b.ds_probe            = saved_probe;
+        b.ds_probe_after_ms   = probe_after_ms;
+        b.ds_probe_account    = probe_account;
         b.ds_vanished_id      = get_str(o, "ds_vanished_id", "");
+        b.ds_vanished_price   = get_num(o, "ds_vanished_price", 0);
         b.disaster_stop_price = get_num(o, "disaster_stop_price", 0);
         b.st.cooldown_left   = (int)get_num(o, "cooldown_left", 0);
         b.qty           = get_num(o, "qty", 0);

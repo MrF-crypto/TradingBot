@@ -1,6 +1,7 @@
 // 数据记录层测试：CSV 格式、表头只写一次、按日文件、过期清理、字段转义。
 #include "core/journal.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -75,7 +76,8 @@ int main() {
         check(has(tl[1], "2026-10-10 13:00:00,2026-10-10 08:00:00,5,"), "  平仓/开仓时间与持仓小时");
         // 估算手续费 (100+110)*2*0.0005 = 0.21，净盈亏 19.79
         check(has(tl[1], ",0.21,19.79,"), "  估算手续费与净盈亏");
-        check(has(tl[2], "\"原因里有,英文逗号\""), "  原因含逗号：加引号，不串列");
+        check(has(tl[2], Journal::csv_field(format_exit_evidence({}, 110, t2.reason))),
+              "  原因含逗号：完整的原因字段加引号，不串列");
         check(has(tl[2], "19.79,,30,"), "  入场离边沿拿不到（NaN）：留空，不写 nan");
         check(has(tl[0], "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,"
                          "浮盈亏最低ATR,浮盈亏最高R,浮盈亏最低R,入场量比,入场箱体ATR,"
@@ -84,6 +86,39 @@ int main() {
         check(has(tl[1], ",0.8,30,-8,15,-4,7.5,-2,2.5,-0.6667,3.1,1.5,0.62,"),
               "  浮盈亏最高/最低：美元、%、ATR、R、量比、箱体、主动买入占比");
         check(has(tl[2], ",30,-8,15,-4,,,,,,,,\""), "  ATR / R / 触发 / 量比 / 箱体 / 主动买入没有：留空");
+    }
+
+    {
+        TrendTrade chip;
+        chip.symbol = "CHIPUSDT"; chip.side = trend::Pos::Long;
+        chip.entry_price = 0.05; chip.exit_price = 0.05135; chip.qty = 8000;
+        chip.pnl = 10.8;
+        chip.reason = "追踪止盈出场，等待新信号";
+        // The historical journal identifies the strategy, but not the trigger quote or ATR.
+        chip.exit_evidence = legacy_exit_evidence(chip.reason, true);
+        const auto explanation = format_exit_evidence(chip.exit_evidence, chip.exit_price, chip.reason);
+        check(has(explanation, "ATR") && has(explanation, "触发时参数=未记录") &&
+              has(explanation, "触发价=未记录") && has(explanation, "成交均价=0.05135"),
+              "CHIPUSDT：已知成交价，旧明细缺失的触发参数和价格明确标注");
+        const auto time = "2024-01-02 20:00:00";
+        const auto headless = Journal::headless_trade_row(chip, time);
+        const auto archive = dir / "upgrade";
+        fs::create_directories(archive);
+        // Synthetic row in the pre-upgrade format, with a plain-text reason.
+        std::ofstream(archive / "trades.csv", std::ios::binary)
+            << tl.front() << '\n'
+            << "2024-01-02 12:00:00,2024-01-02 10:00:00,2,CHIPUSDT,多,趋势跟踪,1h,自动,"
+               "0.05,0.05135,8000,10.8,0.4054,10.3946,0.75,32,-4,"
+               "8,-1,4,-0.5,1.6,-0.2,1.5,2.5,0.55,追踪止盈出场，等待新信号\n";
+        const auto previous = lines_of(archive / "trades.csv");
+        Journal after_upgrade(archive.string());
+        after_upgrade.trade(chip);
+        const auto journal = lines_of(archive / "trades.csv");
+        check(journal.size() == previous.size() + 1 &&
+              std::equal(previous.begin(), previous.end(), journal.begin()) &&
+              has(journal.back(), Journal::csv_field(explanation)) && has(headless, Journal::csv_field(explanation)) &&
+              has(headless, ",0.05,0.05135,8000,10.8,0\n"),
+              "升级后两种 CSV 共用说明，已写入的历史行和日盈亏列位置保留");
     }
 
     // ── 过滤 / 过期清理 ──

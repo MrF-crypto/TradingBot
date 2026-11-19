@@ -83,6 +83,10 @@ int main() {
             saved.uncertain_qty = 2; saved.uncertain_stop = 105;
             saved.pending_close_key = "closing-123"; saved.pending_close_reason = "止损确认";
             saved.pending_close_ms = 1800000000123LL;
+            saved.pending_close_evidence = {"空头 ATR 移动止损", "系数=3，快照=\"原始\"", 105.04, 105.0, 1800000000001LL};
+            saved.stop_evidence = {"空头 ATR 移动止损", "形成时ATR=2", {}, 105.0, 0};
+            saved.hard_stop_evidence = {"交易所硬止损", "初始线=105，外扩0.2%", {}, 105.21, 0};
+            saved.ds_vanished_id = "previous-stop"; saved.ds_vanished_price = 104.91;
             saved.reserved_risk = 10; saved.reserved_margin = 50;
             saved.monitor.model_key = monitor_model_key(saved.cfg);
             saved.monitor.cursor_ms = saved.monitor.target_ms = 1800000000000LL;
@@ -97,6 +101,10 @@ int main() {
                   loaded[0].uncertain_qty == 2 && loaded[0].uncertain_stop == 105 &&
                   loaded[0].pending_close_key == "closing-123" && loaded[0].pending_close_reason == "止损确认" &&
                   loaded[0].pending_close_ms == 1800000000123LL &&
+                  loaded[0].pending_close_evidence == saved.pending_close_evidence &&
+                  loaded[0].stop_evidence == saved.stop_evidence &&
+                  loaded[0].hard_stop_evidence == saved.hard_stop_evidence &&
+                  loaded[0].ds_vanished_price == saved.ds_vanished_price &&
                   loaded[0].reserved_risk == 10 && loaded[0].reserved_margin == 50 &&
                   loaded[0].monitor.cursor_ms == saved.monitor.cursor_ms && loaded[0].monitor.trend_bars == 9 &&
                   loaded[0].reentry_after_ms == saved.reentry_after_ms &&
@@ -104,6 +112,15 @@ int main() {
                   "restart preserves Chinese position, protective order, unknown opening and monitoring/re-entry progress");
         }
     });
+    {
+        // Diagnostic fields are optional even when restoring an open position or checking a close receipt.
+        write_file(path, R"([{"symbol":"CHIPUSDT","pos":1,"entry_price":0.05,"qty":8000,"stop":0.0513,"disaster_stop_id":"hard-1","pending_close_key":"close-1","pending_close_evidence":{"rule":false},"hard_stop_evidence":"damaged"}])");
+        const auto loaded = load_trend_state(path, {mk_cfg("CHIPUSDT")});
+        check(loaded.size() == 1 && loaded[0].qty == 8000 && loaded[0].st.stop == 0.0513 &&
+              loaded[0].disaster_stop_id == "hard-1" && loaded[0].pending_close_key == "close-1" &&
+              loaded[0].pending_close_evidence.empty() && loaded[0].hard_stop_evidence.empty() && loaded[0].stop_evidence.empty(),
+              "缺少或损坏的审计字段保留为未记录，已有仓位、止损和待查平仓回执继续恢复");
+    }
     {
         const std::string damaged = R"([{"symbol":"ɾ�ș�USDT","pos":2,"qty":2,"disaster_stop_id":"protect-123"}])";
         write_file(path, damaged);
@@ -194,6 +211,56 @@ int main() {
                   "  单号必须原样往返（丢了重启后新单会被交易所拒）");
             check(got[0].disaster_stop_price == b.disaster_stop_price,
                   "  触发价逐位无损（判断要不要重挂时要和新止损线比）");
+        }
+    }
+    {
+        TrendBot account;
+        account.ds_account_only = true;
+        account.ds_probe_after_ms = 1800000000000;
+        account.ds_probe_account = "self";
+        save_trend_state(path, {account});
+        const auto got = load_trend_state(path, {}, nullptr, "self");
+        check(got.size() == 1 && got[0].ds_account_only && got[0].cfg.symbol.empty() &&
+              got[0].ds_probe_after_ms == account.ds_probe_after_ms && got[0].ds_probe_account == "self",
+              "空监控列表的账户冷却独立落盘恢复，无需品种配置");
+        bool mismatch = false;
+        try { (void)load_trend_state(path, {}, nullptr, "another"); }
+        catch (const std::exception&) { mismatch = true; }
+        check(mismatch, "账户专属冷却记录校验所属账户");
+    }
+    {
+        auto cleared = mk_bot("ETHUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        cleared.ds_cancel_id = "401";
+        auto unknown = mk_bot("BTCUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        unknown.open_uncertain = unknown.ds_probe = true;
+        unknown.uncertain_client_id = "test-probe";
+        unknown.ds_probe_after_ms = 1740000000000;
+        unknown.ds_probe_account = "first-account";
+        auto cooldown = mk_bot("SOLUSDT", trend::Pos::Flat, 0, 0, 0, 0);
+        cooldown.ds_probe_after_ms = unknown.ds_probe_after_ms;
+        cooldown.ds_probe_account = unknown.ds_probe_account;
+        save_trend_state(path, {cleared, unknown, cooldown});
+        const auto got = load_trend_state(path, {}, nullptr, "first-account");
+        check(got.size() == 3 && got[0].ds_cancel_id == "401" && got[0].state == TrendBot::State::Stopped &&
+              got[0].ds_probe_account.empty() &&
+              got[1].open_uncertain && got[1].ds_probe && got[1].ds_probe_after_ms == unknown.ds_probe_after_ms &&
+              got[1].ds_probe_account == unknown.ds_probe_account && got[1].uncertain_client_id == unknown.uncertain_client_id,
+              "旧保护单撤销和未决试探的断点可落盘恢复，即使配置已移除");
+        check(got.size() == 3 && !got[2].ds_probe && got[2].state == TrendBot::State::Stopped &&
+              got[2].ds_probe_after_ms == cooldown.ds_probe_after_ms && got[2].ds_probe_account == cooldown.ds_probe_account,
+              "删除手动品种配置后亦保留所属账户的熔断冷却断点");
+    }
+    {
+        for (const auto fields : {R"("ds_probe":true)", R"("ds_probe_after_ms":1740000000000)",
+                                  R"("ds_cancel_id":"401")", R"("auto":true,"smart_list":75,"ds_cancel_id":"402")"}) {
+            const std::string original = R"([{"symbol":"BTCUSDT","ds_probe_account":"current","ds_probe":true},)"
+                R"({"symbol":"SOLUSDT","ds_probe_account":"other",)" + std::string(fields) + "}]";
+            write_file(path, original);
+            bool refused = false;
+            try { (void)load_trend_state(path, {}, nullptr, "current"); }
+            catch (const std::runtime_error& e) { refused = std::string(e.what()).find("属于其他账户") != std::string::npos; }
+            std::ifstream input(path, std::ios::binary); std::ostringstream contents; contents << input.rdbuf();
+            check(refused && contents.str() == original, "检测到其他账户的保护断点，整份原始断点逐字节保留");
         }
     }
 
@@ -376,16 +443,20 @@ int main() {
             "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\r\n"
             "2026-10-10 09:30:00,AAAUSDT,sar_long,追踪止盈出场，等待新信号,100,110,2,20,0\r\n"
             "2026-10-10 10:00:00,BBBUSDT,sar_short,原因里有,英文逗号,50,55,1,-5,0\r\n"
+            "2026-10-10 10:30:00,CHIPUSDT,sar_long,\"参数=ATR,\"\"3倍\"\"\n触发价=未记录\",0.05,0.05135,8000,10.8,0\r\n"
             "坏行\r\n"
             "2026-10-10 11:00:00,CCCUSDT,sar_long,x,abc,1,1,1,0\r\n");
         const auto t = load_trades_csv(csv);
-        check(t.size() == 2, "CSV：两行有效，坏行与非数字行跳过（实际 " + std::to_string(t.size()) + "）");
-        if (t.size() == 2) {
+        check(t.size() == 3, "CSV：新旧三行有效，坏行与非数字行跳过（实际 " + std::to_string(t.size()) + "）");
+        if (t.size() == 3) {
             check(t[0].symbol == "AAAUSDT" && t[0].pnl == 20 && t[0].qty == 2 &&
                   t[0].side == trend::Pos::Long, "  第一行各列读对");
             check(t[1].symbol == "BBBUSDT" && t[1].pnl == -5 && t[1].entry_price == 50 &&
                   t[1].side == trend::Pos::Short, "  原因里带英文逗号：数值列从行尾取，照样读对");
             check(t[0].close_time.time_since_epoch().count() != 0, "  时间读成了时间点");
+            check(t[2].reason == "参数=ATR,\"3倍\"\n触发价=未记录" && t[2].symbol == "CHIPUSDT" &&
+                  t[2].exit_price == 0.05135 && t[2].pnl == 10.8 &&
+                  t[1].reason == "原因里有,英文逗号", "日亏损恢复兼容历史裸逗号和完整带换行转义的成交说明");
         }
         check(load_trades_csv(csv + ".nope").empty(), "  文件不存在：空");
         std::remove(csv.c_str());

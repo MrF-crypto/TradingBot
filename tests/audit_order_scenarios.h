@@ -44,7 +44,7 @@ static void test_audit_order_scenarios() {
                     check(path == (mode == TradingClient::AccountMode::Futures ? "/fapi/v1/algoOrder" : "/papi/v1/um/algo/algoOrder"),
                           "protective execution lookup uses account-specific query endpoint");
                     out.body = "{\"algoId\":77,\"symbol\":\"BTCUSDT\",\"side\":\"SELL\",\"algoStatus\":\"" +
-                        std::string(scenario == 2 ? "CANCELED" : "FINISHED") + "\",\"actualOrderId\":\"88\"}";
+                        std::string(scenario == 2 ? "CANCELED" : "FINISHED") + "\",\"actualOrderId\":\"88\",\"triggerPrice\":\"91.25\"}";
                 } else if (path.find("/order") != std::string::npos) {
                     ++order_queries;
                     check(params.find("orderId=88") != std::string::npos,"look up actual order ID from protective order");
@@ -58,6 +58,8 @@ static void test_audit_order_scenarios() {
                   "closing the local leg does not prove an opposite exchange leg is also flat");
             check(result.position_known == (scenario != 0 && scenario != 5),"failed or malformed position data cannot prove flat");
             check(result.protective_fill.ok == (scenario == 4),"only a verified full execution proves a protective stop filled");
+            check(scenario == 4 ? result.threshold_price == 91.25 && result.protective_fill.avg_price == 90 :
+                  !result.threshold_price, "only the verified order supplies the stop level, independently of the fill");
             if (scenario == 1) check(result.remaining_qty == 1 && algo_queries == 0,"still held: do not infer close from stop state");
             if (scenario == 2) check(order_queries == 0,"canceled protective order is not a filled stop");
         }

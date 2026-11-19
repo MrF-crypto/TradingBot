@@ -41,6 +41,7 @@ public:
         // 0 = 普通合约账户，不适用
         double uni_mmr          = 0;
         std::string error;
+        bool available_verified = false;
     };
 
     struct Position {
@@ -67,6 +68,7 @@ public:
         // 平仓可以重试（reduceOnly 天然幂等）
         std::string client_order_id{};
         bool terminal = false;
+        bool not_found = false;
         bool        uncertain    = false;
     };
 
@@ -243,7 +245,7 @@ public:
         int64_t onboard_ms = 0, delivery_ms = 0;
         double  tick = 0;
     };
-    std::vector<MarketSymbol> fetch_exchange_symbols(bool* ok);   // exchangeInfo 全量，权重 1
+    std::vector<MarketSymbol> fetch_exchange_symbols(bool* ok, bool* complete = nullptr);
     struct Ticker24h { double quote_vol = 0, chg_pct = 0, last = 0; };
     std::unordered_map<std::string, Ticker24h> fetch_all_24h(bool* ok);   // 权重 40
     // 全市场最新资金费率，单位 %（lastFundingRate × 100）。权重 10
@@ -443,15 +445,10 @@ public:
         auto r = place_market(symbol, side, qty, reduce_only, tag);
         return {r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id};
     }
-    bool opening_order_terminal(const std::string& symbol, const std::string& id) override {
-        if (id.empty()) return false;
-        const auto r = query_order(symbol, id);
-        return r.terminal && !r.uncertain;
-    }
     OrderOutcome confirmed_order(const std::string& symbol, const std::string& id) override {
         const auto r = query_order(symbol, id);
         const bool confirmed = r.ok && r.terminal && !r.uncertain;
-        return {confirmed, r.order_id, r.error, r.avg_price, r.executed_qty, !confirmed, id};
+        return {confirmed, r.order_id, r.error, r.avg_price, r.executed_qty, !confirmed, id, r.not_found};
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;

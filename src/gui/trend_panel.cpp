@@ -10,6 +10,7 @@
 //
 // 落盘文件名仍是 sar_bots.json（v4.x 留下的），改名会让升级的人丢掉全部配置。
 #include "gui/main_window.h"
+#include "gui/trade_history.h"
 #include "core/app_logic.h"
 #include "core/atomic_file.h"
 
@@ -1505,12 +1506,19 @@ std::string MainWindow::trend_cfg_path() const {
     return (portable_data_dir() + "/sar_bots.json").toStdString();
 }
 
-void MainWindow::save_trend_bots() {
-    if (trendStateBlocked_) return;  // 不覆盖包含旧策略持仓的状态文件。
-    if (!trend_engine_) return;
+// Called by the GUI timer and synchronously by the engine before a breaker probe.
+// Only value objects are accessed here; no widgets or GUI-thread state.
+static SaveResult write_trend_bots(const std::string& path, const std::vector<TrendBot>& bots) {
     QJsonArray arr;
-    for (const auto& b : trend_engine_->get_bots()) {
+    for (const auto& b : bots) {
         QJsonObject o;
+        if (b.ds_account_only) {
+            o["checkpoint_kind"] = "stop_breaker";
+            o["ds_probe_account"] = QString::fromStdString(b.ds_probe_account);
+            o["ds_probe_after_ms"] = static_cast<qint64>(b.ds_probe_after_ms);
+            arr.append(o);
+            continue;
+        }
         o["symbol"]      = QString::fromStdString(b.cfg.symbol);
         o["budget_usdt"] = b.cfg.budget_usdt;
         o["leverage"]    = b.cfg.leverage;
@@ -1557,7 +1565,14 @@ void MainWindow::save_trend_bots() {
         // 单号必须跨重启存活：不存的话重启后会遗留一张触发价对不上的
         // 孤儿单，而 closePosition 同方向只能有一张，新的挂不上去
         o["disaster_stop_id"]    = QString::fromStdString(b.disaster_stop_id);
+        o["ds_cancel_id"]        = QString::fromStdString(b.ds_cancel_id);
+        o["ds_probe"]            = b.ds_probe;
+        o["ds_probe_after_ms"]   = static_cast<qint64>(b.ds_probe_after_ms);
+        if (!b.ds_probe_account.empty()) o["ds_probe_account"] = QString::fromStdString(b.ds_probe_account);
         o["ds_vanished_id"]      = QString::fromStdString(b.ds_vanished_id);
+        if (b.ds_vanished_price > 0) o["ds_vanished_price"] = b.ds_vanished_price;
+        put_exit_evidence(o, "stop_evidence", b.stop_evidence);
+        put_exit_evidence(o, "hard_stop_evidence", b.hard_stop_evidence);
         o["disaster_stop_price"] = b.disaster_stop_price;
         o["state"]           = (int)b.state;
         o["open_uncertain"] = b.open_uncertain || (b.pending && !b.rotation_reserved && b.st.pos == trend::Pos::Flat);
@@ -1566,6 +1581,7 @@ void MainWindow::save_trend_bots() {
         o["uncertain_stop"] = b.uncertain_stop;
         o["pending_close_key"] = QString::fromStdString(b.pending_close_key);
         o["pending_close_reason"] = QString::fromStdString(b.pending_close_reason);
+        put_exit_evidence(o, "pending_close_evidence", b.pending_close_evidence);
         o["pending_close_ms"] = static_cast<qint64>(b.pending_close_ms);
         o["reserved_risk"] = b.reserved_risk;
         o["reserved_margin"] = b.reserved_margin;
@@ -1617,8 +1633,19 @@ void MainWindow::save_trend_bots() {
         arr.append(o);
     }
     const auto payload = QJsonDocument(arr).toJson(QJsonDocument::Compact).toStdString();
-    const auto result = ccbot::write_atomic_file(trend_cfg_path(), payload);
-    if (trend_engine_) trend_engine_->set_persistence_error("趋势断点", result.error);
+    return write_atomic_file(path, payload);
+}
+
+void MainWindow::save_trend_bots() {
+    if (trendStateBlocked_ || !trend_engine_) return;
+    const auto path = trend_cfg_path();
+    SaveResult result{true, {}};
+    const bool saved = trend_engine_->save_checkpoint([&](const std::vector<TrendBot>& bots) {
+        result = write_trend_bots(path, bots);
+        return result.ok;
+    });
+    if (!saved && result.error.empty()) result = {false, "趋势断点写入失败"};
+    trend_engine_->set_persistence_error("趋势断点", result.error);
     if (!result.ok) {
         trendSaveFailed_ = true;
         statusBar()->showMessage("状态保存失败，已暂停新开仓：" + QString::fromStdString(result.error));
@@ -1631,8 +1658,18 @@ void MainWindow::save_trend_bots() {
 void MainWindow::load_and_restore_trend() {
     trendStateBlocked_ = false;
     if (!trend_engine_) return;
-    QFile f(QString::fromStdString(trend_cfg_path()));
-    if (!f.open(QIODevice::ReadOnly)) return;
+    const auto path = trend_cfg_path();
+    const auto account = client_->account_fingerprint();
+    trend_engine_->set_stop_checkpoint(account, [path](const std::vector<TrendBot>& bots) {
+        return write_trend_bots(path, bots).ok;
+    });
+    QFile f(QString::fromStdString(path));
+    if (!f.exists()) return;
+    if (!f.open(QIODevice::ReadOnly)) {
+        trendStateBlocked_ = true;
+        QMessageBox::critical(this, "无法读取趋势断点", f.errorString());
+        return;
+    }
     const auto doc = QJsonDocument::fromJson(f.readAll());
     if (!doc.isArray()) {
         trendStateBlocked_ = true;
@@ -1643,6 +1680,16 @@ void MainWindow::load_and_restore_trend() {
     trendStateBlocked_ = false;
     for (const auto& value : doc.array()) {
         const auto o = value.toObject();
+        if (o.contains("checkpoint_kind")) {
+            if (o["checkpoint_kind"].toString() != "stop_breaker" || doc.array().size() != 1 ||
+                o.size() != 3 || o["ds_probe_account"].toString().isEmpty() ||
+                o["ds_probe_account"].toString().toStdString() != account || o["ds_probe_after_ms"].toInteger() <= 0) {
+                trendStateBlocked_ = true;
+                QMessageBox::critical(this, "无法恢复账户熔断断点", "账户标识或冷却记录无效，已保留原文件。请核对当前账户。");
+                return;
+            }
+            continue;
+        }
         if (!value.isObject() || o["symbol"].toString().isEmpty()) {
             trendStateBlocked_ = true;
             QMessageBox::critical(this, "状态文件损坏", "状态条目或品种字段无效，已保留原文件。");
@@ -1680,6 +1727,20 @@ void MainWindow::load_and_restore_trend() {
                 "开仓委托状态字段损坏，已停止恢复并保留原状态文件。请先核对委托与持仓。");
             return;
         }
+        if ((o.contains("ds_probe") && !o["ds_probe"].isBool()) ||
+            (o.contains("ds_probe_account") && !o["ds_probe_account"].isString()) ||
+            (o.contains("ds_probe_after_ms") && o["ds_probe_after_ms"].toInteger(-1) < 0) ||
+            (o.contains("ds_cancel_id") && !o["ds_cancel_id"].isString())) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "状态文件损坏", "硬止损对账或熔断记录无效，已保留原状态文件。");
+            return;
+        }
+        const auto owner = o["ds_probe_account"].toString().toStdString();
+        if (!owner.empty() && owner != account) {
+            trendStateBlocked_ = true;
+            QMessageBox::critical(this, "账户与断点不匹配", "该硬止损断点属于另一组账户凭证。已保留原文件，请核对当前连接的账户。");
+            return;
+        }
         if (o.contains("reentry_after_ms") &&
             (!o["reentry_after_ms"].isDouble() || o["reentry_after_ms"].toInteger(-1) < 0)) {
             trendStateBlocked_ = true;
@@ -1706,6 +1767,14 @@ void MainWindow::load_and_restore_trend() {
     for (const auto& v : doc.array()) {
         if (!v.isObject()) continue;
         const auto o = v.toObject();
+        if (o.contains("checkpoint_kind")) {
+            TrendBot marker;
+            marker.ds_account_only = true;
+            marker.ds_probe_account = account;
+            marker.ds_probe_after_ms = o["ds_probe_after_ms"].toInteger();
+            trend_engine_->restore_bot(std::move(marker));
+            continue;
+        }
         if (o["strategy"].toInt(0) == 3 ||
             (o["auto"].toBool(false) && app::removed_smart_strategy((char)o["smart_list"].toInt(0))))
             continue;  // 已移除策略的空仓条目无需恢复。
@@ -1829,7 +1898,14 @@ void MainWindow::load_and_restore_trend() {
         b.cfg.disaster_stop_buffer_pct =
             o["disaster_stop_buffer_pct"].toDouble(1.0);
         b.disaster_stop_id    = o["disaster_stop_id"].toString().toStdString();
+        b.ds_cancel_id        = o["ds_cancel_id"].toString().toStdString();
+        b.ds_probe            = o["ds_probe"].toBool();
+        b.ds_probe_after_ms   = o["ds_probe_after_ms"].toInteger();
+        b.ds_probe_account    = o["ds_probe_account"].toString().toStdString();
         b.ds_vanished_id      = o["ds_vanished_id"].toString().toStdString();
+        b.ds_vanished_price   = o["ds_vanished_price"].toDouble();
+        b.stop_evidence       = get_exit_evidence(o["stop_evidence"]);
+        b.hard_stop_evidence  = get_exit_evidence(o["hard_stop_evidence"]);
         b.disaster_stop_price = o["disaster_stop_price"].toDouble(0.0);
         b.state = (TrendBot::State)o["state"].toInt(0);
         b.needs_reconcile = true;
@@ -1840,6 +1916,7 @@ void MainWindow::load_and_restore_trend() {
         b.uncertain_stop = o["uncertain_stop"].toDouble();
         b.pending_close_key = o["pending_close_key"].toString().toStdString();
         b.pending_close_reason = o["pending_close_reason"].toString().toStdString();
+        b.pending_close_evidence = get_exit_evidence(o["pending_close_evidence"]);
         b.pending_close_ms = o["pending_close_ms"].toVariant().toLongLong();
         b.reserved_risk = o["reserved_risk"].toDouble(0);
         b.reserved_margin = o["reserved_margin"].toDouble(0);

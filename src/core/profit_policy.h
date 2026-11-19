@@ -1,4 +1,5 @@
 #pragma once
+#include "core/exit_evidence.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -33,7 +34,13 @@ struct Guard {
     int weak = 0, recovered = 0;
     int64_t last_bar = 0, exit_ms = 0, fresh_after = 0;
     std::string reason;
+    ExitEvidence exit_evidence; // Frozen at the transition into Exiting for all orders in that exit.
     bool blocked() const { return phase != Phase::Watching; }
+    void reset_breadth(int64_t now) {
+        weak = recovered = 0;
+        breadth_peak = breadth = 0;
+        last_bar = now / 3600000 * 3600000;
+    }
     // curve = realized + marked unrealized, including estimated exit costs.
     // An invalid mark must never create a peak or an artificial drawdown.
     void update(const Config& c, int64_t now, double curve, bool prices_ok, bool exposed,
@@ -56,15 +63,23 @@ struct Guard {
             peak = std::max(peak, profit);
             armed = armed || peak >= c.arm_usdt;
         }
-        if (breadth_ok && bar > last_bar && bar <= now) {
+        const double upper = support_upper < 0 ? support : support_upper;
+        const auto is_weak = [&](double fraction) {
+            return fraction < c.weak_breadth || breadth_peak - fraction >= c.breadth_drop;
+        };
+        const bool weakening = is_weak(upper);
+        const bool recovery_known = support >= c.recover_breadth || upper < c.recover_breadth;
+        // A 90% response may still straddle a decision threshold. Leave that hour open
+        // for late votes; only a later nonconsecutive hour breaks a confirmation streak.
+        const bool decision_known = phase == Phase::Waiting ? recovery_known :
+            (weakening || !is_weak(support)) && (phase != Phase::Caution || weakening || recovery_known);
+        if (breadth_ok && decision_known && bar > last_bar && bar <= now) {
             const bool contiguous = last_bar == 0 || bar - last_bar == 3600000;
             if (!contiguous) { weak = 0; recovered = 0; }
             last_bar = bar; breadth = support;
             breadth_peak = std::max(breadth_peak, support);
             // Unknown members may support the direction. Only weaken on the upper bound;
             // recover and raise the breadth peak on the lower bound.
-            const double upper = support_upper < 0 ? support : support_upper;
-            const bool weakening = upper < c.weak_breadth || breadth_peak - upper >= c.breadth_drop;
             weak = weakening ? weak + 1 : 0;
             if (phase == Phase::Waiting) {
                 recovered = bar > exit_ms && support >= c.recover_breadth ? recovered + 1 : 0;
@@ -86,7 +101,7 @@ struct Guard {
         if (phase == Phase::Waiting || phase == Phase::Exiting) return;
         if (armed && prices_ok && exposed && peak > 0) {
             const double dd = (peak - profit) / peak;
-            if (dd >= c.hard_drawdown || (breadth_ok && weak >= c.confirm_bars && dd >= c.soft_drawdown)) {
+            if (dd >= c.hard_drawdown || (breadth_ok && last_bar == bar && weak >= c.confirm_bars && dd >= c.soft_drawdown)) {
                 phase = Phase::Exiting; exit_ms = now; recovered = 0;
                 reason = dd >= c.hard_drawdown ? "组合利润触及硬回撤线" : "市场广度转弱且组合利润回撤";
             }

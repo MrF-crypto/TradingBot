@@ -1,5 +1,6 @@
 #include "app/profit_manager.h"
 #include "core/atomic_file.h"
+#include "core/exit_evidence_json.h"
 #include "core/profit_json.h"
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@ std::string ProfitManager::serialize_locked() const {
     s << "{\"version\":1,\"account\":" << profit::quote(account_) << ",\"started\":" << started_
       << ",\"accumulation_since\":" << accumulation_since_ << ",\"sequence\":" << sequence_ << ",\"tracking\":" << tracking_
       << ",\"capital_floor\":" << capital_floor_ << ",\"used\":" << used_ << ",\"btc_qty\":" << btc_qty_ << ",\"spot_cash\":" << spot_cash_
+      << ",\"breadth_model\":" << profit::quote(breadth_signature_)
       << ",\"purchase\":{\"phase\":" << purchase_.phase << ",\"sent\":" << purchase_.sent << ",\"tag\":" << profit::quote(purchase_.tag)
       << ",\"transfer_id\":" << profit::quote(purchase_.transfer_id) << ",\"reserved\":" << purchase_.reserved << "},\"guards\":[";
     for (size_t i = 0; i < 2; ++i) {
@@ -20,11 +22,18 @@ std::string ProfitManager::serialize_locked() const {
           << ",\"anchor\":" << g.anchor << ",\"peak\":" << g.peak << ",\"profit\":" << g.profit << ",\"breadth_peak\":" << g.breadth_peak
           << ",\"breadth\":" << g.breadth << ",\"weak\":" << g.weak << ",\"recovered\":" << g.recovered
           << ",\"last_bar\":" << g.last_bar << ",\"exit_ms\":" << g.exit_ms << ",\"fresh_after\":" << g.fresh_after
-          << ",\"reason\":" << profit::quote(g.reason) << ",\"cohort\":[";
+          << ",\"reason\":" << profit::quote(g.reason);
+        if (!g.exit_evidence.empty()) s << ",\"exit_evidence\":" << exit_evidence_json(g.exit_evidence);
+        s << ",\"cohort\":[";
         bool first = true; for (const auto& symbol : cohorts_[i]) { if (!first) s << ',';
         first = false; s << profit::quote(symbol); } s << "]}";
     }
-    s << "],\"inherited\":["; bool first = true;
+    s << "],\"breadth_absent\":["; bool first = true;
+    for (const auto& [symbol, since] : missing_from_market_) {
+        if (!first) s << ',';
+        first = false; s << "{\"symbol\":" << profit::quote(symbol) << ",\"since\":" << since << '}';
+    }
+    s << "],\"inherited\":["; first = true;
     for (const auto& [symbol, qty] : inherited_) {
         if (!first) s << ',';
         first = false; s << "{\"symbol\":" << profit::quote(symbol) << ",\"qty\":" << qty << '}';
@@ -44,6 +53,8 @@ std::string ProfitManager::serialize_locked() const {
           << ",\"ok\":" << r.ok << ",\"uncertain\":" << r.uncertain << ",\"order\":" << profit::quote(r.order_id)
           << ",\"client\":" << profit::quote(r.client_order_id) << ",\"price\":" << r.avg_price << ",\"executed\":" << r.executed_qty
           << ",\"settled\":" << entry.settled << ",\"net\":" << entry.net << ",\"first\":" << entry.first_fill << ",\"last\":" << entry.last_fill;
+        if (e.opening && (!e.completed || r.uncertain) && e.required_margin > 0)
+            s << ",\"required_margin\":" << e.required_margin;
         if (!entry.recovery_open_key.empty())
             s << ",\"recovery_open\":" << profit::quote(entry.recovery_open_key)
               << ",\"gross\":" << entry.recovery_gross << ",\"fee\":" << entry.recovery_fee;
@@ -78,6 +89,7 @@ void ProfitManager::load() {
         simdjson::dom::parser p; auto o = p.parse(simdjson::padded_string(json)).value();
         using namespace profit;
         if (integer(o, "version") != 1 || string(o, "account") != account_) throw std::runtime_error("账本版本／API 账户不匹配，保留原文件");
+        if (o["breadth_model"].error() != simdjson::NO_SUCH_FIELD) breadth_signature_ = string(o, "breadth_model");
         started_ = integer(o, "started"); accumulation_since_ = integer(o, "accumulation_since"); sequence_ = integer(o, "sequence");
         tracking_ = boolean(o, "tracking"); capital_floor_ = number(o, "capital_floor"); used_ = number(o, "used"); btc_qty_ = number(o, "btc_qty"); spot_cash_ = number(o, "spot_cash");
         if (capital_floor_ < 0 || used_ < 0 || btc_qty_ < 0 || spot_cash_ < 0 || (tracking_ && started_ <= 0) || sequence_ > 1000000000)
@@ -98,11 +110,23 @@ void ProfitManager::load() {
                 throw std::runtime_error("保护计数不合法");
             g.weak = static_cast<int>(weak); g.recovered = static_cast<int>(recovered); g.last_bar = integer(row, "last_bar");
             g.exit_ms = integer(row, "exit_ms"); g.fresh_after = integer(row, "fresh_after"); g.reason = string(row, "reason");
+            simdjson::dom::element evidence;
+            if (row["exit_evidence"].get(evidence) == simdjson::SUCCESS)
+                read_exit_evidence_json(simdjson::minify(evidence), g.exit_evidence);
             if (g.peak < g.profit || (stage >= 2 && (!g.active || !g.armed || g.exit_ms == 0 || g.peak <= 0)))
                 throw std::runtime_error("保护阶段与峰值不一致");
             const auto symbols = row["cohort"].get_array().value();
             for (auto symbol : symbols) { auto sym = std::string(symbol.get_string().value()); if (sym.empty() || !cohorts_[i].insert(sym).second) throw std::runtime_error("广度名单重复"); }
             ++i;
+        }
+        if (o["breadth_absent"].error() != simdjson::NO_SUCH_FIELD) {
+            const auto absent = o["breadth_absent"].get_array().value();
+            for (auto row : absent) {
+                const auto symbol = string(row, "symbol");
+                const auto since = integer(row, "since");
+                if (cohorts_[0].count(symbol) || cohorts_[1].count(symbol))
+                    missing_from_market_.emplace(symbol, since);
+            }
         }
         const auto inherited = o["inherited"].get_array().value();
         for (auto row : inherited) {
@@ -128,6 +152,10 @@ void ProfitManager::load() {
             e.at_ms = integer(row, "at"); e.qty = number(row, "qty"); e.entry = number(row, "entry");
             r.ok = boolean(row, "ok"); r.uncertain = boolean(row, "uncertain"); r.order_id = string(row, "order"); r.client_order_id = string(row, "client");
             r.avg_price = number(row, "price"); r.executed_qty = number(row, "executed");
+            if (row["required_margin"].error() != simdjson::NO_SUCH_FIELD) {
+                e.required_margin = number(row, "required_margin");
+                if (e.required_margin <= 0) throw std::runtime_error("在途开仓保证金不合法");
+            }
             entry.settled = boolean(row, "settled"); entry.net = number(row, "net"); entry.first_fill = integer(row, "first"); entry.last_fill = integer(row, "last");
             if (row["recovery_open"].error() != simdjson::NO_SUCH_FIELD) {
                 entry.recovery_open_key = string(row, "recovery_open");

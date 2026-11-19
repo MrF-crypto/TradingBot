@@ -1,4 +1,5 @@
 #include "core/journal.h"
+#include "core/exit_evidence.h"
 
 #include <algorithm>
 #include <chrono>
@@ -146,13 +147,25 @@ void Journal::trade(const TrendTrade& t) {
       << num(t.mfe_r, 4)   << "," << num(t.mae_r, 4)   << ","
       << num(t.entry_vol_ratio, 4) << ","
       << num(t.entry_box_atr, 4) << "," << num(t.entry_taker, 4) << ","
-      << csv_field(t.reason) << "\n";
+      << csv_field(format_exit_evidence(t.exit_evidence, t.exit_price, t.reason)) << "\n";
     std::lock_guard<std::mutex> lk(mtx_);
     append("trades.csv",
            "平仓时间UTC,开仓时间UTC,持仓小时,品种,方向,策略,周期,手动自动,开仓价,平仓价,数量,盈亏U,估算手续费U,净盈亏U,入场离通道边沿ATR,"
            "浮盈亏最高U,浮盈亏最低U,浮盈亏最高%,浮盈亏最低%,浮盈亏最高ATR,浮盈亏最低ATR,"
            "浮盈亏最高R,浮盈亏最低R,入场量比,入场箱体ATR,入场主动买入占比,原因",
            l.str());
+}
+
+std::string Journal::headless_trade_row(const TrendTrade& t, const std::string& local_time) {
+    // reason carries the same evidence as the trade journal. Keep the five trailing
+    // accounting fields in their original positions for existing P&L readers.
+    std::ostringstream row;
+    row << local_time << ',' << csv_field(t.symbol) << ','
+        << (t.side == trend::Pos::Short ? "sar_short" : "sar_long") << ','
+        << csv_field(format_exit_evidence(t.exit_evidence, t.exit_price, t.reason)) << ','
+        << exit_number(t.entry_price) << ',' << exit_number(t.exit_price) << ','
+        << exit_number(t.qty) << ',' << exit_number(t.pnl) << ",0\n";
+    return row.str();
 }
 
 void Journal::filter(const FilterEvent& e) {

@@ -262,7 +262,7 @@ void TrendEngine::execute_rotation() {
             b.rotation_attempt_bar_ms = rotation_.bar_ms;
         }
         bool fully_closed = outgoing.empty();
-        if (!outgoing.empty()) execute_close(outgoing, "满仓换仓：持续失去原方向趋势许可", trend::Pos::Flat, &fully_closed);
+        if (!outgoing.empty()) execute_close(outgoing, "满仓换仓：持续失去原方向趋势许可", trend::Pos::Flat, {}, &fully_closed);
         {
             std::lock_guard<std::recursive_mutex> lk(mtx_);
             if (!fully_closed) {

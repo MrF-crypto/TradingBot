@@ -12,6 +12,27 @@ public:
 
 static void test_accounting_engine_scenarios() {
     {
+        auto cli = std::make_shared<ReceiptClient>();
+        TrendEngine e(cli, inline_host());
+        TrendBot probe;
+        probe.cfg = mk_cfg(); probe.cfg.use_disaster_stop = true;
+        probe.ds_probe = probe.open_uncertain = true;
+        probe.uncertain_stop = 100; probe.reserved_dir = trend::Pos::Long;
+        probe.uncertain_client_id = "persisted-before-post";
+        e.restore_bot(probe);
+        cli->receipt.not_found = true;
+        e.maintain_paused_hard_stops();
+        check(cli->queries == 1 && e.get_bots()[0].open_uncertain && cli->stop_log.empty(),
+              "not-found opening queries the original order once and waits for independent position confirmation");
+        cli->receipt = {true, "M1", "", 110, 2, false, probe.uncertain_client_id};
+        e.reconcile_positions({{probe.cfg.symbol, 1, 2, 110}}, std::chrono::milliseconds(0));
+        advance(61); e.maintain_paused_hard_stops();
+        const auto owner = e.get_bots()[0];
+        check(cli->queries == 2 && !owner.open_uncertain && owner.qty == 2 && owner.st.entry_price == 110 &&
+              !owner.disaster_stop_id.empty() && cli->calls.empty(),
+              "a later FILLED response restores price and quantity and protects the real position without resending");
+    }
+    {
         advance(1);
         auto cli = std::make_shared<ReceiptClient>();
         TrendEngine engine(cli, inline_host());

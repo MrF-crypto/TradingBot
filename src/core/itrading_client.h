@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include <cmath>
 
@@ -15,6 +16,7 @@ struct OrderOutcome {
     double      executed_qty = 0;
     bool        uncertain    = false;   // 状态不明（超时且查单失败）
     std::string client_order_id{};
+    bool not_found = false; // Explicit exchange response to lookup of the original client order ID.
 };
 
 inline void require_execution_price(OrderOutcome& r) {
@@ -38,9 +40,6 @@ public:
                                            double qty, bool reduce_only, const std::string& tag) {
         return place_market_order(symbol, side, qty, reduce_only);
     }
-    // True only after a successful query proves the opening order terminal.
-    // Unknown / unsupported is false, never inferred from an empty position snapshot.
-    virtual bool opening_order_terminal(const std::string&, const std::string&) { return false; }
     // A read of the original order, never a new submission. ok implies terminal
     // with a confirmed quantity and (for nonzero fills) actual average price.
     virtual OrderOutcome confirmed_order(const std::string&, const std::string&) {
@@ -57,6 +56,7 @@ public:
         double remaining_qty = 0;
         OrderOutcome protective_fill; // Actual executed order, never the trigger price.
         bool has_opposite_position = false;
+        std::optional<double> threshold_price{}; // Trigger level from the verified protective order.
     };
     virtual CloseVerification verify_close(const std::string&, const std::string&,
                                             const std::string&) { return {}; }

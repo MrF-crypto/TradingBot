@@ -30,6 +30,8 @@ public:
 
     // 工具（测试也用）
     static std::string csv_field(const std::string& s);   // 含逗号/引号/换行时加引号
+    // Preserve the headless nine-column history consumed by the daily loss gate.
+    static std::string headless_trade_row(const TrendTrade& t, const std::string& local_time);
     static std::string utc_time(int64_t ms);              // "2026-10-10 08:00:00"
     static std::string utc_date(int64_t ms);              // "20261010"
 

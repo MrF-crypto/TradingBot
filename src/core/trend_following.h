@@ -42,6 +42,7 @@ struct SignalData {
     bool er_ok = false;
     double range_atr = 0; // completed signal candle's range / pre-breakout ATR
     double close_location = 0; // (completed close - low) / (high - low); data display only
+    double regime_close = 0; // completed candle used in the EMA regime comparison
 };
 struct Signal : SignalData {
     // Independent closed-candle evidence, also available when initial entry is intrabar.
@@ -112,6 +113,7 @@ inline SignalData compute_model(const std::vector<indicators::Ohlc>& bars,
     const auto er = indicators::efficiency_ratio(reference, channel_period, 0);
     s.er_ok = er.ok; s.er = er.er;
     const auto& b = closed.back();
+    s.regime_close = b.close;
     const double span = b.high - b.low;
     s.range_atr = span / s.atr;
     if (span > 0) {

@@ -1,14 +1,18 @@
-// Included by test_profit.cpp. All account, fill and position data are fabricated.
+// Included by test_profit.cpp. All accounts, sizes, prices, orders and timestamps are synthetic.
 enum class HistoryCase { Complete, ExchangeHolding, ReopenedDuringHistory, MissingFill, ForeignOpen, MissingFee, PositionError };
+enum class MissingPositions { ActShort, SevenShorts, LunaLong };
 
 struct MissingCloseFixture {
     const std::filesystem::path dir = std::filesystem::temp_directory_path() /
         ("tradingbot-profit-recovery-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const std::string checkpoint = (dir / "profit.json").string();
-    const std::map<std::string, double> quantities = {
-        {"ACTUSDT", 108898}, {"EVAAUSDT", 894.4}, {"MEGAUSDT", 20935}, {"QNTUSDT", 5.6},
-        {"RAYSOLUSDT", 618.7}, {"TRXUSDT", 3158}, {"ZECUSDT", 1.017}
-    };
+    static std::map<std::string, double> positions(MissingPositions sample) {
+        if (sample == MissingPositions::LunaLong) return {{"LUNA2USDT", 2000}};
+        if (sample == MissingPositions::ActShort) return {{"ACTUSDT", 80000}};
+        return {{"ACTUSDT", 80000}, {"EVAAUSDT", 750.5}, {"MEGAUSDT", 16000}, {"QNTUSDT", 4.8},
+                {"RAYSOLUSDT", 540.5}, {"TRXUSDT", 2400}, {"ZECUSDT", 1.125}};
+    }
+    const std::map<std::string, double> quantities;
     HistoryCase evidence = HistoryCase::Complete;
     std::string incomplete_symbol;
     bool later_cycle = false;
@@ -23,15 +27,27 @@ struct MissingCloseFixture {
     std::unique_ptr<ProfitManager> manager;
     std::unique_ptr<TradingClient> exchange;
 
+    static double entry_price(const std::string& symbol) { return symbol == "LUNA2USDT" ? .50 : 100; }
+    static double exit_price(const std::string& symbol, int fill_id, int order) {
+        if (symbol == "LUNA2USDT") {
+            if (fill_id == 13) return .476;
+            if (fill_id == 14) return .474;
+            return .470;
+        }
+        return order == 104 ? (symbol == "ZECUSDT" ? 103 : 98) : 99;
+    }
     std::string fill(const std::string& symbol, int id, int order, bool opening,
                      double qty, int64_t when, bool usdt) const {
-        const int price = opening ? 100 : (order == 104 ? (symbol == "ZECUSDT" ? 103 : 98) : 99);
+        const bool is_long = order < 200 && symbol == "LUNA2USDT"; // The later cycle is a short.
+        const bool long_leg = (mix_hedge_legs && id == 15) ? !is_long : is_long;
+        const double entry = entry_price(symbol);
+        const double price = opening ? entry : exit_price(symbol, id, order);
         std::ostringstream s;
         s << std::setprecision(14) << "{\"symbol\":" << profit::quote(symbol) << ",\"id\":" << id
-          << ",\"orderId\":" << order << ",\"positionSide\":\"" << (hedge ? (mix_hedge_legs && id == 15 ? "LONG" : "SHORT") : "BOTH")
-          << "\",\"side\":\"" << (opening ? "SELL" : "BUY")
+          << ",\"orderId\":" << order << ",\"positionSide\":\"" << (hedge ? (long_leg ? "LONG" : "SHORT") : "BOTH")
+          << "\",\"side\":\"" << (opening == is_long ? "BUY" : "SELL")
           << "\",\"price\":\"" << price << "\",\"qty\":\"" << qty << "\",\"quoteQty\":\"" << price * qty
-          << "\",\"time\":" << when << ",\"realizedPnl\":\"" << (opening ? 0 : qty * (100 - price))
+          << "\",\"time\":" << when << ",\"realizedPnl\":\"" << (opening ? 0 : qty * (is_long ? price - entry : entry - price))
           << "\",\"commission\":\"0.01\",\"commissionAsset\":\"" << (usdt ? "USDT" : "BNB") << "\"}";
         return s.str();
     }
@@ -49,8 +65,11 @@ struct MissingCloseFixture {
                     ",\"positionAmt\":" + profit::quote(amount) + "}";
             };
             const bool reopened = evidence == HistoryCase::ReopenedDuringHistory && history_queries > 0;
-            const auto amount = evidence == HistoryCase::ExchangeHolding || reopened ? "-1" : "0";
-            result.body = "[" + (hedge ? pos("LONG", "0") + "," + pos("SHORT", amount) : pos("BOTH", amount)) + "]";
+            const bool held = evidence == HistoryCase::ExchangeHolding || reopened;
+            const auto long_qty = held && symbol == "LUNA2USDT" ? "1" : "0";
+            const auto short_qty = held && symbol != "LUNA2USDT" ? "-1" : "0";
+            result.body = "[" + (hedge ? pos("LONG", long_qty) + "," + pos("SHORT", short_qty) :
+                                 pos("BOTH", symbol == "LUNA2USDT" ? long_qty : short_qty)) + "]";
             if (evidence == HistoryCase::PositionError) { result.code = 403; result.body = "{}"; }
         } else if (endpoint == "/fapi/v1/userTrades" && quantities.count(symbol)) {
             const double qty = quantities.at(symbol);
@@ -73,7 +92,7 @@ struct MissingCloseFixture {
             add(14, 103, false, qty / 4, now + hour + 1);
             if (evidence != HistoryCase::MissingFill && symbol != incomplete_symbol)
                 add(15, 104, false, qty / 2, now + 2 * hour, evidence != HistoryCase::MissingFee);
-            if (later_cycle && symbol == "ACTUSDT") {
+            if (later_cycle) {
                 add(20, 200, true, 7, now + 3 * hour);
                 add(21, 201, false, 7, now + 4 * hour);
             }
@@ -90,7 +109,8 @@ struct MissingCloseFixture {
         }
         return true;
     }
-    explicit MissingCloseFixture(bool all, bool use_hedge = false, bool partial_booked = false) : hedge(use_hedge) {
+    explicit MissingCloseFixture(MissingPositions sample, bool use_hedge = false, bool partial_booked = false)
+        : quantities(positions(sample)), hedge(use_hedge) {
         if (!std::filesystem::create_directory(dir)) throw std::runtime_error("cannot create isolated test directory");
         TradingClient::Config network;
         network.api_key = "offline"; network.api_secret = "offline"; network.testnet = false;
@@ -102,25 +122,28 @@ struct MissingCloseFixture {
         cfg.protect = true; cfg.accumulate = false;
         reload();
         for (const auto& [symbol, qty] : quantities) {
-            if (!all && symbol != "ACTUSDT") continue;
+            const bool is_long = symbol == "LUNA2USDT";
+            const double entry = entry_price(symbol);
             ExecutionEvent e;
             e.bot_id = "old-bot-" + symbol; e.symbol = symbol; e.is_auto = e.completed = e.opening = true;
-            e.direction = -1; e.qty = qty; e.at_ms = now + 1000;
-            e.result = {true, "100", "", 100, qty, false, ""};
-            check(manager->record(e), "persist owned short with exchange receipt");
-            if (symbol == "MEGAUSDT" || symbol == "EVAAUSDT") {
-                auto rejected = e; rejected.key.clear(); rejected.opening = false; rejected.entry = 100;
+            e.direction = is_long ? 1 : -1; e.qty = qty; e.at_ms = now + 1000;
+            e.result = {true, "100", "", entry, qty, false, ""};
+            check(manager->record(e), "persist owned opening with exchange receipt");
+            if (is_long || symbol == "MEGAUSDT" || symbol == "EVAAUSDT") {
+                auto rejected = e; rejected.key.clear(); rejected.opening = false; rejected.entry = entry;
                 rejected.at_ms += hour; rejected.result = {};
                 check(manager->record(rejected), "persist rejected close without crediting any execution");
             }
             if (partial_booked) {
-                auto partial = e; partial.key.clear(); partial.opening = false; partial.entry = 100;
+                auto partial = e; partial.key.clear(); partial.opening = false; partial.entry = entry;
                 partial.qty = qty / 2; partial.at_ms = now + hour + 1;
-                partial.result = {true, "103", "", 99, partial.qty, false, ""};
+                const double avg = (exit_price(symbol, 13, 103) + exit_price(symbol, 14, 103)) / 2;
+                partial.result = {true, "103", "", avg, partial.qty, false, ""};
                 check(manager->record(partial), "persist already recorded partial close");
             }
             TrendBot b; b.is_auto = true; b.cfg.symbol = symbol; b.qty = partial_booked ? qty / 2 : qty;
-            b.st.pos = trend::Pos::Short; b.st.entry_price = 100; b.st.stop = 110;
+            b.st.pos = is_long ? trend::Pos::Long : trend::Pos::Short;
+            b.st.entry_price = entry; b.st.stop = entry * (is_long ? .9 : 1.1);
             engine->restore_bot(b);
         }
         time = now + hour + 5000;
@@ -129,9 +152,12 @@ struct MissingCloseFixture {
         reload(); // Exchange closures happened offline. Only the opening receipts survived locally.
         for (const auto& [symbol, qty] : quantities) {
             (void)qty;
-            if (!all && symbol != "ACTUSDT") continue;
             TrendConfig c; c.symbol = symbol; c.use_disaster_stop = false;
-            engine->add_bot(c, true);
+            if (sample == MissingPositions::LunaLong) {
+                TrendBot stopped; stopped.cfg = c; stopped.is_auto = true; stopped.monitor.saved = true;
+                stopped.state = TrendBot::State::Stopped;
+                engine->restore_bot(stopped);
+            } else engine->add_bot(c, true);
         }
         engine->reconcile_positions({}, std::chrono::milliseconds(0));
         manager->evaluate(*engine, time);
@@ -179,13 +205,13 @@ struct MissingCloseFixture {
     void record_later_cycle(bool close_recorded) {
         later_cycle = true;
         ExecutionEvent e;
-        e.bot_id = "new-bot-ACT"; e.symbol = "ACTUSDT"; e.is_auto = e.completed = e.opening = true;
+        e.symbol = quantities.begin()->first; e.bot_id = "new-bot-" + e.symbol; e.is_auto = e.completed = e.opening = true;
         e.direction = -1; e.qty = 7; e.at_ms = now + 3 * hour;
-        e.result = {true, "200", "", 100, 7, false, ""};
+        e.result = {true, "200", "", entry_price(e.symbol), 7, false, ""};
         check(manager->record(e), "later owned opening has an independent order identity");
         if (close_recorded) {
-            e.key.clear(); e.opening = false; e.entry = 100; e.at_ms = now + 4 * hour;
-            e.result = {true, "201", "", 99, 7, false, ""};
+            e.key.clear(); e.opening = false; e.entry = entry_price(e.symbol); e.at_ms = now + 4 * hour;
+            e.result = {true, "201", "", exit_price(e.symbol, 21, 201), 7, false, ""};
             check(manager->record(e), "existing later close receipt belongs to the later cycle");
         }
     }
@@ -193,7 +219,81 @@ struct MissingCloseFixture {
 
 void profit_recovery_tests() {
     {
-        MissingCloseFixture f(true);
+        // The LUNA2 opening survived alongside a failed close receipt with no order ID.
+        // The exit prices, fees and timestamps below are independent offline test data.
+        MissingCloseFixture f(MissingPositions::LunaLong);
+        f.evidence = HistoryCase::MissingFill;
+        f.service();
+        check(f.history_pending() && f.settled_closes().first == 0 && f.manager->recovered_trades().empty(),
+              "a failed LUNA2 exit and incomplete exchange fills cannot settle the long");
+        f.evidence = HistoryCase::ReopenedDuringHistory;
+        f.history_queries = 0;
+        const int before = f.position_queries;
+        f.service();
+        check(f.history_queries > 0 && f.position_queries == before + 2 && f.history_pending() &&
+              f.settled_closes().first == 0, "a long reopened during the history query invalidates the flat snapshot");
+        f.evidence = HistoryCase::Complete;
+        f.service();
+        const auto history = f.manager->recovered_trades();
+        const double exit = (.476 + .474 + 2 * .470) / 4;
+        const double gross = 2000 * (exit - .50);
+        const auto [count, net] = f.settled_closes();
+        check(!f.history_pending() && count == 2 && near(net, gross - .03) && f.unknown == 0 && f.writes == 0,
+              "two verified LUNA2 closing orders settle actual gross loss minus three commissions");
+        const auto bots = f.engine->get_bots();
+        check(std::any_of(bots.begin(), bots.end(), [](const auto& b) {
+            return b.cfg.symbol == "LUNA2USDT" && b.state == TrendBot::State::Stopped && b.st.pos == trend::Pos::Flat;
+        }), "backfilling a stopped, flat LUNA2 bot leaves its saved trading state intact");
+        check(history.size() == 1 && history[0].symbol == "LUNA2USDT" && history[0].side == trend::Pos::Long &&
+              near(history[0].qty, 2000) && near(history[0].entry_price, .50) && near(history[0].exit_price, exit) &&
+              near(history[0].pnl, gross) && history[0].close_time == std::chrono::system_clock::time_point(std::chrono::milliseconds(now + 2 * hour)),
+              "LUNA2 reports the actual closing time, fill-weighted price and a long-side loss");
+        f.reload(); f.service();
+        const auto restored = f.manager->recovered_trades();
+        check(!f.history_pending() && f.settled_closes() == std::make_pair(count, net) && restored.size() == 1 &&
+              restored[0].side == trend::Pos::Long && near(restored[0].pnl, gross),
+              "a restart retains the reconciled long without duplicating receipts or commissions");
+    }
+    {
+        MissingCloseFixture f(MissingPositions::LunaLong);
+        f.evidence = HistoryCase::MissingFill;
+        int receipts = 0;
+        f.engine->set_execution_cb([&](ExecutionEvent& event) {
+            if (!f.manager->record(event)) return false;
+            if (event.completed && event.result.ok) ++receipts;
+            return true;
+        });
+        f.during_history = [&] {
+            for (bool buy : {true, false}) {
+                TrendConfig probe; probe.symbol = buy ? "UPUSDT" : "DOWNUSDT"; probe.use_disaster_stop = false;
+                const auto id = f.engine->add_bot(probe, true);
+                f.engine->update_signal(id, 2, 2, true, 110, 90, f.time / hour * hour);
+                f.engine->tick(probe.symbol, 100);
+                f.engine->tick(probe.symbol, buy ? 111 : 89);
+            }
+        };
+        f.service();
+        check(f.history_pending() && f.broker->opens == 2 && receipts == 2,
+              "long and short breakouts submit and journal their fills during the LUNA2 history request");
+    }
+    {
+        MissingCloseFixture f(MissingPositions::LunaLong, true);
+        f.record_later_cycle(false); // A separately owned short on the same instrument.
+        f.mix_hedge_legs = true;
+        f.service();
+        check(f.history_pending() && f.settled_closes().first == 0, "a SHORT fill cannot complete a LONG close in hedge mode");
+        f.mix_hedge_legs = false;
+        f.service();
+        const auto history = f.manager->recovered_trades();
+        const auto short_trade = std::find_if(history.begin(), history.end(), [](const auto& t) { return t.side == trend::Pos::Short; });
+        const auto long_trade = std::find_if(history.begin(), history.end(), [](const auto& t) { return t.side == trend::Pos::Long; });
+        check(!f.history_pending() && f.settled_closes().first == 3 && history.size() == 2 &&
+              long_trade != history.end() && near(long_trade->qty, 2000) && long_trade->pnl < 0 &&
+              short_trade != history.end() && near(short_trade->qty, 7) && near(short_trade->pnl, 7 * (.50 - .470)),
+              "the earlier missing LUNA2 long and its later short use independent owned fills and P&L signs");
+    }
+    {
+        MissingCloseFixture f(MissingPositions::SevenShorts);
         TrendConfig probe; probe.symbol = "PROBEUSDT"; probe.use_disaster_stop = false;
         const auto id = f.engine->add_bot(probe, true);
         check(f.history_pending(), "restart detects the seven missing short close receipts");
@@ -232,7 +332,7 @@ void profit_recovery_tests() {
               "repeated service and restart do not duplicate recovered receipts or fees");
     }
     {
-        MissingCloseFixture f(false, true);
+        MissingCloseFixture f(MissingPositions::ActShort, true);
         f.mix_hedge_legs = true;
         f.service();
         check(f.history_pending() && f.settled_closes().first == 0, "a LONG fill cannot complete a SHORT recovery");
@@ -242,7 +342,7 @@ void profit_recovery_tests() {
               "empty hedge legs and complete SHORT history can recover the missing short");
     }
     {
-        MissingCloseFixture f(false, false, true);
+        MissingCloseFixture f(MissingPositions::ActShort, false, true);
         f.service();
         const auto history = f.manager->recovered_trades();
         check(!f.history_pending() && f.settled_closes().first == 2 && history.size() == 1 &&
@@ -250,7 +350,7 @@ void profit_recovery_tests() {
               "already booked partial close retains its original receipt; history adds only the missing remainder");
     }
     for (const bool protect : {true, false}) {
-        MissingCloseFixture f(false);
+        MissingCloseFixture f(MissingPositions::ActShort);
         f.cfg.protect = protect;
         f.manager->configure(f.cfg, true, f.time);
         f.manager->evaluate(*f.engine, f.time);
@@ -272,7 +372,7 @@ void profit_recovery_tests() {
         check(!f.history_pending() && f.settled_closes().first == 2, "fresh evidence after the pending order clears is accepted");
     }
     for (const bool later_close_recorded : {true, false}) {
-        MissingCloseFixture f(false);
+        MissingCloseFixture f(MissingPositions::ActShort);
         f.record_later_cycle(later_close_recorded);
         f.reload();
         f.service();
@@ -292,7 +392,7 @@ void profit_recovery_tests() {
     }
     for (const auto scenario : {HistoryCase::ExchangeHolding, HistoryCase::ReopenedDuringHistory, HistoryCase::MissingFill,
                                 HistoryCase::ForeignOpen, HistoryCase::MissingFee, HistoryCase::PositionError}) {
-        MissingCloseFixture f(false); f.evidence = scenario;
+        MissingCloseFixture f(MissingPositions::ActShort); f.evidence = scenario;
         f.service();
         check(f.position_queries > 0 && f.history_pending() && f.settled_closes().first == 0 && f.writes == 0,
               "non-flat, incomplete, mixed or unavailable evidence leaves the discrepancy open and all fills unbooked");

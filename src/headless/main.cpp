@@ -205,6 +205,18 @@ int main(int argc, char** argv) {
     for (const auto& w : cfg.warnings) log_line("⚠ 配置警告: " + w, "WARN");
 
     auto client = std::make_shared<TradingClient>(tc_cfg);
+    const std::string account = client->account_fingerprint();
+    const std::string trend_state_path = cfg.state_path + ".sar"; // Existing installations use this suffix.
+    std::vector<TrendBot> trend_saved;
+    try {
+        trend_saved = load_trend_state(trend_state_path, cfg.trend_bots,
+                                       cfg.smart.enabled ? &cfg.smart.tmpl : nullptr, account);
+    } catch (const std::exception& e) {
+        log_line(e.what(), "ERR");
+        std::error_code ec;
+        std::filesystem::remove(lock_path, ec);
+        return 1;
+    }
     const auto first_sync = client->sync_server_time();
     // 探测持仓模式（单向/双向）。此前这个查询【从未被调用】，dual_mode_ 一直是
     // 默认的 false，等于把"单向持仓"写死了：账户若是双向，每笔单都缺 positionSide
@@ -242,6 +254,7 @@ int main(int argc, char** argv) {
     // 表头保留 layers 列但恒为 0：网格DCA 移除后不再有"层"这个概念，
     // 而改表头会让已有的 CSV 与新写入的行对不上列——历史数据还要能读
     const std::string trades_csv = "ccbot_trades.csv";
+    std::mutex trade_csv_mutex;
     if (!std::filesystem::exists(trades_csv)) {
         std::ofstream f(trades_csv);
         if (f) f << "time,symbol,direction,reason,entry_price,exit_price,qty,pnl,layers\n";
@@ -253,13 +266,14 @@ int main(int argc, char** argv) {
         (std::filesystem::path(cfg.state_path).parent_path() / "journal").string());
     std::shared_ptr<TrendEngine> trend_engine;
     std::vector<std::string> trend_ids;
-    // 状态文件仍带 .sar 后缀：老部署升级上来时这个文件已经存在，改名等于
-    // 把在跑的仓位状态丢掉
-    const std::string trend_state_path = cfg.state_path + ".sar";
     // 引擎一律创建：配置里一个手动 bot 都没有时，智能模式也可能在用它；
     // 智能模式关着时，状态文件里也可能有一笔还在持仓的自动 bot 要接着管
     {
         trend_engine = std::make_shared<TrendEngine>(client, pool);
+        trend_engine->set_stop_checkpoint(account,
+            [trend_state_path](const std::vector<TrendBot>& bots) {
+                return save_trend_state(trend_state_path, bots).ok;
+            });
         // 账户级闸门。v4.7.1 之前这两个配置项挂在 DCA 引擎上，DCA 移除后若不接到
         // 这里，它们就会【静默失效】——配置文件照样写着上限，进程照样启动，
         // 而上限根本没人执行
@@ -268,33 +282,17 @@ int main(int argc, char** argv) {
         trend_engine->set_log_cb([&](const std::string& msg) { log_line(msg); });
         trend_engine->set_filter_cb([j = journal](const FilterEvent& e) { j->filter(e); });
         trend_engine->set_trade_cb([&](const TrendTrade& tr) {
-            journal->trade(tr);   // 数据记录层：带开仓时的段、分数、入场离边沿多少 ATR
-            std::ostringstream ss;
-            ss << "[趋势] " << tr.symbol << " " << tr.reason
-               << " 开=$" << tr.entry_price << " 平=$" << tr.exit_price
-               << " P&L=" << tr.pnl << "U" << (tr.reversed ? "（已反手）" : "");
-            log_line(ss.str(), tr.pnl >= 0 ? "OK" : "WARN");
+            // The engine sends the confirmed fill and its decision through the log callback once.
+            journal->trade(tr);
+            const auto row = Journal::headless_trade_row(tr, now_str());
+            std::lock_guard<std::mutex> lock(trade_csv_mutex);
             std::ofstream f(trades_csv, std::ios::app);
-            if (f) f << now_str() << "," << tr.symbol << ","
-                     // 方向值保留 sar_ 前缀：这一列写进的是【追加型】CSV，
-                     // 老行已经这么记了。改了之后同一个文件里会有两种写法，
-                     // 任何按这一列分组的统计都会把同一个方向算成两个
-                     << (tr.side == trend::Pos::Short ? "sar_short" : "sar_long") << ","
-                     << tr.reason << "," << tr.entry_price << "," << tr.exit_price << ","
-                     << tr.qty << "," << tr.pnl << ",0\n";
+            if (f) f << row;
         });
         // 先恢复落盘状态，再把配置里新增、落盘没有的品种全新起步。
         // 顺序不能反：反了的话 add_bot 会先占住品种名，restore_bot 被拒，
         // 引擎以为自己空仓而交易所上的仓位还在
         // 自动 bot 不在配置里，用智能模式模板恢复参数（关着时空仓的自动 bot 会被丢弃）
-        std::vector<TrendBot> trend_saved;
-        try {
-            trend_saved = load_trend_state(trend_state_path, cfg.trend_bots,
-                                          cfg.smart.enabled ? &cfg.smart.tmpl : nullptr);
-        } catch (const std::exception& e) {
-            log_line(e.what(), "ERR");
-            return 1;
-        }
         std::set<std::string> trend_restored;
         for (auto& b : trend_saved) {
             auto id = trend_engine->restore_bot(b);
@@ -376,6 +374,7 @@ int main(int argc, char** argv) {
     std::set<std::string> sym_add_q, sym_del_q;
     std::atomic<bool> smart_busy{false};
     std::atomic<bool> profit_busy{false};
+    std::atomic<bool> breadth_busy{false};
     auto smart = std::make_shared<SmartRunner>(
         client, trend_engine, cfg.state_path + ".smart",
         [webhook](const std::string& m, bool warn) {
@@ -688,6 +687,12 @@ int main(int argc, char** argv) {
         {
             const int64_t now_ms = RestPriceFeed::now_ms();
             smart->evaluate_profits(client->market_time_ms());
+            if (tick_n % 5 == 1 && smart->needs_breadth_quotes() && !breadth_busy.exchange(true)) {
+                fetch_pool->submit([smart, &breadth_busy] {
+                    try { smart->refresh_breadth(); } catch (...) {}
+                    breadth_busy.store(false);
+                });
+            }
             if (tick_n % 10 == 3 && !profit_busy.exchange(true)) {
                 fetch_pool->submit([smart, now_ms, &profit_busy] {
                     try { smart->service_profits(now_ms); } catch (...) {}
@@ -883,11 +888,12 @@ int main(int argc, char** argv) {
                 // 静默失去保护：日志一片安静，而交易所上什么都没有。
                 // VPS 上没有界面，这层核对是唯一能发现它的东西
                 bool algo_ok = false;
+                const auto expected_stops = trend_engine ? trend_engine->capture_stop_orders() : TrendEngine::StopOrderSnapshot{};
                 auto live = client->fetch_open_algo_ids(&algo_ok);
                 // 拉取失败绝不核对：给空集合会让所有保护单被判成已消失，
                 // 白撤白挂一轮 —— 与上面那条同一个道理
                 if (algo_ok && trend_engine) {
-                    auto dissues = trend_engine->reconcile_stop_orders(live);
+                    auto dissues = trend_engine->reconcile_stop_orders(expected_stops, live);
                     if (!dissues.empty()) {
                         for (const auto& i : dissues)
                             log_line("⚠ 保护单核对: " + i, "WARN");

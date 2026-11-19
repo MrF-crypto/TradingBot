@@ -297,6 +297,9 @@ enum class Action {
     CloseReverseShort,  // 平多并反手做空
 };
 
+enum class ExitPath { None, StopLine, Breakeven, RoiTrail, TrendReversal, FailedBreakout };
+enum class StopChange { None, Strategy, Breakeven };
+
 struct Verdict {
     Action      action = Action::Hold;
     const char* reason = "";
@@ -304,6 +307,8 @@ struct Verdict {
     bool        profitable_exit = false;   // 本次出场是否 >= 成本价
     bool        filtered = false;          // 有突破信号，但被横盘突破过滤拦下
     bool        filtered_long = false;     // 被拦的是向上突破（日志要按方向解读效率比）
+    ExitPath    exit_path = ExitPath::None;
+    StopChange  stop_change = StopChange::None;
 };
 
 // 数据是否足以【开新仓】。三个策略要的东西不同：
@@ -672,6 +677,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         //   EP 仍然每拍更新（K线内的新高要算进去），只是 AF 是否加速、SAR 推多少，
         //   留到下一根K线开始时按"这根K线有没有刷新 EP"一次性结算。
         //   新K线那一拍的价格会先并进 EP 再结算——只差一个 3 秒的采样，可以忽略
+        const double previous_stop = st.stop;
         if (cfg.strategy == Strategy::ParabolicSar) {
             if (in.new_bar) {
                 // 标记为 0：刚从落盘恢复（这个字段不落盘），以当前 EP 起算，
@@ -689,11 +695,14 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
             st.stop = is_long ? std::max(st.stop, cand)    // 棘轮：只上不下
                               : std::min(st.stop, cand);
         }
+        if (st.stop != previous_stop) v.stop_change = StopChange::Strategy;
         // 保本：和 Chandelier 候选线一样走棘轮，谁更有利听谁的
         const bool be = breakeven_armed(st, cfg, in);
         if (be) {
             const double line = breakeven_line(st);
+            const double strategy_stop = st.stop;
             st.stop = is_long ? std::max(st.stop, line) : std::min(st.stop, line);
+            if (st.stop != strategy_stop) v.stop_change = StopChange::Breakeven;
         }
         v.stop = st.stop;
 
@@ -704,6 +713,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
              (!is_long && in.following.regime == following::Regime::Up))) {
             v.action = Action::Close;
             v.reason = "趋势反转：已收盘均线方向改变";
+            v.exit_path = ExitPath::TrendReversal;
             v.profitable_exit = is_long ? in.price >= st.entry_price : in.price <= st.entry_price;
             st.consec_reverses = 0;
             return v;
@@ -715,6 +725,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         if (fail_breakout(st, cfg, in)) {
             v.action = Action::Close;
             v.reason = "假突破：收盘跌回通道内";
+            v.exit_path = ExitPath::FailedBreakout;
             v.profitable_exit = is_long ? (in.price >= st.entry_price) : (in.price <= st.entry_price);
             st.consec_reverses = 0;
             return v;
@@ -724,6 +735,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         if (roi_trail_hit(st, cfg, in)) {
             v.action = Action::Close;
             v.reason = "追踪止盈：收益率从高点回撤";
+            v.exit_path = ExitPath::RoiTrail;
             v.profitable_exit = is_long ? (in.price >= st.entry_price) : (in.price <= st.entry_price);
             st.consec_reverses = 0;
             return v;
@@ -739,6 +751,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         // 触线出场。盈亏以【止损线】而非现价衡量：现价可能已经穿过线更多，
         // 但决策语义是"回撤到线就走"，用线判定才和事前预期一致
         const double exit_px = st.stop;
+        v.exit_path = ExitPath::StopLine;
         v.profitable_exit = is_long ? (exit_px >= st.entry_price)
                                     : (exit_px <= st.entry_price);
 
@@ -746,6 +759,7 @@ inline Verdict step(State& st, const Config& cfg, const Inputs& in) {
         if (be && st.stop == breakeven_line(st)) {
             v.action = Action::Close;
             v.reason = "保本止损出场";
+            v.exit_path = ExitPath::Breakeven;
             st.consec_reverses = 0;
             return v;
         }

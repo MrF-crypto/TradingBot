@@ -1,9 +1,12 @@
 #include "app/profit_manager.h"
 #include "core/atomic_file.h"
 #include "core/profit_json.h"
+#include "core/monitor_state.h"
+#include "core/parallel.h"
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace ccbot {
@@ -19,28 +22,102 @@ std::string phase_name(profit::Phase p) {
     return "未知";
 }
 bool holding(const TrendBot& b) { return b.qty > 0 && b.st.pos != trend::Pos::Flat; }
+std::set<std::string> running_hourly(const std::map<std::string, const TrendBot*>& bots) {
+    std::set<std::string> members;
+    for (const auto& [sym, b] : bots)
+        if (!b->retiring && b->state == TrendBot::State::Running && b->cfg.interval == "1h") members.insert(sym);
+    return members;
+}
 }
 ProfitManager::ProfitManager(std::string path, std::string account) : path_(std::move(path)), account_(std::move(account)) { load(); }
-void ProfitManager::configure(profit::Config cfg, bool enabled, int64_t now) {
+void ProfitManager::configure(profit::Config cfg, bool enabled, int64_t now, const TrendConfig& tmpl) {
     std::lock_guard<std::mutex> lk(mutex_);
     if (!profit::valid(cfg)) { error_ = "利润配置不合法"; return; }
+    auto breadth = tmpl;
+    breadth.interval = "1h";
+    breadth.rule.following.enabled = true; // The entry filter and the breadth indicator have separate switches.
+    const auto key = monitor_model_key(breadth);
+    if (key != breadth_signature_) {
+        if (!breadth_signature_.empty())
+            for (auto& g : guards_) if (g.active) g.reset_breadth(now);
+        ++observation_epoch_; observer_quotes_.clear();
+        breadth_signature_ = key;
+    }
+    breadth_model_ = breadth.rule.following; breadth_atr_ = breadth.rule.atr_period;
+    breadth_channel_ = breadth.rule.donchian_period;
+    if ((!enabled || !cfg.protect) && !observer_quotes_.empty()) {
+        ++observation_epoch_; observer_quotes_.clear();
+    }
     cfg_ = cfg; smart_enabled_ = enabled;
     if (enabled && (cfg.protect || cfg.accumulate) && !tracking_) { tracking_ = true; started_ = now; }
     if (enabled && cfg.accumulate && accumulation_since_ == 0) accumulation_since_ = now;
     if (tracking_) save_locked();
 }
-bool ProfitManager::record(ExecutionEvent& e) {
-    std::lock_guard<std::mutex> lk(mutex_);
+double ProfitManager::pending_open_margin_locked() const {
+    double margin = 0;
+    for (const auto& hold : submitting_margins_) margin += hold.second;
+    // An unresolved opening can survive the process that submitted it. Until
+    // it becomes terminal, do not also promise those funds to a different bot.
+    for (const auto& [key, item] : entries_) {
+        const auto& e = item.event;
+        if (!e.opening || (e.completed && !e.result.uncertain) ||
+            submitting_margins_.contains({e.bot_id, e.at_ms})) continue;
+        if (!(e.required_margin > 0)) return std::numeric_limits<double>::infinity();
+        margin += e.required_margin;
+    }
+    return margin;
+}
+
+bool ProfitManager::record(ExecutionEvent& e, TradingClient* client) {
+    std::unique_lock<std::mutex> lk(mutex_);
+    if (!tracking_) return true;
+    const auto intent = std::make_pair(e.bot_id, e.at_ms);
+    if (e.opening && !e.completed && purchase_.phase == 1) {
+        if (!client || !(e.required_margin > 0) || !std::isfinite(e.required_margin)) {
+            e.result.error = "划转待核，无法确认本单所需保证金";
+            return false;
+        }
+        const auto sent = purchase_.sent;
+        const double reserved = purchase_.reserved, pending = pending_open_margin_locked(), admitted = admitted_margin_;
+        lk.unlock();
+        const auto account = client->fetch_account();
+        lk.lock();
+        if (cancelled_ || damaged_) return false;
+        if (purchase_.phase == 1) {
+            if (sent != purchase_.sent || reserved != purchase_.reserved || !account.ok || !account.available_verified ||
+                !std::isfinite(account.available) || account.available < 0) {
+                e.result.error = "划转待核，本次未能核实合约可用保证金";
+                return false;
+            }
+            const double required = reserved + pending + (admitted_margin_ - admitted) + e.required_margin;
+            if (account.available + 1e-8 < required) {
+                e.result.error = "扣除待核划转及在途开仓后，可用保证金不足";
+                return false;
+            }
+        }
+    }
+    if (!record_locked(e)) return false;
+    ++execution_revision_;
+    if (e.opening) {
+        if (e.completed) submitting_margins_.erase(intent);
+        else if (purchase_.phase == 1) {
+            if (submitting_margins_.emplace(intent, e.required_margin).second) admitted_margin_ += e.required_margin;
+        }
+    }
+    return true;
+}
+
+bool ProfitManager::record_locked(ExecutionEvent& e) {
     if (!tracking_ || !e.is_auto) return true;
     if (cancelled_ || damaged_) return false;
     if (e.symbol.empty() || e.bot_id.empty() || e.at_ms <= 0 || (e.direction != 1 && e.direction != -1) ||
         !std::isfinite(e.qty) || e.qty <= 0 || !std::isfinite(e.entry) || e.entry < 0 ||
+        !std::isfinite(e.required_margin) || e.required_margin < 0 ||
         !std::isfinite(e.result.executed_qty) || e.result.executed_qty < 0 ||
         !std::isfinite(e.result.avg_price) || e.result.avg_price < 0 ||
         (e.completed && e.result.ok && e.result.executed_qty > 0 && e.result.avg_price <= 0)) {
         error_ = "成交回执数值不合法，保留原账本等待核对"; return false;
     }
-    if (e.opening && !e.completed && purchase_.phase != 0) return false;
     ++receipt_revision_[e.symbol];
     if (e.key.empty()) {
         // The durable sequence is also the clientOrderId. Never recycle it after restart.
@@ -180,41 +257,98 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
                     prices_ok[i] = inventory_ok_[i] = false;
                 }
             const auto bar = now / 3600000 * 3600000;
+            std::set<std::string> observers;
+            const auto has_live_source = [&](const TrendBot& b) {
+                return b.state == TrendBot::State::Running && b.cfg.interval == "1h" &&
+                    b.cfg.rule.atr_period == breadth_atr_ && b.cfg.rule.donchian_period == breadth_channel_ &&
+                    b.signal_following_config() == breadth_model_;
+            };
             for (size_t i = 0; i < 2; ++i) {
                 auto& g = guards_[i]; auto& cohort = cohorts_[i];
                 const auto previous_phase = g.phase;
-                if (!inventory_ok_[i] && previous_phase == profit::Phase::Watching) continue;
                 if (enabled && !g.active && exposed[i] && prices_ok[i]) {
                     g.active = true; g.anchor = realized[i] + entry_cost[i];
                     cohort.clear();
                 }
                 if (enabled && cohort.empty() && g.active) {
-                    for (const auto& [sym, b] : by_symbol) if (!b->retiring && b->state != TrendBot::State::Stopped && b->cfg.interval == "1h") cohort.insert(sym);
+                    cohort = running_hourly(by_symbol);
                     if (cohort.size() < 10) cohort.clear(); // Wait for the first successful candidate scan.
                 }
                 int ready = 0, support = 0;
+                auto& report = coverage_[i]; report = {};
                 for (const auto& sym : cohort) {
-                    const auto it = by_symbol.find(sym); if (it == by_symbol.end()) continue;
-                    const auto& b = *it->second;
-                    if (!b.sig_ok || b.monitor.recovering || b.bar_open_ms != bar || !b.following.ready || b.cfg.interval != "1h") continue;
+                    if (unavailable_.count(sym)) { ++report.unavailable; continue; }
+                    const auto it = by_symbol.find(sym);
+                    auto regime = following::Regime::Unknown;
+                    if (it != by_symbol.end() && has_live_source(*it->second)) {
+                        const auto& b = *it->second;
+                        if (b.sig_ok && !b.monitor.recovering && b.bar_open_ms == bar && b.following.ready &&
+                            b.following.settings == breadth_model_) regime = b.following.regime;
+                        if (regime == following::Regime::Unknown) {
+                            ++report.missing_live;
+                            if (report.error.empty() && !b.monitor.data_error.empty())
+                                report.error = sym + " " + b.monitor.data_error;
+                        }
+                    } else {
+                        const auto q = observer_quotes_.find(sym);
+                        if (q != observer_quotes_.end() && q->second.bar == bar) regime = q->second.regime;
+                        if (regime == following::Regime::Unknown) {
+                            ++report.missing_observer;
+                            if (q != observer_quotes_.end() && report.error.empty() && !q->second.error.empty())
+                                report.error = sym + " " + q->second.error;
+                        }
+                    }
+                    if (regime == following::Regime::Unknown) continue;
                     ++ready;
-                    if (b.following.regime == (i == 0 ? following::Regime::Up : following::Regime::Down)) ++support;
+                    if (regime == (i == 0 ? following::Regime::Up : following::Regime::Down)) ++support;
                 }
+                report.ready = static_cast<size_t>(ready);
                 // Fixed denominator: missing data cannot masquerade as weakening breadth.
                 const bool coverage = cohort.size() >= 10 && ready * 10 >= static_cast<int>(cohort.size()) * 9;
                 auto guard_config = cfg_; guard_config.protect = enabled;
-                g.update(guard_config, now, realized[i] + floating[i], prices_ok[i], exposed[i], bar,
+                if (inventory_ok_[i] || previous_phase != profit::Phase::Watching)
+                    g.update(guard_config, now, realized[i] + floating[i], prices_ok[i], exposed[i], bar,
                     cohort.empty() ? 0 : static_cast<double>(support) / static_cast<double>(cohort.size()), coverage && enabled,
                     cohort.empty() ? 1 : static_cast<double>(support + static_cast<int>(cohort.size()) - ready) / static_cast<double>(cohort.size()),
                     !inventory_ok_[i] && live_prices_ok[i]);
+                if (previous_phase != profit::Phase::Exiting && g.phase == profit::Phase::Exiting) {
+                    auto& ev = g.exit_evidence;
+                    ev = {};
+                    ev.rule = g.reason;
+                    ev.trigger_ms = g.exit_ms;
+                    const double drawdown = (g.peak - g.profit) / g.peak;
+                    ev.parameters = "启动利润 " + exit_number(cfg_.arm_usdt) + " U，组合峰值 " +
+                        exit_number(g.peak) + " U，当前利润 " + exit_number(g.profit) +
+                        " U，实际回撤 " + exit_number(drawdown * 100) + "%";
+                    if (drawdown >= cfg_.hard_drawdown) {
+                        ev.parameters += "，硬回撤阈值 " + exit_number(cfg_.hard_drawdown * 100) + "%";
+                    } else {
+                        ev.parameters += "，软回撤阈值 " + exit_number(cfg_.soft_drawdown * 100) +
+                            "%，广度转弱阈值 " + exit_number(cfg_.weak_breadth * 100) +
+                            "% 或较峰值下降 " + exit_number(cfg_.breadth_drop * 100) +
+                            " 个百分点，已确认 " + std::to_string(g.weak) + "/" +
+                            std::to_string(cfg_.confirm_bars) + " 根，支持 " + std::to_string(support) +
+                            " 个，有效样本 " + std::to_string(ready) + "/" + std::to_string(cohort.size());
+                    }
+                }
+                if (g.phase != profit::Phase::Exiting) g.exit_evidence = {};
                 if (previous_phase != profit::Phase::Waiting && g.phase == profit::Phase::Waiting) {
                     // A completed exit starts a new recovery cohort; confirmation counts restart.
-                    cohort.clear(); g.last_bar = bar; g.recovered = 0;
-                    for (const auto& [sym, b] : by_symbol) if (!b->retiring && b->cfg.interval == "1h") cohort.insert(sym);
+                    g.reset_breadth(now);
+                    cohort = running_hourly(by_symbol); report = {};
                     if (cohort.size() < 10) cohort.clear();
+                    ++observation_epoch_;
+                }
+                if (!g.active) { cohort.clear(); report = {}; }
+                if (enabled) for (const auto& sym : cohort) {
+                    if (unavailable_.count(sym)) continue;
+                    const auto it = by_symbol.find(sym);
+                    if (it == by_symbol.end() || !has_live_source(*it->second)) observers.insert(sym);
                 }
                 if (g.phase != previous_phase) notices_.push_back(std::string("组合利润保护：") + (i == 0 ? "多头 " : "空头 ") + phase_name(g.phase) + "；" + g.reason);
             }
+            std::erase_if(observer_quotes_, [&](const auto& item) { return !observers.count(item.first); });
+            for (const auto& sym : observers) observer_quotes_.try_emplace(sym);
             save_locked();
         }
         guards = guards_; error = error_;
@@ -228,8 +362,102 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
         const auto after = std::max(guards[i].fresh_after, guards[1 - i].exit_ms);
         engine.set_profit_gate(direction, closing ? "组合保护退出中，暂停智能新增风险" :
             (enabled && guards[i].blocked() ? guards[i].reason : ""), enabled ? after : 0);
-        if (enabled && guards[i].phase == profit::Phase::Exiting) engine.close_auto_direction(direction, guards[i].reason);
+        if (enabled && guards[i].phase == profit::Phase::Exiting)
+            engine.close_auto_direction(direction, guards[i].reason, guards[i].exit_evidence);
     }
+}
+
+bool ProfitManager::needs_breadth_quotes() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return !cancelled_ && smart_enabled_ && cfg_.protect && !damaged_ && !observer_quotes_.empty();
+}
+
+void ProfitManager::refresh_breadth(TradingClient& client) {
+    constexpr int64_t hour = 3600000, retry_ms = 60000;
+    const auto now = client.market_time_ms(), bar = now / hour * hour;
+    std::vector<std::pair<int64_t, std::string>> work;
+    following::Config model;
+    int channel, atr;
+    uint64_t epoch;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (cancelled_ || !smart_enabled_ || !cfg_.protect || damaged_) return;
+        for (const auto& [sym, q] : observer_quotes_)
+            if (q.bar != bar && (q.attempted <= 0 || now - q.attempted >= retry_ms))
+                work.emplace_back(q.attempted, sym);
+        // Oldest attempt first so permanently unavailable tickers cannot starve the remainder.
+        std::sort(work.begin(), work.end());
+        if (work.size() > 8) work.resize(8);
+        for (const auto& [attempted, sym] : work) observer_quotes_.at(sym).attempted = now;
+        epoch = observation_epoch_; model = breadth_model_; channel = breadth_channel_; atr = breadth_atr_;
+    }
+    parallel_for(static_cast<int>(work.size()), 2, [&](int i) {
+        if (cancelled_) return;
+        const auto& sym = work[i].second;
+        TradingClient::TrendSnapshot signal;
+        try { signal = client.fetch_trend_signal(sym, "1h", channel, atr, model); }
+        catch (...) { signal.error = "读取收盘数据异常"; }
+        const auto received = client.market_time_ms();
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto q = observer_quotes_.find(sym);
+        if (cancelled_ || epoch != observation_epoch_ || unavailable_.count(sym) || q == observer_quotes_.end() ||
+            q->second.attempted != now || !smart_enabled_ || !cfg_.protect || damaged_) return;
+        if (received / hour * hour != bar || signal.bar_open_ms != bar || !signal.ok ||
+            !signal.following.ready || signal.following.settings != model ||
+            signal.following.regime == following::Regime::Unknown) {
+            q->second.error = signal.error.empty() ? "等待本小时完整收盘数据" : signal.error;
+            return;
+        }
+        q->second.bar = bar; q->second.regime = signal.following.regime; q->second.error.clear();
+    });
+}
+
+void ProfitManager::update_breadth_market(const std::set<std::string>& listed, const std::set<std::string>& settled,
+                                        const std::set<std::string>& candidates, int64_t now) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (cancelled_ || !smart_enabled_ || !cfg_.protect || damaged_ || listed.empty() || now <= 0) return;
+    std::set<std::string> permanent = settled;
+    std::set<std::string> tracked;
+    for (const auto& members : cohorts_) tracked.insert(members.begin(), members.end());
+    bool absence_changed = std::erase_if(missing_from_market_, [&](const auto& item) {
+        return !tracked.count(item.first) || listed.count(item.first);
+    }) != 0;
+    for (const auto& sym : tracked) if (!listed.count(sym)) {
+        const auto [it, first] = missing_from_market_.try_emplace(sym, now);
+        absence_changed |= first;
+        if (!first && now - it->second >= 3600000) permanent.insert(sym);
+    }
+    unavailable_.clear();
+    for (const auto& sym : tracked) if (permanent.count(sym)) unavailable_.insert(sym);
+    bool changed = false;
+    for (size_t i = 0; i < cohorts_.size(); ++i) {
+        auto& cohort = cohorts_[i];
+        const auto target = cohort.size();
+        if (!guards_[i].active || target == 0) continue;
+        auto replacement = candidates.begin();
+        std::vector<std::pair<std::string, std::string>> swaps;
+        for (const auto& old : cohort) if (permanent.count(old)) {
+            while (replacement != candidates.end() && (cohort.count(*replacement) ||
+                   !listed.count(*replacement) || permanent.count(*replacement))) ++replacement;
+            if (replacement == candidates.end()) break;
+            swaps.emplace_back(old, *replacement++);
+        }
+        if (swaps.empty()) continue;
+        // One for one. A confirmed vacancy with no eligible replacement stays in the denominator.
+        for (const auto& [old, fresh] : swaps) { cohort.erase(old); cohort.insert(fresh); }
+        guards_[i].reset_breadth(now); coverage_[i] = {};
+        notices_.push_back(std::string(i == 0 ? "多头" : "空头") + "组合广度：已核实合约下架，等量替换 " +
+            std::to_string(swaps.size()) + "/" + std::to_string(target) + " 个样本（" + swaps.front().first + " → " +
+            swaps.front().second + "），从下根收盘重新确认");
+        changed = true;
+    }
+    if (changed) {
+        ++observation_epoch_; observer_quotes_.clear();
+        std::erase_if(missing_from_market_, [&](const auto& item) {
+            return !cohorts_[0].count(item.first) && !cohorts_[1].count(item.first);
+        });
+    }
+    if (changed || absence_changed) save_locked();
 }
 
 void ProfitManager::totals_locked(double& shorts, double& overall, bool& complete) const {
@@ -289,7 +517,12 @@ std::string ProfitManager::status() const {
     for (size_t i = 0; i < 2; ++i) {
         const auto& g = guards_[i];
         s << (i == 0 ? "多头" : "空头") << "：" << phase_name(g.phase) << "，本轮 " << g.profit << "U / 峰值 " << g.peak
-          << "U，最近有效广度下界 " << g.breadth * 100 << "%（固定候选 " << cohorts_[i].size() << "）\n";
+          << "U，最近有效广度下界 " << g.breadth * 100 << "%（本小时有效 " << coverage_[i].ready << "/" << cohorts_[i].size() << "）";
+        if (coverage_[i].missing_live) s << "，等待机器人收盘数据 " << coverage_[i].missing_live;
+        if (coverage_[i].missing_observer) s << "，等待读取独立行情 " << coverage_[i].missing_observer;
+        if (coverage_[i].unavailable) s << "，合约下架待补位 " << coverage_[i].unavailable;
+        if (!coverage_[i].error.empty()) s << "（" << coverage_[i].error << "）";
+        s << "\n";
         if (!inventory_ok_[i]) s << "仓位变动缺少匹配成交，后台核对中。本方向利润回撤计算暂停，新信号照常检查入场条件。\n";
     }
     double shorts, overall; bool complete; totals_locked(shorts, overall, complete);

@@ -2,6 +2,7 @@
 #include "core/trend_decision.h"
 #include "core/itrading_client.h"
 #include "core/execution_event.h"
+#include "core/exit_evidence.h"
 #include "core/engine_host.h"
 #include "core/thread_pool.h"
 
@@ -137,6 +138,9 @@ struct TrendBot {
     std::string uncertain_client_id;
     double uncertain_qty = 0, uncertain_stop = 0;
     std::string pending_close_key, pending_close_reason;
+    ExitEvidence pending_close_evidence; // Immutable for the lifetime of the submitted close order.
+    ExitEvidence stop_evidence; // Parameters that formed the current ratcheted line.
+    ExitEvidence hard_stop_evidence; // Frozen reference line and buffer for the exchange order.
     int64_t pending_close_ms = 0;
     std::chrono::steady_clock::time_point close_last_query{};
     bool uncertain_terminal = false;
@@ -225,6 +229,15 @@ struct TrendBot {
     // 同一 bot 的挂单串行化：没有它会并发派发多次，第二张被拒的同时把第一张的
     // 单号误清掉
     bool        ds_syncing = false;
+    std::string ds_cancel_id; // Exact order retired with the previous position.
+    bool ds_canceling = false;
+    std::chrono::steady_clock::time_point ds_cancel_after{};
+    bool ds_probe = false; // The account's one admitted half-open order.
+    std::string ds_probe_account; // Non-secret fingerprint of the checkpoint's originating account.
+    bool ds_account_only = false; // Serialization-only metadata when no bots remain to carry the cooldown.
+    bool opening_submitted = false; // POST may have happened; an unsent reservation alone needs no order lookup.
+    bool ds_probe_needs_stop_check = false; // Restored stop ID still needs exchange confirmation.
+    int64_t ds_probe_after_ms = 0; // Account cooldown deadline in saved snapshots.
 
     // 硬止损单从交易所挂单列表里【消失】时它的触发价（见 reconcile_stop_orders）。
     // 消失最常见的原因是它触发了——而那时对账还要两轮才确认仓位没了，
@@ -358,6 +371,7 @@ struct TrendTrade {
     }
     double estimated_net(double rate) const { return pnl - estimated_fee(rate); }
     std::string reason;
+    ExitEvidence exit_evidence;
     bool        reversed    = false;     // 本次平仓后是否反手了
     std::chrono::system_clock::time_point close_time{};
 
@@ -426,7 +440,7 @@ public:
     // 在途单（正在开 / 正在平）的跳过——它的结果回来之前再发平仓单不安全。
     // 返回发出平仓的笔数。不停 bot、不暂停开新仓（由调用方决定）
     int  close_all();
-    int close_auto_direction(trend::Pos direction, const std::string& reason);
+    int close_auto_direction(trend::Pos direction, const std::string& reason, const ExitEvidence& evidence = {});
     void set_profit_gate(trend::Pos direction, std::string reason, int64_t fresh_after);
     using ExecutionCb = std::function<bool(ExecutionEvent&)>;
     void set_execution_cb(ExecutionCb cb);
@@ -442,6 +456,9 @@ public:
     bool remove_if_flat(const std::string& bot_id);
     void stop_all();
     std::vector<TrendBot> get_bots() const;
+    using BotCheckpoint = std::function<bool(const std::vector<TrendBot>&)>;
+    void set_stop_checkpoint(std::string account, BotCheckpoint save);
+    bool save_checkpoint(const BotCheckpoint& save) const;
     struct Inspection {
         TrendBot bot;
         std::string gate, rotation, decision;
@@ -603,7 +620,11 @@ public:
     //
     // 发现对不上就清掉本地 id 并复位重试状态，让每 tick 的重挂逻辑自然接手；
     // 这里不直接发 HTTP（对账在锁内）
-    std::vector<std::string> reconcile_stop_orders(const std::set<std::string>& live_ids);
+    struct StopOrderIds { std::string active, retired; };
+    using StopOrderSnapshot = std::map<std::string, StopOrderIds>; // IDs owned by each bot before HTTP
+    StopOrderSnapshot capture_stop_orders() const;
+    std::vector<std::string> reconcile_stop_orders(const StopOrderSnapshot& expected,
+                                                  const std::set<std::string>& live_ids);
 
     // 仅测试用：见 CcgEngine::set_pending_for_test 的理由
     void set_pending_for_test(const std::string& bot_id, bool v);
@@ -687,15 +708,20 @@ private:
     void abandon_and_close(const std::string& bot_id, const std::string& why);
     // 仓位归零时复位硬止损的运行时状态。
     // ⚠ 不碰 ds_fail_closes —— 它要跨仓位累计才看得出系统性故障
-    static void clear_ds_runtime(TrendBot& b);
+    void clear_ds_runtime(TrendBot& b);
+    void end_unprotected_probe(TrendBot& b);
+    bool confirm_probe_protection(TrendBot& b);
+    bool persist_stop_checkpoint();
+    int64_t stop_deadline_ms() const;
+    void flush_stop_checkpoint();
 
     // 平仓（可选紧接着反手）。两笔单在同一任务里顺序执行，全程持 pending
     void submit_close(const std::string& bot_id, const std::string& reason,
-                      trend::Pos reverse_to);
+                      trend::Pos reverse_to, const ExitEvidence& evidence);
     void submit_open (const std::string& bot_id, trend::Pos dir, bool from_reverse);
     void execute_open(const std::string& bot_id, trend::Pos dir, bool from_reverse);
     void execute_close(const std::string& bot_id, const std::string& reason,
-                       trend::Pos reverse_to, bool* fully_closed = nullptr);
+                       trend::Pos reverse_to, ExitEvidence evidence, bool* fully_closed = nullptr);
     void verify_external_close(const std::string& bot_id);
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log(const std::string& msg);
@@ -762,6 +788,13 @@ private:
     // 一次成功挂单会把计数清零——那说明故障已经过去了
     int                             ds_abandons_total_  = 0;
     bool                            ds_account_broken_  = false;
+    std::string stop_account_;
+    BotCheckpoint stop_checkpoint_;
+    bool stop_checkpoint_dirty_ = false;
+    mutable uint64_t checkpoint_sequence_ = 0; // Engine lock orders snapshot capture.
+    mutable std::mutex checkpoint_write_mutex_;
+    mutable uint64_t last_write_sequence_ = 0; // Writer lock orders atomic replacements.
+    mutable bool last_write_ok_ = true;
     // 熔断跳闸的时刻（单调钟）。open_gate_block 靠它决定什么时候半开放行一笔试探。
     // 每次兜底平仓都会刷新它 —— 试探失败就重新开始冷却
     std::chrono::steady_clock::time_point ds_break_time_{};

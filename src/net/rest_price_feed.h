@@ -75,12 +75,13 @@ public:
         bool fresh(int64_t now) const;
     };
 
-    // 健康状态。只有四个数，而且每一个都是【直接观测】到的，不是推断出来的。
+    // 最近有效报价的来源、轮询失败次数和订阅品种的报价新鲜度。
     struct Health {
         bool    running       = false;
-        int64_t last_ok_ms    = 0;   // 上一次成功拿到标记价的时刻（0 = 还没成功过）
+        int64_t last_ok_ms    = 0;   // 上一次取得主源或备用源有效报价的时刻
         int64_t age_ms        = 0;   // 距上次成功多久
-        int     fail_streak   = 0;   // 连续失败轮数
+        int     fail_streak   = 0;   // 连续未取得任何有效报价的轮数
+        bool    on_fallback   = false; // 最近一次成功轮询使用备用成交价
         size_t  symbols       = 0;
         size_t  fresh         = 0;   // 价格在 kStaleMs 之内的品种数
         struct Issue { std::string symbol; bool received; int64_t age_ms; };
@@ -149,6 +150,7 @@ public:
 
 private:
     void loop();
+    bool update_prices(const std::unordered_map<std::string, double>& prices, bool fallback);
     void say(const std::string& m) const;
 
     FetchMap fetch_marks_, fetch_changes_, fetch_fallback_;

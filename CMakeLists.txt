@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.4.4 LANGUAGES CXX)
+project(TradingBot VERSION 1.4.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -143,6 +143,7 @@ if(CCBOT_BUILD_GUI)
         src/main.cpp
         src/core/key_store.cpp
         src/gui/main_window.cpp
+        src/gui/trade_history.cpp
         src/gui/trend_panel.cpp
         src/gui/smart_panel.cpp
         src/gui/candidate_monitor.cpp
@@ -424,7 +425,8 @@ endforeach()
 enable_testing()
 if(TARGET TradingBot)
     qt_add_executable(tradingbot_monitor_smoke tests/test_candidate_monitor.cpp src/gui/candidate_monitor.cpp
-        src/core/monitor_checkpoint.cpp src/core/smart_mode.cpp src/gui/data_directory.cpp)
+        src/core/monitor_checkpoint.cpp src/core/smart_mode.cpp src/gui/data_directory.cpp
+        src/gui/trade_history.cpp src/core/journal.cpp)
     target_include_directories(tradingbot_monitor_smoke PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tradingbot_monitor_smoke PRIVATE Qt6::Widgets simdjson::simdjson)
     ccbot_harden(tradingbot_monitor_smoke)

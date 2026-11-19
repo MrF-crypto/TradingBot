@@ -1,10 +1,11 @@
 // Included after the fake exchange/clock helpers in test_trend_engine.cpp.
 static void test_reentry_scenarios() {
     constexpr int64_t hour = 3'600'000, base = 1'800'000'000'000LL;
-    // Restart with a bot-owned short which the operator already closed at the
-    // exchange. Exercise both normal reconciliation paths (with/without stop).
-    for (const bool stop_on_file : {false, true}) {
-        for (const bool paused : {false, true}) {
+    // Restart with a bot-owned position which the operator already closed.
+    // Exercise both snapshot paths, with and without a protective stop on file.
+    for (const auto side : {trend::Pos::Long, trend::Pos::Short}) {
+        const bool is_long = side == trend::Pos::Long;
+        const auto check_reentry = [&](bool stop_on_file, bool paused) {
             auto cli = std::make_shared<FakeClient>();
             cli->close_verification.position_known = true;
             int64_t wall = base + 60'000;
@@ -13,25 +14,27 @@ static void test_reentry_scenarios() {
             TrendEngine e(cli, host);
             TrendBot held; held.cfg = mk_cfg(); held.is_auto = true; held.cfg.interval = "1h";
             held.cfg.rule.following.enabled = true; held.cfg.use_disaster_stop = stop_on_file;
-            held.st.pos = trend::Pos::Short; held.st.entry_price = held.st.peak = 100;
-            held.st.stop = 110; held.qty = 1;
+            held.st.pos = side; held.st.entry_price = held.st.peak = 100;
+            held.st.stop = is_long ? 90 : 110; held.qty = 1;
             if (stop_on_file) held.disaster_stop_id = "external-stop";
             if (paused) held.state = TrendBot::State::Stopped;
             const auto id = e.restore_bot(held);
             e.set_retiring(id, false); // Requalified by a successful candidate scan.
             reconcile(e, {});
-            check(bot_of(e, held.cfg.symbol).qty == 1, "one empty snapshot leaves the restored short intact");
+            check(bot_of(e, held.cfg.symbol).qty == 1, "one empty snapshot leaves the restored position intact");
             reconcile(e, {});
             const auto flat = bot_of(e, held.cfg.symbol);
             check(flat.qty == 0 && flat.trade_count == 0 && flat.reentry_after_ms == base + 2 * hour,
                   "external flat confirmation starts the usual reentry wait without estimating a fill");
             check((flat.state == TrendBot::State::Stopped) == paused,
-                  "a running auto short keeps monitoring; an explicitly stopped one stays stopped");
+                  "a running smart bot keeps monitoring; an explicitly stopped one stays stopped");
             following::Signal signal; signal.settings = flat.signal_following_config();
-            signal.ready = true; signal.regime = following::Regime::Down; signal.short_confirmed = true;
+            signal.ready = true; signal.regime = is_long ? following::Regime::Up : following::Regime::Down;
+            signal.long_confirmed = is_long; signal.short_confirmed = !is_long;
+            const auto price = is_long ? 111.0 : 89.0;
             auto breakout = [&](int64_t bar) {
-                e.update_signal(id, 2, 2, true, 110, 90, bar, 0, 2, true, .8, 89, 0, 0, signal);
-                cli->fill_price = 89; e.tick(held.cfg.symbol, 89);
+                e.update_signal(id, 2, 2, true, 110, 90, bar, 0, 2, true, .8, price, 0, 0, signal);
+                cli->fill_price = price; e.tick(held.cfg.symbol, price);
             };
             breakout(base);
             check(cli->calls.empty(), "the disappeared position cannot reopen on its previous bar");
@@ -41,11 +44,32 @@ static void test_reentry_scenarios() {
             wall = base + 2 * hour;
             breakout(wall);
             if (!paused && cli->calls.empty())
-                std::printf("external short did not reopen: %s / %s\n",
+                std::printf("external close did not reopen: %s / %s\n",
                             bot_of(e, held.cfg.symbol).last_decision.c_str(), bot_of(e, held.cfg.symbol).last_action.c_str());
-            check(cli->calls.size() == (paused ? 0U : 1U),
+            check(cli->calls.size() == (paused ? 0U : 1U) && (paused || bot_of(e, held.cfg.symbol).st.pos == side),
                   "a fresh confirmed same-symbol breakout can reenter while the old fill is missing");
+        };
+        for (const bool stop_on_file : {false, true}) {
+            check_reentry(stop_on_file, false);
+            check_reentry(stop_on_file, true);
         }
+    }
+    // Model LUNA2's failed close with a reduce-only rejection on a flat account.
+    // The rejection itself supplies no execution price.
+    {
+        auto cli = std::make_shared<FakeClient>();
+        TrendEngine e(cli, inline_host());
+        TrendBot held; held.cfg = mk_cfg("LUNA2USDT"); held.is_auto = true;
+        held.st.pos = trend::Pos::Long; held.st.entry_price = 0.50;
+        held.qty = 2000; held.disaster_stop_id = "luna2-protective-stop";
+        const auto id = e.restore_bot(held);
+        cli->fail_next = true; cli->error_next = "ReduceOnly Order is rejected [-2022]";
+        cli->close_verification.position_known = true;
+        e.close_bot(id);
+        const auto flat = bot_of(e, held.cfg.symbol);
+        check(cli->close_checks == 1 && flat.qty == 0 && flat.pending_close_key.empty() &&
+              flat.trade_count == 0 && flat.state == TrendBot::State::Running && flat.waiting_reentry(),
+              "LUNA2 rejected close with verified flat position keeps monitoring and leaves fills to recovery");
     }
     {
         auto cli = std::make_shared<FakeClient>();
