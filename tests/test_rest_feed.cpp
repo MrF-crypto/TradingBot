@@ -282,10 +282,11 @@ int main() {
         int switches = 0, back = 0;
         bool held_last_price = false, backup_recovered = false;
         int64_t before_outage = 0;
+        RestPriceFeed* observed_feed = nullptr; // Assigned before start() invokes either price source.
         RestPriceFeed feed(
             [&]() -> std::unordered_map<std::string, double> {
                 const int round = ++primary_round;
-                if (round == 8) before_outage = feed.get("BTCUSDT").mark_ms;
+                if (round == 8) before_outage = observed_feed->get("BTCUSDT").mark_ms;
                 if (round > 1 && round <= 14) {
                     if (round == 10) return {{"BTCUSDT", 0.0}, {"UNSUBSCRIBED", 1.0}};
                     return {};
@@ -299,6 +300,7 @@ int main() {
                 if (round >= 8 && round <= 10) return {};
                 return {{"BTCUSDT", 59990.0 + round}};
             });
+        observed_feed = &feed;
         feed.on_server_msg([&](const std::string& m) {
             if (m.find("备用价格源") != std::string::npos && m.find("成交价") != std::string::npos) ++switches;
             if (m.find("切回标记价") != std::string::npos) ++back;
