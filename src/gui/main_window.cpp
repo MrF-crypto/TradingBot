@@ -510,24 +510,41 @@ void MainWindow::save_trade_stats() const {
 
 void MainWindow::refreshStats() {
     if (!statsLabel_) return;
-    const double winRate = statTrades_ > 0 ? (double)statWins_ / statTrades_ * 100.0 : 0.0;
+    auto count = statTrades_, wins = statWins_;
+    double gross = statPnl_;
+    // The account ledger owns external fills. Project them into the display so a
+    // restart between saving the ledger and updating the GUI cannot count one twice.
+    if (smart_) for (const auto& t : smart_->recovered_trades()) {
+        ++count;
+        if (t.pnl > 0) ++wins;
+        gross += t.pnl;
+    }
+    const double winRate = count > 0 ? (double)wins / count * 100.0 : 0.0;
     statsLabel_->setTextFormat(Qt::RichText);
     statsLabel_->setText(
         QString("成交统计：共 %1 笔 | 毛盈利胜率 %2% | 累计毛盈亏 %3")
-        .arg(statTrades_)
+        .arg(count)
         .arg(winRate, 0, 'f', 1)
-        .arg(colored_money(statPnl_)));
+        .arg(colored_money(gross)));
     statsLabel_->setStyleSheet("color:#8b949e;font-size:11px;");
     statsLabel_->setToolTip(
         "所有 bot 的成交累计，包含已删除的 bot。\n"
         "毛盈亏按成交价计算，未扣手续费和资金费。明细的预估净盈亏扣除估算手续费；实结净额见利润账本。\n"
-        "你在 App 上手动平仓、或被强平的仓位，程序拿不到成交价，不在这里。");
+        "连接账户后，统计包含利润账本已按交易所成交核实的外部平仓。");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 交易明细弹窗
 // ─────────────────────────────────────────────────────────────────────────────
 void MainWindow::openTradeHistoryDialog() {
+    auto history = trades_;
+    if (smart_) {
+        const auto recovered = smart_->recovered_trades();
+        history.insert(history.end(), recovered.begin(), recovered.end());
+    }
+    std::stable_sort(history.begin(), history.end(), [](const auto& a, const auto& b) {
+        return a.close_time < b.close_time;
+    });
     QDialog dlg(this);
     dlg.setWindowTitle("交易明细与周期统计");
     dlg.resize(1040, 620);
@@ -556,7 +573,7 @@ void MainWindow::openTradeHistoryDialog() {
         std::chrono::system_clock::time_point first_close{}, last_close{};
     };
     std::map<std::string, SymStat> stats;
-    for (const auto& t : trades_) {
+    for (const auto& t : history) {
         auto& s = stats[t.symbol];
         if (s.cycles == 0) s.first_close = t.close_time;
         s.cycles++;
@@ -637,10 +654,10 @@ void MainWindow::openTradeHistoryDialog() {
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     dv->addWidget(table);
 
-    table->setRowCount((int)trades_.size());
-    for (int i = 0; i < (int)trades_.size(); ++i) {
+    table->setRowCount((int)history.size());
+    for (int i = 0; i < (int)history.size(); ++i) {
         // 最新的排在最上面
-        const auto& t = trades_[trades_.size() - 1 - i];
+        const auto& t = history[history.size() - 1 - i];
         QDateTime dt = QDateTime::fromMSecsSinceEpoch(tp_to_ms(t.close_time));
         table->setItem(i, 0, mkc(dt.toString("MM-dd HH:mm:ss"), QColor("#8b949e")));
         table->setItem(i, 1, mkc(QString::fromStdString(t.symbol), QColor("#e6edf3")));

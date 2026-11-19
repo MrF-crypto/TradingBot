@@ -1,6 +1,63 @@
 // Included after the fake exchange/clock helpers in test_trend_engine.cpp.
 static void test_reentry_scenarios() {
     constexpr int64_t hour = 3'600'000, base = 1'800'000'000'000LL;
+    // Restart with a bot-owned short which the operator already closed at the
+    // exchange. Exercise both normal reconciliation paths (with/without stop).
+    for (const bool stop_on_file : {false, true}) {
+        for (const bool paused : {false, true}) {
+            auto cli = std::make_shared<FakeClient>();
+            cli->close_verification.position_known = true;
+            int64_t wall = base + 60'000;
+            auto host = inline_host();
+            host.now_wall = [&] { return std::chrono::system_clock::time_point(std::chrono::milliseconds(wall)); };
+            TrendEngine e(cli, host);
+            TrendBot held; held.cfg = mk_cfg(); held.is_auto = true; held.cfg.interval = "1h";
+            held.cfg.rule.following.enabled = true; held.cfg.use_disaster_stop = stop_on_file;
+            held.st.pos = trend::Pos::Short; held.st.entry_price = held.st.peak = 100;
+            held.st.stop = 110; held.qty = 1;
+            if (stop_on_file) held.disaster_stop_id = "external-stop";
+            if (paused) held.state = TrendBot::State::Stopped;
+            const auto id = e.restore_bot(held);
+            e.set_retiring(id, false); // Requalified by a successful candidate scan.
+            reconcile(e, {});
+            check(bot_of(e, held.cfg.symbol).qty == 1, "one empty snapshot leaves the restored short intact");
+            reconcile(e, {});
+            const auto flat = bot_of(e, held.cfg.symbol);
+            check(flat.qty == 0 && flat.trade_count == 0 && flat.reentry_after_ms == base + 2 * hour,
+                  "external flat confirmation starts the usual reentry wait without estimating a fill");
+            check((flat.state == TrendBot::State::Stopped) == paused,
+                  "a running auto short keeps monitoring; an explicitly stopped one stays stopped");
+            following::Signal signal; signal.settings = flat.signal_following_config();
+            signal.ready = true; signal.regime = following::Regime::Down; signal.short_confirmed = true;
+            auto breakout = [&](int64_t bar) {
+                e.update_signal(id, 2, 2, true, 110, 90, bar, 0, 2, true, .8, 89, 0, 0, signal);
+                cli->fill_price = 89; e.tick(held.cfg.symbol, 89);
+            };
+            breakout(base);
+            check(cli->calls.empty(), "the disappeared position cannot reopen on its previous bar");
+            wall = base + hour;
+            breakout(wall);
+            check(cli->calls.empty(), "reentry still waits for a complete post-close bar");
+            wall = base + 2 * hour;
+            breakout(wall);
+            if (!paused && cli->calls.empty())
+                std::printf("external short did not reopen: %s / %s\n",
+                            bot_of(e, held.cfg.symbol).last_decision.c_str(), bot_of(e, held.cfg.symbol).last_action.c_str());
+            check(cli->calls.size() == (paused ? 0U : 1U),
+                  "a fresh confirmed same-symbol breakout can reenter while the old fill is missing");
+        }
+    }
+    {
+        auto cli = std::make_shared<FakeClient>();
+        cli->close_verification.position_known = cli->close_verification.has_opposite_position = true;
+        TrendEngine e(cli, inline_host());
+        TrendBot held; held.cfg = mk_cfg(); held.is_auto = true;
+        held.st.pos = trend::Pos::Short; held.qty = 1; held.st.entry_price = 100;
+        held.disaster_stop_id = "external-stop";
+        e.restore_bot(held); reconcile(e, {}); reconcile(e, {});
+        check(bot_of(e, held.cfg.symbol).state == TrendBot::State::Stopped,
+              "a fresh position query with the opposite leg still present prevents automatic reentry");
+    }
     for (const auto& [interval, period] : std::vector<std::pair<std::string, int64_t>>{
              {"15m", hour / 4}, {"30m", hour / 2}, {"1h", hour}, {"2h", 2 * hour}, {"4h", 4 * hour}}) {
         auto cli = std::make_shared<FakeClient>();

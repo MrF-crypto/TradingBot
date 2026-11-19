@@ -67,6 +67,13 @@ const char* side_of(trend::Pos p, bool closing) {
     const bool buy = closing ? (p == trend::Pos::Short) : (p == trend::Pos::Long);
     return buy ? "BUY" : "SELL";
 }
+// Keep an active smart short eligible for the usual post-close signal. A stopped
+// bot may have been paused by its owner, even if its holding later disappeared.
+bool monitor_after_external_short(const TrendBot& b) {
+    return b.is_auto && b.cfg.rule.strategy == trend::Strategy::TrendFollowing &&
+           b.st.pos == trend::Pos::Short && b.state == TrendBot::State::Running &&
+           !b.open_uncertain && b.pending_close_key.empty();
+}
 } // namespace
 
 TrendEngine::TrendEngine(std::shared_ptr<ITradingClient> client,
@@ -368,6 +375,11 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             //
             //   这和本项目修过四次的"拉取失败当成确实没有"是同一个病，只不过
             //   这次不是失败，是【陈旧】——而陈旧比失败更难看出来
+            const bool monitor = monitor_after_external_short(b);
+            if (monitor && snapshot_age > std::chrono::seconds(5)) {
+                b.ext_gone_seen = 0;
+                continue;
+            }
             if (b.ext_gone_seen == 0) {
                 b.ext_gone_seen = 1;
                 note_once(TrendBot::Recon::ExtGoneSuspect,
@@ -380,8 +392,9 @@ std::vector<std::string> TrendEngine::reconcile_positions(
                 verify_ids.push_back(b.bot_id);
                 continue;
             }
-            note_once(TrendBot::Recon::ExtGone,
-                      b.cfg.symbol + " 连续两次确认交易所无仓位，已停止；实际成交与盈亏待核对");
+            b.last_action = monitor ? "连续两次确认交易所无仓位，等待新的收盘突破；实际成交与盈亏待核对"
+                                    : "连续两次确认交易所无仓位，已停止；实际成交与盈亏待核对";
+            note_once(TrendBot::Recon::ExtGone, b.cfg.symbol + " " + b.last_action);
             trend::on_closed(b.st);
             start_reentry_wait(b);
             clear_ds_runtime(b);
@@ -389,8 +402,8 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             b.disaster_stop_id.clear();
             b.disaster_stop_price = 0;
             b.qty = 0;
-            b.state = TrendBot::State::Stopped;
-            b.last_action = "⚠ 交易所侧已无仓位，已停止";
+            if (monitor) b.needs_reconcile = false;
+            else b.state = TrendBot::State::Stopped;
             continue;
         }
 
@@ -1016,7 +1029,9 @@ int64_t TrendEngine::utc_day(std::chrono::system_clock::time_point t) {
     return s / 86400;
 }
 double TrendEngine::today_realized() const {
-    return (day_key_ == utc_day(host_.now_wall())) ? day_realized_ : 0.0;
+    const auto today = utc_day(host_.now_wall());
+    return (day_key_ == today ? day_realized_ : 0.0) +
+           (recovered_day_.day == today ? recovered_day_.realized : 0.0);
 }
 void TrendEngine::book_day(double pnl, double entry, double exit, double qty) {
     const int64_t today = utc_day(host_.now_wall());
@@ -1033,6 +1048,15 @@ void TrendEngine::restore_day_pnl(DayPnl d) {
     if (d.day != utc_day(host_.now_wall()) || !std::isfinite(d.realized)) return;
     day_key_      = d.day;
     day_realized_ = d.realized;
+}
+TrendEngine::DayPnl TrendEngine::day_pnl_checkpoint() const {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    const auto today = utc_day(host_.now_wall());
+    return {today, day_key_ == today ? day_realized_ : 0.0};
+}
+void TrendEngine::set_recovered_day_pnl(DayPnl d) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    if (std::isfinite(d.realized)) recovered_day_ = d;
 }
 
 std::string TrendEngine::take_filter_summary() {
@@ -2311,8 +2335,14 @@ void TrendEngine::verify_external_close(const std::string& id) {
                 b.last_action = "硬止损成交已核对，等待新收盘突破";
                 emit = true;
             } else {
-                b.state = TrendBot::State::Stopped;
-                b.last_action = "已确认交易所无仓位；实际成交与盈亏待核对";
+                if (!evidence.has_opposite_position && monitor_after_external_short(b)) {
+                    b.last_action = "已确认交易所无仓位，等待新的收盘突破；实际成交与盈亏待核对";
+                } else {
+                    b.state = TrendBot::State::Stopped;
+                    b.last_action = evidence.has_opposite_position
+                        ? "原仓已平但交易所仍有反向持仓，已停止；实际成交与盈亏待核对"
+                        : "已确认交易所无仓位；实际成交与盈亏待核对";
+                }
             }
             // A different live stop can remain after an earlier stop fired. Cancel it only
             // after the position query confirms zero; never cancel protection on rejection alone.

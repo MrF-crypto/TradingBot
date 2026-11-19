@@ -150,6 +150,12 @@ void policy_tests() {
     natural.update(c, 3 * hour, 190, true, true, 3 * hour, .4, true);
     natural.update(c, 3 * hour + 100, 190, true, false, 3 * hour, .4, true);
     check(natural.phase == profit::Phase::Waiting && natural.active, "individual exits during caution continue into recoverable waiting state");
+    auto waiting = natural;
+    waiting.update(c, 4 * hour, -999, false, false, 4 * hour, .7, true, .7, true);
+    check(waiting.blocked(), "flat portfolio with missing historical fills still requires the full breadth recovery");
+    waiting.update(c, 5 * hour, -999, false, false, 5 * hour, .7, true, .7, true);
+    check(!waiting.blocked() && !waiting.active && waiting.fresh_after == 5 * hour && waiting.anchor == 0,
+          "recovered breadth and flat exposure release the guard without adopting incomplete historical P&L");
     natural.update(c, 4 * hour, 190, true, false, 4 * hour, .7, true);
     natural.update(c, 5 * hour, 190, true, false, 5 * hour, .7, true);
     check(natural.phase == profit::Phase::Watching, "natural flat exit is not permanently blocked");
@@ -158,7 +164,38 @@ void policy_tests() {
     flat.update(c, hour + 100, 200, true, false, hour, .8, true);
     check(!flat.active && flat.breadth_peak >= flat.breadth, "normal flat reset preserves valid checkpoint invariants");
 }
+#include "profit_recovery_scenarios.h"
+
 void integration_tests() {
+    {
+        Fixture f("entry-during-history-gap");
+        f.cfg.protect = true;
+        f.cfg.batch_usdt = 500;
+        f.manager->configure(f.cfg, true, now);
+        TrendBot bot; bot.is_auto = true; bot.cfg.symbol = "OLDUSDT"; bot.qty = 1;
+        bot.st.pos = trend::Pos::Short; bot.st.entry_price = 100; bot.st.stop = 110;
+        f.engine->restore_bot(bot);
+        f.engine->reconcile_positions({{"OLDUSDT", -1, 1, 100}}, std::chrono::milliseconds(0));
+        f.manager->evaluate(*f.engine, now);
+        f.closed_short();  // ETH realized 100 U less 1 U fees. The minimum batch keeps that profit unspent.
+        f.manager->service(*f.client, *f.engine, now + 400000);
+        check(f.manager->status().find("可新增预算 29.70U") != std::string::npos,
+              "verified short profit is available for BTC before the historical discrepancy");
+        f.engine->reconcile_positions({}, std::chrono::milliseconds(0));
+        f.engine->reconcile_positions({}, std::chrono::milliseconds(0));
+        f.cfg.batch_usdt = 5;
+        f.manager->configure(f.cfg, true, now + 410000);
+        f.manager->evaluate(*f.engine, now + 410000);
+        f.manager->service(*f.client, *f.engine, now + 410000);
+        check(f.manager->status().find("可新增预算 0.00U") != std::string::npos && f.transfers == 0 && f.purchases == 0,
+              "historical short mismatch freezes an otherwise spendable BTC budget");
+        TrendConfig cfg; cfg.symbol = "NEWUSDT"; cfg.use_disaster_stop = false;
+        const auto id = f.engine->add_bot(cfg, true);
+        f.engine->update_signal(id, 2, 2, true, 110, 90, now / hour * hour);
+        f.engine->tick(cfg.symbol, 100); f.engine->tick(cfg.symbol, 89);
+        check(f.fake->opens == 1 && f.transfers == 0 && f.purchases == 0,
+              "breakout entry proceeds independently of the frozen BTC budget");
+    }
     {
         Fixture f("settlement-before-engine"); f.closed_short(); f.cfg.protect = true;
         f.manager->configure(f.cfg, true, now);
@@ -373,7 +410,7 @@ int main() {
         check(f.transfers == (funded ? 1 : 0) && f.purchases == 0,
               "profit spending rechecks pause/pending/config after quote HTTP");
     }
-    try { policy_tests(); integration_tests(); }
+    try { policy_tests(); integration_tests(); profit_recovery_tests(); }
     catch (const std::exception& e) { std::printf("EXCEPTION %s\n", e.what()); ++failures; }
     return failures ? 1 : 0;
 }

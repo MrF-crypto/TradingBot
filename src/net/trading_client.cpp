@@ -507,7 +507,7 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params,
-                                  long* out_code, int max_attempts) {
+                                  long* out_code, int max_attempts, bool* out_transient) {
     tl_net_err.clear();
     std::string resp, rhdr;
     const std::string base_params = params;
@@ -540,6 +540,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
                 gate_->observe(fr.code, fr.headers, fr.body);
                 tl_net_err = describe_net(fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK, fr.code, fr.body);
                 if (out_code) *out_code = fr.code;
+                if (out_transient) *out_transient = fr.timed_out || transient_net(CURLE_OK, fr.code);
                 return fr.body;
             }
         }
@@ -559,6 +560,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
         gate_->observe(code, rhdr, resp);
         tl_net_err = describe_net(rc, code, resp);
         if (out_code) *out_code = code;
+        if (out_transient) *out_transient = transient_net(rc, code);
         if (!transient_net(rc, code)) break;
     }
     return resp;
@@ -1188,9 +1190,11 @@ ITradingClient::CloseVerification TradingClient::verify_close(
     if (!ok) return result;
     result.position_known = true;
     const int direction = entry_side == "BUY" ? 1 : -1;
-    for (const auto& position : positions)
-        if (position.symbol == sym && position.direction == direction)
-            result.remaining_qty += position.qty;
+    for (const auto& position : positions) {
+        if (position.symbol != sym || position.qty <= 0) continue;
+        if (position.direction == direction) result.remaining_qty += position.qty;
+        else result.has_opposite_position = true;
+    }
     if (result.remaining_qty > 0 || stop_id.empty()) return result;
 
     // Query endpoints differ from the PM POST/DELETE endpoint.

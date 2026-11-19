@@ -37,7 +37,8 @@ struct Guard {
     // curve = realized + marked unrealized, including estimated exit costs.
     // An invalid mark must never create a peak or an artificial drawdown.
     void update(const Config& c, int64_t now, double curve, bool prices_ok, bool exposed,
-                int64_t bar, double support, bool breadth_ok, double support_upper = -1) {
+                int64_t bar, double support, bool breadth_ok, double support_upper = -1,
+                bool history_pending = false) {
         if (!c.protect) return;
         if (!active) {
             if (!exposed || !prices_ok) return;
@@ -67,10 +68,12 @@ struct Guard {
             weak = weakening ? weak + 1 : 0;
             if (phase == Phase::Waiting) {
                 recovered = bar > exit_ms && support >= c.recover_breadth ? recovered + 1 : 0;
-                if (recovered >= c.recovery_bars && prices_ok) {
+                // A confirmed flat portfolio needs a fresh breakout, but does
+                // not need a P&L anchor until it holds positions again.
+                if (recovered >= c.recovery_bars && (prices_ok || (history_pending && !exposed))) {
                     // Require a later, newly closed breakout even on previously flat candidates.
                     fresh_after = bar; phase = Phase::Watching; active = exposed;
-                    anchor = curve; peak = profit = 0; armed = false; weak = recovered = 0;
+                    anchor = prices_ok ? curve : 0; peak = profit = 0; armed = false; weak = recovered = 0;
                     breadth_peak = support; reason = "恢复趋势许可，等待新的收盘突破";
                 }
             } else if (phase != Phase::Exiting && armed) {

@@ -506,6 +506,8 @@ public:
         double  realized = 0;   // 当日已实现 − 估算手续费
     };
     DayPnl day_pnl() const;              // 当前 UTC 日的值（跨日后为 0）
+    DayPnl day_pnl_checkpoint() const;   // 只保存引擎平仓；外部平仓从成交账本恢复
+    void set_recovered_day_pnl(DayPnl d);
     void   restore_day_pnl(DayPnl d);    // 启动时恢复；不是今天的直接作废
     static int64_t utc_day(std::chrono::system_clock::time_point t);
 
@@ -779,6 +781,7 @@ private:
     bool                            pause_new_        = false;
     int64_t                         day_key_          = 0;   // day_realized_ 属于哪个 UTC 日
     double                          day_realized_     = 0;
+    DayPnl                          recovered_day_;
     // 自动 bot 的过滤计数（按类别）与被闸门拦过的 bot。见 take_filter_summary
     std::map<std::string, int>      filter_counts_;
     std::set<std::string>           gate_blocked_auto_;

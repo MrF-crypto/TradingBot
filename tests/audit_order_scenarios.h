@@ -54,6 +54,8 @@ static void test_audit_order_scenarios() {
                 return true;
             });
             const auto result = client.verify_close("BTCUSDT","BUY","77");
+            check(result.has_opposite_position == (scenario >= 2 && scenario <= 4),
+                  "closing the local leg does not prove an opposite exchange leg is also flat");
             check(result.position_known == (scenario != 0 && scenario != 5),"failed or malformed position data cannot prove flat");
             check(result.protective_fill.ok == (scenario == 4),"only a verified full execution proves a protective stop filled");
             if (scenario == 1) check(result.remaining_qty == 1 && algo_queries == 0,"still held: do not infer close from stop state");

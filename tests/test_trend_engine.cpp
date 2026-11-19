@@ -943,6 +943,13 @@ int main() {
         check(eng2.day_pnl().realized == 0, "恢复：昨天的记录作废");
         eng2.restore_day_pnl({TrendEngine::utc_day(wall), -50});
         check(eng2.day_pnl().realized == -50, "恢复：今天的记录生效");
+        const auto day = TrendEngine::utc_day(wall);
+        eng2.set_recovered_day_pnl({day, -20});
+        eng2.set_recovered_day_pnl({day, -20});
+        check(eng2.day_pnl().realized == -70 && eng2.day_pnl_checkpoint().realized == -50,
+              "交易所补录重复评估只计一次，智能断点不重复保存");
+        wall += std::chrono::hours(24);
+        check(eng2.day_pnl().realized == 0, "历史日补录不占用新一天的亏损预算");
     }
 
     // ── 持仓浮亏限额 / 手动暂停开新仓 ─────────────────────────────────────────

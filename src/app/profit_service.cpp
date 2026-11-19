@@ -55,6 +55,8 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
         entries_[e.key] = entry; if (!save_locked()) return;
     }
 
+    recover_external_close(client, engine, now);
+
     // Only complete owned position cycles contribute positive short profit. Partial closes
     // remain in the cycle until the remainder is flat; losses are never discarded.
     struct Cycle { std::string key, symbol; int direction = 0; double qty = 0; int64_t start = 0, end = 0; };

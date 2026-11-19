@@ -404,6 +404,14 @@ public:
     bool is_testnet() const { return cfg_.testnet; }
     std::string account_fingerprint() const;
     struct ProfitFill { std::string id, order_id, side; int64_t time = 0; double qty = 0, pnl = 0, fee = 0; };
+    struct HistoryFill : ProfitFill {
+        std::string position_side;
+        double price = 0, quote_qty = 0;
+    };
+    // Signed, read-only evidence for reconciling externally closed positions.
+    bool profit_confirm_flat(const std::string& symbol, std::string& error, bool* retry_soon = nullptr);
+    bool profit_history(const std::string& symbol, int64_t start_ms, int64_t end_ms,
+                        std::vector<HistoryFill>& fills, std::string& error, bool* retry_soon = nullptr);
     bool profit_fills(const std::string& symbol, const std::string& order_id, double expected_qty,
                       std::vector<ProfitFill>& fills, std::string& error);
     bool profit_funding(const std::string& symbol, int64_t start, int64_t end, double& amount, std::string& error);
@@ -573,7 +581,8 @@ private:
 
     // 带签名（需要 timestamp + HMAC）
     std::string http_get (const std::string& path, std::string params = "",
-                         long* out_code = nullptr, int max_attempts = 2);
+                         long* out_code = nullptr, int max_attempts = 2, bool* out_transient = nullptr);
+    std::string profit_evidence_get(const std::string& path, const std::string& params, bool* retry_soon);
     // out_code：可选，带回 HTTP 状态码。
     //
     // ⚠ 存在的理由：响应体不是 JSON 时，光有 body 分不清到底出了什么事，而这几种

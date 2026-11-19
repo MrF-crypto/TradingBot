@@ -85,6 +85,7 @@ public:
     void evaluate_profits(int64_t now_ms);
     void service_profits(int64_t now_ms);
     std::string profit_status() const;
+    std::vector<TrendTrade> recovered_trades() const;
 
     // 品种加入/移除时通知应用层（订阅/退订价格、刷新界面）
     std::function<void(const std::string&)> on_symbol_added;

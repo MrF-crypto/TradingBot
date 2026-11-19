@@ -29,6 +29,11 @@ std::string ProfitManager::serialize_locked() const {
         if (!first) s << ',';
         first = false; s << "{\"symbol\":" << profit::quote(symbol) << ",\"qty\":" << qty << '}';
     }
+    s << "],\"inventory_discrepancies\":["; first = true;
+    for (const auto& [symbol, sides] : inventory_discrepancies_) {
+        if (!first) s << ',';
+        first = false; s << "{\"symbol\":" << profit::quote(symbol) << ",\"long\":" << sides[0] << ",\"short\":" << sides[1] << '}';
+    }
     s << "],\"entries\":["; first = true;
     for (const auto& [key, entry] : entries_) {
         if (!first) s << ',';
@@ -38,7 +43,11 @@ std::string ProfitManager::serialize_locked() const {
           << ",\"at\":" << e.at_ms << ",\"qty\":" << e.qty << ",\"entry\":" << e.entry
           << ",\"ok\":" << r.ok << ",\"uncertain\":" << r.uncertain << ",\"order\":" << profit::quote(r.order_id)
           << ",\"client\":" << profit::quote(r.client_order_id) << ",\"price\":" << r.avg_price << ",\"executed\":" << r.executed_qty
-          << ",\"settled\":" << entry.settled << ",\"net\":" << entry.net << ",\"first\":" << entry.first_fill << ",\"last\":" << entry.last_fill << '}';
+          << ",\"settled\":" << entry.settled << ",\"net\":" << entry.net << ",\"first\":" << entry.first_fill << ",\"last\":" << entry.last_fill;
+        if (!entry.recovery_open_key.empty())
+            s << ",\"recovery_open\":" << profit::quote(entry.recovery_open_key)
+              << ",\"gross\":" << entry.recovery_gross << ",\"fee\":" << entry.recovery_fee;
+        s << '}';
     }
     s << "],\"funding\":["; first = true;
     for (const auto& [key, f] : funding_) {
@@ -100,6 +109,16 @@ void ProfitManager::load() {
             const auto symbol = string(row, "symbol"); const auto qty = number(row, "qty");
             if (symbol.empty() || qty == 0 || !inherited_.emplace(symbol, qty).second) throw std::runtime_error("期初仓位不合法");
         }
+        if (o["inventory_discrepancies"].error() != simdjson::NO_SUCH_FIELD) {
+            const auto pending = o["inventory_discrepancies"].get_array().value();
+            for (auto row : pending) {
+                const auto symbol = string(row, "symbol");
+                std::array<bool, 2> sides{boolean(row, "long"), boolean(row, "short")};
+                if (symbol.empty() || (!sides[0] && !sides[1]) || !inventory_discrepancies_.emplace(symbol, sides).second)
+                    throw std::runtime_error("库存核对状态不合法");
+                for (size_t side = 0; side < sides.size(); ++side) if (sides[side]) inventory_ok_[side] = false;
+            }
+        }
         const auto entries = o["entries"].get_array().value();
         for (auto row : entries) {
             Entry entry; auto& e = entry.event; auto& r = e.result;
@@ -110,8 +129,22 @@ void ProfitManager::load() {
             r.ok = boolean(row, "ok"); r.uncertain = boolean(row, "uncertain"); r.order_id = string(row, "order"); r.client_order_id = string(row, "client");
             r.avg_price = number(row, "price"); r.executed_qty = number(row, "executed");
             entry.settled = boolean(row, "settled"); entry.net = number(row, "net"); entry.first_fill = integer(row, "first"); entry.last_fill = integer(row, "last");
+            if (row["recovery_open"].error() != simdjson::NO_SUCH_FIELD) {
+                entry.recovery_open_key = string(row, "recovery_open");
+                entry.recovery_gross = number(row, "gross"); entry.recovery_fee = number(row, "fee");
+                if (entry.recovery_open_key.empty() || e.opening || !e.completed || !r.ok || r.uncertain ||
+                    !entry.settled || !e.is_auto || r.executed_qty <= 0 || r.avg_price <= 0 || entry.first_fill <= 0 ||
+                    r.order_id.empty() || std::fabs(entry.net - (entry.recovery_gross - entry.recovery_fee)) > 1e-8)
+                    throw std::runtime_error("外部平仓补录回执不完整");
+            }
             if (e.key.empty() || e.bot_id.empty() || e.symbol.empty() || e.qty <= 0 || r.executed_qty < 0 || r.avg_price < 0 ||
                 entry.last_fill < entry.first_fill || !entries_.emplace(e.key, entry).second) throw std::runtime_error("成交账本不合法");
+        }
+        for (const auto& [key, entry] : entries_) if (!entry.recovery_open_key.empty()) {
+            auto it = entries_.find(entry.recovery_open_key);
+            if (it == entries_.end() || !it->second.settled || !it->second.event.opening ||
+                it->second.event.symbol != entry.event.symbol || it->second.event.direction != entry.event.direction)
+                throw std::runtime_error("外部平仓补录缺少对应开仓成交");
         }
         const auto funding = o["funding"].get_array().value();
         for (auto row : funding) {

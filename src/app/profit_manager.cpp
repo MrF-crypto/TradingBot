@@ -41,6 +41,7 @@ bool ProfitManager::record(ExecutionEvent& e) {
         error_ = "成交回执数值不合法，保留原账本等待核对"; return false;
     }
     if (e.opening && !e.completed && purchase_.phase != 0) return false;
+    ++receipt_revision_[e.symbol];
     if (e.key.empty()) {
         // The durable sequence is also the clientOrderId. Never recycle it after restart.
         e.key = "tbp" + std::to_string(started_) + "_" + std::to_string(++sequence_);
@@ -50,6 +51,14 @@ bool ProfitManager::record(ExecutionEvent& e) {
     if (e.completed && !e.result.order_id.empty()) {
         for (const auto& [key, old] : entries_) if (key != e.key && old.event.symbol == e.symbol &&
             old.event.result.order_id == e.result.order_id && old.event.completed) {
+                const auto alias = entries_.find(e.key);
+                if (old.event.direction != e.direction || old.event.opening != e.opening ||
+                    (alias != entries_.end() && (alias->second.event.symbol != e.symbol ||
+                     alias->second.event.direction != e.direction || alias->second.event.opening != e.opening ||
+                     (alias->second.event.result.ok && alias->second.event.result.executed_qty > 0 &&
+                      alias->second.event.result.order_id != e.result.order_id)))) {
+                    error_ = "重复回执的订单归属冲突，保留已有账本"; return false;
+                }
                 entries_.erase(e.key);
                 e.key = key;
                 merged = true;
@@ -60,6 +69,15 @@ bool ProfitManager::record(ExecutionEvent& e) {
     const auto& old = entry.event;
     if (!old.symbol.empty() && (old.symbol != e.symbol || old.direction != e.direction || old.opening != e.opening)) {
         error_ = "成交回执与原订单归属不一致，保留原账本等待核对"; return false;
+    }
+    // A late order-status response (including its rounded average price) must not
+    // replace individually verified fills or remove their durable recovery link.
+    if (!entry.recovery_open_key.empty()) {
+        if (e.completed && e.result.ok && (e.result.order_id != old.result.order_id ||
+            std::fabs(e.result.executed_qty - old.result.executed_qty) > std::max(1e-10, old.qty * 1e-10))) {
+            error_ = "补录成交与迟到回执矛盾，保留已核实的成交"; return false;
+        }
+        return merged ? save_locked() : true;
     }
     // Replays and late uncertain responses must not erase exchange-settled net P&L.
     if (old.completed && old.result.ok && !old.result.uncertain &&
@@ -76,8 +94,8 @@ bool ProfitManager::record(ExecutionEvent& e) {
 void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
     std::array<profit::Guard, 2> guards;
     std::string error;
+    double recovery_today = 0;
     bool enabled = false;
-    std::array<bool, 2> inventory_ok{true, true};
     {
         std::lock_guard<std::mutex> lk(mutex_);
         if (cancelled_) return;
@@ -88,15 +106,21 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
         if (tracking_ && !damaged_) {
             std::array<double, 2> realized{}, floating{}, entry_cost{};
             std::array<bool, 2> exposed{}, prices_ok{true, true};
-            auto expected = inherited_;
+            // An old unbooked short close and a new long in the same symbol are
+            // separate cycles. Netting the sides could freeze the wrong curve.
+            std::map<std::string, std::array<double, 2>> expected, actual;
+            for (const auto& [symbol, qty] : inherited_)
+                expected[symbol][slot(qty > 0 ? 1 : -1)] = std::fabs(qty);
             std::set<std::string> recorded;
             for (const auto& [key, entry] : entries_) {
                 const auto& e = entry.event; auto i = slot(e.direction);
                 recorded.insert(e.symbol);
                 if (!e.completed || e.result.uncertain) { prices_ok[i] = false; continue; }
                 if (!e.result.ok || e.result.executed_qty <= 0) continue;
-                expected[e.symbol] += e.result.executed_qty * e.direction * (e.opening ? 1 : -1);
+                expected[e.symbol][i] += e.result.executed_qty * (e.opening ? 1 : -1);
                 const double fee = e.result.executed_qty * e.result.avg_price * TrendEngine::kEstFeeRate;
+                if (!entry.recovery_open_key.empty() && entry.last_fill / 86400000 == now / 86400000)
+                    recovery_today += entry.recovery_gross - fee - e.result.executed_qty * e.entry * TrendEngine::kEstFeeRate;
                 if (entry.settled) realized[i] += entry.net;
                 else realized[i] += (e.opening ? 0 : (e.result.avg_price - e.entry) * e.result.executed_qty * e.direction) - fee;
             }
@@ -105,19 +129,20 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
             }
             const auto steady = std::chrono::steady_clock::now();
             std::map<std::string, const TrendBot*> by_symbol;
-            std::map<std::string, double> actual;
             std::set<std::string> in_flight;
+            std::set<std::string> reconciling;
             for (const auto& b : bots) if (b.is_auto) {
                 auto& candidate = by_symbol[b.cfg.symbol];
                 if (!candidate || b.state != TrendBot::State::Stopped || holding(b)) candidate = &b;
                 if (b.pending || b.open_uncertain || !b.pending_close_key.empty()) in_flight.insert(b.cfg.symbol);
+                if (b.needs_reconcile) reconciling.insert(b.cfg.symbol);
                 if (b.pending || b.open_uncertain || !b.pending_close_key.empty() || b.needs_reconcile) {
                     const auto direction = b.st.pos != trend::Pos::Flat ? b.st.pos : b.reserved_dir;
                     if (direction != trend::Pos::Flat) { exposed[direction == trend::Pos::Long ? 0 : 1] = true; prices_ok[direction == trend::Pos::Long ? 0 : 1] = false; }
                 }
                 if (!holding(b)) continue;
                 const auto i = b.st.pos == trend::Pos::Long ? 0U : 1U; exposed[i] = true;
-                actual[b.cfg.symbol] += b.qty * (i == 0 ? 1 : -1);
+                actual[b.cfg.symbol][i] += b.qty;
                 entry_cost[i] += b.st.entry_price * b.qty * TrendEngine::kEstFeeRate;
                 const auto age = std::chrono::duration_cast<std::chrono::seconds>(steady - b.price_time).count();
                 if (!std::isfinite(b.current_price) || b.current_price <= 0 || age < 0 || age > 30 || b.needs_reconcile) { prices_ok[i] = false; continue; }
@@ -125,27 +150,40 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
             }
             // Capture inherited holdings only once. Thereafter every quantity change must
             // have a receipt, including across process restarts or bot-ID reassignment.
-            for (const auto& [symbol, qty] : actual) if (!recorded.count(symbol) && !inherited_.count(symbol)) {
-                inherited_[symbol] = qty; expected[symbol] = qty;
+            for (const auto& [symbol, qty] : actual) if (!recorded.count(symbol) && !inherited_.count(symbol) &&
+                                                         (qty[0] == 0 || qty[1] == 0)) {
+                inherited_[symbol] = qty[0] - qty[1]; expected[symbol] = qty;
             }
-            for (const auto& [symbol, qty] : actual) { (void)qty; expected.try_emplace(symbol, 0); }
+            for (const auto& [symbol, qty] : actual) expected.try_emplace(symbol);
+            for (const auto& [symbol, sides] : inventory_discrepancies_) expected.try_emplace(symbol);
+            std::map<std::string, std::array<bool, 2>> discrepancies;
             for (const auto& [symbol, qty] : expected) {
                 // Receipt and engine position are updated in separate critical sections.
                 // Freeze protection calculations during that window, without labelling
-                // the expected transition as a broken ledger. Persistent mismatches still block.
-                if (in_flight.count(symbol)) continue;
-                const double present = actual[symbol];
-                if (std::fabs(present - qty) <= std::max({1e-8, std::fabs(qty) * 1e-8, std::fabs(present) * 1e-8})) continue;
-                for (const double signed_qty : {qty, present}) if (std::fabs(signed_qty) > 1e-8) {
-                    const auto i = slot(signed_qty > 0 ? 1 : -1);
-                    prices_ok[i] = inventory_ok[i] = false; exposed[i] = true;
+                // the expected transition as a broken ledger.
+                const auto old = inventory_discrepancies_.find(symbol);
+                if (in_flight.count(symbol) || (reconciling.count(symbol) && old != inventory_discrepancies_.end())) {
+                    if (old != inventory_discrepancies_.end()) discrepancies.emplace(*old);
+                    continue;
+                }
+                const auto& present = actual[symbol];
+                for (size_t i = 0; i < qty.size(); ++i) {
+                    const auto tolerance = std::max({1e-8, std::fabs(qty[i]) * 1e-8, present[i] * 1e-8});
+                    if (std::fabs(present[i] - qty[i]) > tolerance) discrepancies[symbol][i] = true;
                 }
             }
-            inventory_ok_ = inventory_ok;
+            inventory_discrepancies_ = std::move(discrepancies);
+            const auto live_prices_ok = prices_ok;
+            inventory_ok_ = {true, true};
+            for (const auto& [symbol, sides] : inventory_discrepancies_)
+                for (size_t i = 0; i < sides.size(); ++i) if (sides[i]) {
+                    prices_ok[i] = inventory_ok_[i] = false;
+                }
             const auto bar = now / 3600000 * 3600000;
             for (size_t i = 0; i < 2; ++i) {
                 auto& g = guards_[i]; auto& cohort = cohorts_[i];
                 const auto previous_phase = g.phase;
+                if (!inventory_ok_[i] && previous_phase == profit::Phase::Watching) continue;
                 if (enabled && !g.active && exposed[i] && prices_ok[i]) {
                     g.active = true; g.anchor = realized[i] + entry_cost[i];
                     cohort.clear();
@@ -167,7 +205,8 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
                 auto guard_config = cfg_; guard_config.protect = enabled;
                 g.update(guard_config, now, realized[i] + floating[i], prices_ok[i], exposed[i], bar,
                     cohort.empty() ? 0 : static_cast<double>(support) / static_cast<double>(cohort.size()), coverage && enabled,
-                    cohort.empty() ? 1 : static_cast<double>(support + static_cast<int>(cohort.size()) - ready) / static_cast<double>(cohort.size()));
+                    cohort.empty() ? 1 : static_cast<double>(support + static_cast<int>(cohort.size()) - ready) / static_cast<double>(cohort.size()),
+                    !inventory_ok_[i] && live_prices_ok[i]);
                 if (previous_phase != profit::Phase::Waiting && g.phase == profit::Phase::Waiting) {
                     // A completed exit starts a new recovery cohort; confirmation counts restart.
                     cohort.clear(); g.last_bar = bar; g.recovered = 0;
@@ -182,19 +221,19 @@ void ProfitManager::evaluate(TrendEngine& engine, int64_t now) {
     }
     // Persistence errors block new risk but never disable any existing stop.
     engine.set_persistence_error("profit", error);
+    engine.set_recovered_day_pnl({now / 86400000, recovery_today});
     const bool closing = enabled && (guards[0].phase == profit::Phase::Exiting || guards[1].phase == profit::Phase::Exiting);
     for (size_t i = 0; i < 2; ++i) {
         const auto direction = i == 0 ? trend::Pos::Long : trend::Pos::Short;
         const auto after = std::max(guards[i].fresh_after, guards[1 - i].exit_ms);
         engine.set_profit_gate(direction, closing ? "组合保护退出中，暂停智能新增风险" :
-            (enabled && !inventory_ok[i] ? "仓位与成交账本不一致，暂停该方向新增风险，保留单币止损" :
-            (enabled && guards[i].blocked() ? guards[i].reason : "")), enabled ? after : 0);
+            (enabled && guards[i].blocked() ? guards[i].reason : ""), enabled ? after : 0);
         if (enabled && guards[i].phase == profit::Phase::Exiting) engine.close_auto_direction(direction, guards[i].reason);
     }
 }
 
 void ProfitManager::totals_locked(double& shorts, double& overall, bool& complete) const {
-    shorts = overall = 0; complete = !damaged_ && error_.empty();
+    shorts = overall = 0; complete = !damaged_ && error_.empty() && inventory_ok_[0] && inventory_ok_[1];
     struct Lot { double qty = 0, net = 0; int direction = 0; int64_t opened = 0; std::string key; bool eligible = false; };
     std::map<std::string, Lot> lots;
     std::vector<const Entry*> sorted;
@@ -251,7 +290,7 @@ std::string ProfitManager::status() const {
         const auto& g = guards_[i];
         s << (i == 0 ? "多头" : "空头") << "：" << phase_name(g.phase) << "，本轮 " << g.profit << "U / 峰值 " << g.peak
           << "U，最近有效广度下界 " << g.breadth * 100 << "%（固定候选 " << cohorts_[i].size() << "）\n";
-        if (!inventory_ok_[i]) s << "仓位变动缺少匹配成交，暂停回撤计算，保留已有止损\n";
+        if (!inventory_ok_[i]) s << "仓位变动缺少匹配成交，后台核对中。本方向利润回撤计算暂停，新信号照常检查入场条件。\n";
     }
     double shorts, overall; bool complete; totals_locked(shorts, overall, complete);
     s << "已结算空头净收益 " << shorts << "U；整体已实现 " << overall << "U；已购成本 " << used_ << "U\n"
@@ -260,6 +299,7 @@ std::string ProfitManager::status() const {
       << std::setprecision(8) << "已购 BTC " << btc_qty_ << std::setprecision(2);
     if (btc_price_ > 0) s << "；现值 " << btc_qty_ * btc_price_ << "U；持币盈亏 " << btc_qty_ * btc_price_ - used_ << "U";
     s << "\n" << (error_.empty() ? message_ : error_);
+    for (const auto& [symbol, reason] : recovery_wait_) s << "\n" << symbol << " 外部平仓待核对：" << reason;
     if (!complete) s << "（成交／费用未全部核实，暂停购买）";
     if (!smart_enabled_ || !cfg_.accumulate) s << "；新增购买已暂停";
     return s.str();

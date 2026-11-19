@@ -56,6 +56,7 @@ public:
         bool position_known = false;
         double remaining_qty = 0;
         OrderOutcome protective_fill; // Actual executed order, never the trigger price.
+        bool has_opposite_position = false;
     };
     virtual CloseVerification verify_close(const std::string&, const std::string&,
                                             const std::string&) { return {}; }

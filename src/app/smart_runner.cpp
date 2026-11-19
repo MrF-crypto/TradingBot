@@ -210,7 +210,7 @@ double sum_day_realized(const std::vector<TrendTrade>& trades, int64_t utc_day) 
 
 void SmartRunner::seed_day_from_history(const std::vector<TrendTrade>& trades) {
     if (!engine_) return;
-    const auto d = engine_->day_pnl();
+    const auto d = engine_->day_pnl_checkpoint();
     if (d.realized != 0) return;   // 状态文件里有今天的数，以它为准
     const double r = sum_day_realized(trades, d.day);
     if (r != 0) {
@@ -238,6 +238,9 @@ void SmartRunner::evaluate_profits(int64_t now) {
 }
 void SmartRunner::service_profits(int64_t now) { if (profits_ && !cancelled_) profits_->service(*client_, *engine_, client_->market_time_ms()); }
 std::string SmartRunner::profit_status() const { return profits_ ? profits_->status() : "尚未连接"; }
+std::vector<TrendTrade> SmartRunner::recovered_trades() const {
+    return profits_ ? profits_->recovered_trades() : std::vector<TrendTrade>{};
+}
 
 void SmartRunner::set_config(const smart::Config& cfg) {
     {
@@ -558,7 +561,7 @@ void SmartRunner::save_locked() const {
     if (state_path_.empty() || cancelled_.load()) return;   // 作废的不和新运行器抢文件
     std::ostringstream o;
     o << std::setprecision(std::numeric_limits<double>::max_digits10);
-    const auto d = engine_ ? engine_->day_pnl() : TrendEngine::DayPnl{};
+    const auto d = engine_ ? engine_->day_pnl_checkpoint() : TrendEngine::DayPnl{};
     o << "{\"pool\":" << pool_.to_json() << ",\"day\":{\"d\":" << d.day << ",\"r\":" << d.realized << "}}";
     const auto result = write_atomic_file(state_path_, o.str());
     if (engine_) engine_->set_persistence_error("智能状态", result.error);

@@ -22,6 +22,7 @@ public:
     void service(TradingClient& client, TrendEngine& engine, int64_t now);
     std::string status() const;
     std::vector<std::string> take_notices();
+    std::vector<TrendTrade> recovered_trades() const;
     void cancel() { cancelled_.store(true); }
 private:
     struct Entry {
@@ -29,6 +30,9 @@ private:
         bool settled = false;
         double net = 0;
         int64_t first_fill = 0, last_fill = 0;
+        // Only historical closes carry a link to their settled opening receipt.
+        std::string recovery_open_key;
+        double recovery_gross = 0, recovery_fee = 0;
     };
     struct Funding { double net = 0; int64_t checked = 0; };
     struct Purchase {
@@ -43,6 +47,7 @@ private:
     bool save_locked();
     void totals_locked(double& shorts, double& overall, bool& complete) const;
     void finish_purchase_locked(const TradingClient::SpotPurchase& result);
+    void recover_external_close(TradingClient& client, TrendEngine& engine, int64_t now);
     std::string path_, account_, error_, message_;
     mutable std::mutex mutex_;
     std::mutex service_mutex_;
@@ -58,7 +63,12 @@ private:
     // durable ownership is per symbol, with signed quantities in one managed net position.
     std::map<std::string, double> inherited_;
     std::array<bool, 2> inventory_ok_{true, true};
+    std::map<std::string, std::array<bool, 2>> inventory_discrepancies_;
     std::map<std::string, Entry> entries_;
+    std::map<std::string, uint64_t> receipt_revision_;
+    struct RecoveryCheck { int64_t last = 0, next = 0; };
+    std::map<std::string, RecoveryCheck> recovery_checks_;
+    std::map<std::string, std::string> recovery_wait_;
     std::map<std::string, Funding> funding_;
     Purchase purchase_;
     std::string last_saved_;

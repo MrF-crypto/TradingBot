@@ -54,7 +54,9 @@ static const char* kExchangeInfo =
 #include "audit_order_scenarios.h"
 #include "execution_price_scenarios.h"
 #include "leverage_order_scenarios.h"
+#include "position_history_scenarios.h"
 int main() {
+    test_position_history_scenarios();
     test_leverage_order_scenarios();
     test_execution_price_scenarios();
     test_rollover_scenarios();

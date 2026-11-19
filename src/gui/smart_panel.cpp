@@ -93,6 +93,7 @@ void MainWindow::startSmartRunner() {
     // 状态文件里没有今天的数（升级后第一次运行）：用成交明细补，亏损限额不从 0 算
     smart_->seed_day_from_history(trades_);
     applySmartConfig(smartCfg_);
+    refreshStats();
     if (smartCfg_.enabled) log("智能模式已启用，稍后开始扫描全市场", "OK");
 }
 
@@ -114,6 +115,9 @@ void MainWindow::smartTick() {
         run_async([this, sr, now] {
             try { sr->service_profits(now); } catch (...) {}
             profitBusy_.store(false);
+            QMetaObject::invokeMethod(this, [this, sr] {
+                if (smart_ == sr) refreshStats();
+            }, Qt::QueuedConnection);
         });
     }
     if (smart_->due(now) && !smartBusy_.exchange(true)) {
