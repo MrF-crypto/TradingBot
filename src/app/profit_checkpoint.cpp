@@ -53,6 +53,7 @@ std::string ProfitManager::serialize_locked() const {
           << ",\"ok\":" << r.ok << ",\"uncertain\":" << r.uncertain << ",\"order\":" << profit::quote(r.order_id)
           << ",\"client\":" << profit::quote(r.client_order_id) << ",\"price\":" << r.avg_price << ",\"executed\":" << r.executed_qty
           << ",\"settled\":" << entry.settled << ",\"net\":" << entry.net << ",\"first\":" << entry.first_fill << ",\"last\":" << entry.last_fill;
+        if (!r.submit_diagnostic.empty()) s << ",\"submit_diagnostic\":" << profit::quote(r.submit_diagnostic);
         if (e.opening && (!e.completed || r.uncertain) && e.required_margin > 0)
             s << ",\"required_margin\":" << e.required_margin;
         if (!entry.recovery_open_key.empty())
@@ -151,6 +152,9 @@ void ProfitManager::load() {
             const auto d = number(row, "direction"); if (d != 1 && d != -1) throw std::runtime_error("成交方向不合法"); e.direction = d > 0 ? 1 : -1;
             e.at_ms = integer(row, "at"); e.qty = number(row, "qty"); e.entry = number(row, "entry");
             r.ok = boolean(row, "ok"); r.uncertain = boolean(row, "uncertain"); r.order_id = string(row, "order"); r.client_order_id = string(row, "client");
+            std::string_view diagnostic;
+            if (row["submit_diagnostic"].get(diagnostic) == simdjson::SUCCESS && diagnostic.size() <= 4096)
+                r.submit_diagnostic.assign(diagnostic);
             r.avg_price = number(row, "price"); r.executed_qty = number(row, "executed");
             if (row["required_margin"].error() != simdjson::NO_SUCH_FIELD) {
                 e.required_margin = number(row, "required_margin");

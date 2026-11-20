@@ -123,7 +123,7 @@ bool ProfitManager::record_locked(ExecutionEvent& e) {
         // The durable sequence is also the clientOrderId. Never recycle it after restart.
         e.key = "tbp" + std::to_string(started_) + "_" + std::to_string(++sequence_);
     }
-    bool merged = false;
+    bool changed = false;
     // Exchange-stop evidence can be delivered more than once after reconnection.
     if (e.completed && !e.result.order_id.empty()) {
         for (const auto& [key, old] : entries_) if (key != e.key && old.event.symbol == e.symbol &&
@@ -136,9 +136,11 @@ bool ProfitManager::record_locked(ExecutionEvent& e) {
                       alias->second.event.result.order_id != e.result.order_id)))) {
                     error_ = "重复回执的订单归属冲突，保留已有账本"; return false;
                 }
+                if (alias != entries_.end() && e.result.submit_diagnostic.empty())
+                    e.result.submit_diagnostic = alias->second.event.result.submit_diagnostic;
                 entries_.erase(e.key);
                 e.key = key;
-                merged = true;
+                changed = true;
                 break;
             }
     }
@@ -147,6 +149,12 @@ bool ProfitManager::record_locked(ExecutionEvent& e) {
     if (!old.symbol.empty() && (old.symbol != e.symbol || old.direction != e.direction || old.opening != e.opening)) {
         error_ = "成交回执与原订单归属不一致，保留原账本等待核对"; return false;
     }
+    // A later order lookup cannot reconstruct the original submission response.
+    if (!old.result.submit_diagnostic.empty()) e.result.submit_diagnostic = old.result.submit_diagnostic;
+    else if (!e.result.submit_diagnostic.empty()) {
+        entry.event.result.submit_diagnostic = e.result.submit_diagnostic;
+        changed = true;
+    }
     // A late order-status response (including its rounded average price) must not
     // replace individually verified fills or remove their durable recovery link.
     if (!entry.recovery_open_key.empty()) {
@@ -154,14 +162,14 @@ bool ProfitManager::record_locked(ExecutionEvent& e) {
             std::fabs(e.result.executed_qty - old.result.executed_qty) > std::max(1e-10, old.qty * 1e-10))) {
             error_ = "补录成交与迟到回执矛盾，保留已核实的成交"; return false;
         }
-        return merged ? save_locked() : true;
+        return changed ? save_locked() : true;
     }
     // Replays and late uncertain responses must not erase exchange-settled net P&L.
     if (old.completed && old.result.ok && !old.result.uncertain &&
         (!e.completed || !e.result.ok || e.result.uncertain ||
          (e.result.ok && e.result.order_id == old.result.order_id &&
           e.result.executed_qty == old.result.executed_qty && e.result.avg_price == old.result.avg_price)))
-        return merged ? save_locked() : true;
+        return changed ? save_locked() : true;
     // A late execution receipt can follow an earlier "order not found" query.
     // Never retain that query's settled flag or zero net amount for the real fill.
     entry = {}; entry.event = e;

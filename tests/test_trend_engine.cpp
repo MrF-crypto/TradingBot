@@ -220,8 +220,10 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "accounting_engine_scenarios.h"
 #include "stop_reconciliation_scenarios.h"
 #include "exit_evidence_scenarios.h"
+#include "close_retry_scenarios.h"
 
 int main() {
+    test_close_retry_scenarios();
     test_exit_evidence_scenarios();
     test_stop_reconciliation_scenarios();
     test_accounting_engine_scenarios();

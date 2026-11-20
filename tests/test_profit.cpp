@@ -128,6 +128,67 @@ struct Fixture {
 
 #include "profit_breadth_scenarios.h"
 
+void close_submission_ledger_tests() {
+    for (bool accepted : {false, true}) {
+        Fixture f(accepted ? "accepted-close-lookup" : "missing-close-lookup");
+        ExecutionEvent e;
+        e.key = "offline-close"; e.bot_id = "bot"; e.symbol = "RAVEUSDT";
+        e.completed = e.is_auto = true; e.direction = 1; e.qty = 2; e.entry = 110; e.at_ms = now;
+        e.result.uncertain = true;
+        if (accepted) e.result.order_id = "9001";
+        e.result.error = "raw-body-must-never-be-persisted";
+        e.result.submit_diagnostic = "HTTP 503, exchange -1007, lookup -2013";
+        check(f.manager->record(e), "store the ambiguous close");
+        f.manager = std::make_shared<ProfitManager>(f.path, f.client->account_fingerprint());
+        f.manager->configure(f.cfg, true, now + 1);
+        f.manager->service(*f.client, *f.engine, now + 20000);
+        check(read(f.path).find("\"settled\":false") != std::string::npos,
+              "an initial missing lookup cannot settle an ambiguous close as zero");
+        f.manager->service(*f.client, *f.engine, now + 36000);
+        check(read(f.path).find(accepted ? "\"settled\":false" : "\"settled\":true") != std::string::npos,
+              "only an orphan close without evidence of execution can settle after spaced missing lookups");
+        const std::string diagnostic = e.result.submit_diagnostic;
+        e.result = {true, "9001", {}, 113.25, 2, false, e.key};
+        check(f.manager->record(e), "late confirmed close overrides earlier absent or unknown receipt");
+        const auto json = read(f.path);
+        check(json.find(diagnostic) != std::string::npos && json.find("raw-body-must-never") == std::string::npos &&
+              json.find("\"executed\":2") != std::string::npos,
+              "original sanitized submission diagnostic survives reload and late fill");
+    }
+    {
+        Fixture owned("engine-owned-close");
+        auto bot = TrendBot{}; bot.cfg.symbol = "RAVEUSDT"; bot.is_auto = true;
+        bot.st.pos = trend::Pos::Long; bot.st.entry_price = 110; bot.st.stop = 108; bot.qty = 2;
+        bot.pending_close_key = "engine-still-reconciling";
+        ExecutionEvent e;
+        e.key = bot.pending_close_key; e.bot_id = owned.engine->restore_bot(bot); e.symbol = bot.cfg.symbol;
+        e.completed = e.is_auto = true; e.direction = 1; e.qty = bot.qty; e.entry = bot.st.entry_price; e.at_ms = now;
+        e.result.uncertain = true;
+        check(owned.manager->record(e), "record engine-owned close");
+        owned.manager->service(*owned.client, *owned.engine, now + 20000);
+        owned.manager->service(*owned.client, *owned.engine, now + 40000);
+        check(read(owned.path).find("\"settled\":false") != std::string::npos,
+              "background settlement leaves the active engine's uncertain close pending");
+    }
+    // Eight never-visible but previously acknowledged closes must not monopolize the lookup batch.
+    Fixture f("close-lookup-fairness");
+    ExecutionEvent pending;
+    pending.bot_id = "bot"; pending.symbol = "RAVEUSDT"; pending.completed = pending.is_auto = true;
+    pending.direction = 1; pending.qty = 2; pending.entry = 110; pending.at_ms = now;
+    pending.result.uncertain = true;
+    for (int i = 0; i < 8; ++i) {
+        pending.key = "busy-" + std::to_string(i); pending.result.order_id = std::to_string(9001 + i);
+        check(f.manager->record(pending), "seed an acknowledged but unresolved close");
+    }
+    pending.key = "z-close"; pending.result.order_id.clear();
+    check(f.manager->record(pending), "seed independent close after eight unresolved orders");
+    for (int i = 1; i <= 4; ++i) f.manager->service(*f.client, *f.engine, now + 20000 * i);
+    const auto ledger = read(f.path);
+    const auto last = ledger.find("\"key\":\"z-close\"");
+    check(last != std::string::npos && ledger.find("\"settled\":true", last) < ledger.find('}', last),
+          "unrelated close settles even when a full batch of earlier keys is still pending");
+}
+
 void policy_tests() {
     breadth_recovery_tests();
     breadth_replacement_tests();
@@ -585,7 +646,7 @@ int main() {
         check(f.transfers == (funded ? 1 : 0) && f.purchases == 0,
               "profit spending rechecks pause/pending/config after quote HTTP");
     }
-    try { policy_tests(); integration_tests(); profit_recovery_tests(); recovered_long_profit_services(); wallet_pending_entry_tests(); }
+    try { policy_tests(); integration_tests(); profit_recovery_tests(); recovered_long_profit_services(); wallet_pending_entry_tests(); close_submission_ledger_tests(); }
     catch (const std::exception& e) { std::printf("EXCEPTION %s\n", e.what()); ++failures; }
     return failures ? 1 : 0;
 }

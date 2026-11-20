@@ -118,8 +118,26 @@ int main() {
         const auto loaded = load_trend_state(path, {mk_cfg("CHIPUSDT")});
         check(loaded.size() == 1 && loaded[0].qty == 8000 && loaded[0].st.stop == 0.0513 &&
               loaded[0].disaster_stop_id == "hard-1" && loaded[0].pending_close_key == "close-1" &&
+              loaded[0].pending_close_seen_on_exchange &&
               loaded[0].pending_close_evidence.empty() && loaded[0].hard_stop_evidence.empty() && loaded[0].stop_evidence.empty(),
               "缺少或损坏的审计字段保留为未记录，已有仓位、止损和待查平仓回执继续恢复");
+    }
+    {
+        auto saved = mk_bot("RAVEUSDT", trend::Pos::Long, 10, 12, 11, 4);
+        saved.pending_close_key = "close-original";
+        saved.disaster_stop_id = "stop-original";
+        for (const bool seen : {false, true}) {
+            saved.pending_close_seen_on_exchange = seen;
+            check(save_trend_state(path, {saved}).ok, "save pending close with explicit exchange receipt state");
+            const auto loaded = load_trend_state(path, {saved.cfg});
+            check(loaded.size() == 1 && loaded[0].pending_close_key == saved.pending_close_key &&
+                  loaded[0].pending_close_seen_on_exchange == seen && loaded[0].qty == saved.qty &&
+                  loaded[0].disaster_stop_id == saved.disaster_stop_id, "restore close receipt evidence and original protection");
+        }
+        write_file(path, R"([{"symbol":"RAVEUSDT","pos":1,"qty":4,"pending_close_key":"close-original","pending_close_seen_on_exchange":"false"}])");
+        const auto malformed = load_trend_state(path, {saved.cfg});
+        check(malformed.size() == 1 && malformed[0].pending_close_seen_on_exchange,
+              "invalid receipt flag keeps potentially accepted order under its original ID");
     }
     {
         const std::string damaged = R"([{"symbol":"ɾ�ș�USDT","pos":2,"qty":2,"disaster_stop_id":"protect-123"}])";
@@ -141,7 +159,7 @@ int main() {
     {
         write_file(path, R"([{"symbol":"LEGACYUSDT","pos":0,"qty":0}])");
         const auto migrated = load_trend_state(path, {mk_cfg("LEGACYUSDT")});
-        check(migrated.size() == 1 && migrated[0].needs_reconcile,
+        check(migrated.size() == 1 && migrated[0].needs_reconcile && !migrated[0].pending_close_seen_on_exchange,
               "legacy files also require exchange reconciliation before new entries");
     }
 

@@ -3,6 +3,14 @@
 #include <cmath>
 
 namespace ccbot {
+namespace {
+bool same_receipt(const ExecutionEvent& a, const ExecutionEvent& b) {
+    return a.completed == b.completed && a.result.ok == b.result.ok &&
+        a.result.uncertain == b.result.uncertain && a.result.order_id == b.result.order_id &&
+        a.result.executed_qty == b.result.executed_qty && a.result.avg_price == b.result.avg_price;
+}
+} // namespace
+
 void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t now) {
     std::unique_lock<std::mutex> run(service_mutex_, std::try_to_lock);
     if (!run.owns_lock() || cancelled_) return;
@@ -10,9 +18,23 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
     {
         std::lock_guard<std::mutex> lk(mutex_);
         if (!tracking_ || damaged_ || !error_.empty()) return;
-        for (const auto& [key, e] : entries_) {
-            if (!e.settled && (!e.event.completed || e.event.result.uncertain || e.event.result.ok)) work.push_back(e);
-            if (work.size() >= 8) break;
+        std::optional<std::set<std::string>> owned_closes;
+        auto it = entries_.upper_bound(settlement_cursor_);
+        for (size_t scanned = 0; scanned < entries_.size(); ++scanned) {
+            if (it == entries_.end()) it = entries_.begin();
+            const auto& [key, e] = *it++;
+            if (e.settled || (e.event.completed && !e.event.result.uncertain && !e.event.result.ok)) continue;
+            if (!e.event.opening && (!e.event.completed || e.event.result.uncertain)) {
+                if (!owned_closes) {
+                    owned_closes.emplace();
+                    for (const auto& bot : engine.get_bots())
+                        if (!bot.pending_close_key.empty()) owned_closes->insert(bot.pending_close_key);
+                }
+                // The engine is already looking up this exact close, with the held position and hard stop.
+                if (owned_closes->count(key)) continue;
+            }
+            work.push_back(e);
+            if (work.size() >= 8) { settlement_cursor_ = key; break; }
         }
     }
     for (auto entry : work) {
@@ -21,8 +43,30 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
         auto& e = entry.event;
         if (!e.completed || e.result.uncertain) {
             auto q = client.query_order(e.symbol, e.key);
+            if (!e.opening && (q.not_found || !q.terminal || q.uncertain)) {
+                std::lock_guard<std::mutex> lk(mutex_);
+                const auto current = entries_.find(e.key);
+                if (current == entries_.end() || !same_receipt(current->second.event, before)) continue;
+                auto& stored = current->second;
+                if (!q.not_found) {
+                    stored.first_close_missing_ms = 0;
+                    // A nonterminal exchange order cannot subsequently be settled as absent.
+                    if (stored.event.result.order_id.empty() && !q.order_id.empty()) {
+                        stored.event.result.order_id = q.order_id;
+                        save_locked();
+                    }
+                    continue;
+                }
+                if (!e.result.order_id.empty() || e.result.executed_qty > 0) continue;
+                if (!stored.first_close_missing_ms || now < stored.first_close_missing_ms) {
+                    stored.first_close_missing_ms = now;
+                    continue;
+                }
+                if (now - stored.first_close_missing_ms < 15000) continue;
+            }
             if (!q.terminal || q.uncertain) continue;
-            e.result = {q.ok, q.order_id, q.error, q.avg_price, q.executed_qty, q.uncertain, q.client_order_id};
+            e.result = {q.ok, q.order_id, q.error, q.avg_price, q.executed_qty, q.uncertain,
+                        q.client_order_id, q.not_found, before.result.submit_diagnostic};
             e.completed = true;
         }
         std::string error;
@@ -48,10 +92,9 @@ void ProfitManager::service(TradingClient& client, TrendEngine& engine, int64_t 
         const auto current = entries_.find(e.key);
         if (current == entries_.end()) continue;
         const auto& latest = current->second.event;
-        if (latest.completed != before.completed || latest.result.ok != before.result.ok ||
-            latest.result.uncertain != before.result.uncertain || latest.result.order_id != before.result.order_id ||
-            latest.result.executed_qty != before.result.executed_qty || latest.result.avg_price != before.result.avg_price)
+        if (!same_receipt(latest, before))
             continue; // A receipt arrived during network I/O; settle that newer evidence next time.
+        entry.event.result.submit_diagnostic = latest.result.submit_diagnostic;
         entries_[e.key] = entry; if (!save_locked()) return;
     }
 

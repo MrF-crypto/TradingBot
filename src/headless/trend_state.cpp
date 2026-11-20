@@ -107,6 +107,7 @@ SaveResult save_trend_state_locked(const std::string& path, const std::vector<Tr
            << "\"uncertain_qty\":" << b.uncertain_qty << ","
            << "\"uncertain_stop\":" << b.uncertain_stop << ","
            << "\"pending_close_key\":\"" << json_escape(b.pending_close_key) << "\","
+           << "\"pending_close_seen_on_exchange\":" << (b.pending_close_seen_on_exchange ? "true" : "false") << ","
            << "\"pending_close_reason\":\"" << json_escape(b.pending_close_reason) << "\","
            << (b.pending_close_evidence.empty() ? "" : "\"pending_close_evidence\":" + exit_evidence_json(b.pending_close_evidence) + ",")
            << (b.stop_evidence.empty() ? "" : "\"stop_evidence\":" + exit_evidence_json(b.stop_evidence) + ",")
@@ -385,6 +386,10 @@ std::vector<TrendBot> load_trend_state(const std::string& path,
         b.uncertain_qty = get_num(o, "uncertain_qty", 0);
         b.uncertain_stop = get_num(o, "uncertain_stop", 0);
         b.pending_close_key = get_str(o, "pending_close_key", "");
+        // A missing or damaged flag in a legacy pending order must keep the original ID.
+        bool seen_on_exchange = true;
+        b.pending_close_seen_on_exchange = !b.pending_close_key.empty() &&
+            (o["pending_close_seen_on_exchange"].get(seen_on_exchange) != simdjson::SUCCESS || seen_on_exchange);
         b.pending_close_reason = get_str(o, "pending_close_reason", "");
         const auto read_evidence = [&](const char* field, ExitEvidence& result) {
             simdjson::dom::element value;

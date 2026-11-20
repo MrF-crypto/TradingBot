@@ -17,6 +17,8 @@ struct OrderOutcome {
     bool        uncertain    = false;   // 状态不明（超时且查单失败）
     std::string client_order_id{};
     bool not_found = false; // Explicit exchange response to lookup of the original client order ID.
+    // Transport/HTTP codes and controlled response categories only. Never persist a raw response or signed URL.
+    std::string submit_diagnostic{};
 };
 
 inline void require_execution_price(OrderOutcome& r) {
@@ -44,6 +46,9 @@ public:
     // with a confirmed quantity and (for nonzero fills) actual average price.
     virtual OrderOutcome confirmed_order(const std::string&, const std::string&) {
         OrderOutcome r; r.uncertain = true; return r;
+    }
+    virtual OrderOutcome confirmed_close_order(const std::string& symbol, const std::string& id) {
+        return confirmed_order(symbol, id);
     }
     virtual double round_qty(const std::string& symbol, double qty) = 0;
     virtual bool   set_leverage(const std::string& symbol, int lev)  = 0;

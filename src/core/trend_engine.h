@@ -138,11 +138,19 @@ struct TrendBot {
     std::string uncertain_client_id;
     double uncertain_qty = 0, uncertain_stop = 0;
     std::string pending_close_key, pending_close_reason;
+    bool pending_close_seen_on_exchange = false; // A known order must be reconciled to its terminal receipt.
+    bool close_missing_last_query = false; // Consecutive reads of this key, not persisted across runs.
     ExitEvidence pending_close_evidence; // Immutable for the lifetime of the submitted close order.
     ExitEvidence stop_evidence; // Parameters that formed the current ratcheted line.
     ExitEvidence hard_stop_evidence; // Frozen reference line and buffer for the exchange order.
     int64_t pending_close_ms = 0;
     std::chrono::steady_clock::time_point close_last_query{};
+    struct CloseRetry {
+        unsigned submissions = 0, queries = 0;
+        bool reported = false, awaiting_receipt = false;
+        std::chrono::steady_clock::time_point started{}, last_report{};
+        std::string last_detail;
+    } close_retry; // Observations of this position only. Never drive signal or submission timing.
     bool uncertain_terminal = false;
     std::chrono::steady_clock::time_point uncertain_terminal_time{};
     std::chrono::steady_clock::time_point uncertain_last_query{};
@@ -226,6 +234,8 @@ struct TrendBot {
     // 所以"有价无单号"就是【还没挂上】的状态，重启后据此继续重试
     std::string disaster_stop_id;
     double      disaster_stop_price = 0;
+    std::string ds_last_confirmed_id;
+    std::chrono::steady_clock::time_point ds_last_confirmation{}; // Receipt/list observed in this process.
     // 同一 bot 的挂单串行化：没有它会并发派发多次，第二张被拒的同时把第一张的
     // 单号误清掉
     bool        ds_syncing = false;
@@ -722,7 +732,9 @@ private:
     void execute_open(const std::string& bot_id, trend::Pos dir, bool from_reverse);
     void execute_close(const std::string& bot_id, const std::string& reason,
                        trend::Pos reverse_to, ExitEvidence evidence, bool* fully_closed = nullptr);
-    void verify_external_close(const std::string& bot_id);
+    OrderOutcome lookup_pending_close(const std::string& id, const std::string& symbol, const std::string& key,
+                                      trend::Pos pos, double qty, std::optional<double>& verified_remainder);
+    void verify_external_close(const std::string& bot_id, ExecutionEvent* missing_close = nullptr);
     void clear_pending_after_throw(const std::string& bot_id, const std::string& what);
     void log(const std::string& msg);
 

@@ -70,6 +70,8 @@ public:
         bool terminal = false;
         bool not_found = false;
         bool        uncertain    = false;
+        // Safe transport/lookup details for the submission ledger. Never contains a response body or signed URL.
+        std::string submit_diagnostic{};
     };
 
     explicit TradingClient(const Config& cfg);
@@ -87,7 +89,7 @@ public:
     OrderResult place_market(const std::string& symbol, const std::string& side,
                               double qty, bool reduce_only = false, const std::string& tag = {});
     // 按自定义 clientOrderId 查单（幂等性恢复：下单请求超时后确认它到底成交没有）
-    OrderResult query_order(const std::string& symbol, const std::string& client_order_id);
+    OrderResult query_order(const std::string& symbol, const std::string& client_order_id, bool order_priority = false);
     // close_all_positions 删于 v5.9.9：零调用者，且内含 fetch_positions() 不判 ok
 
     // set_leverage / round_qty 见下方 ITradingClient 实现区（override 声明）
@@ -438,17 +440,20 @@ public:
     OrderOutcome place_market_order(const std::string& symbol, const std::string& side,
                                     double qty, bool reduce_only) override {
         auto r = place_market(symbol, side, qty, reduce_only);
-        return { r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id };
+        return {r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id,
+                r.not_found, r.submit_diagnostic};
     }
     OrderOutcome place_tagged_order(const std::string& symbol, const std::string& side,
                                     double qty, bool reduce_only, const std::string& tag) override {
         auto r = place_market(symbol, side, qty, reduce_only, tag);
-        return {r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id};
+        return {r.ok, r.order_id, r.error, r.avg_price, r.executed_qty, r.uncertain, r.client_order_id,
+                r.not_found, r.submit_diagnostic};
     }
     OrderOutcome confirmed_order(const std::string& symbol, const std::string& id) override {
-        const auto r = query_order(symbol, id);
-        const bool confirmed = r.ok && r.terminal && !r.uncertain;
-        return {confirmed, r.order_id, r.error, r.avg_price, r.executed_qty, !confirmed, id, r.not_found};
+        return confirmed_result(query_order(symbol, id));
+    }
+    OrderOutcome confirmed_close_order(const std::string& symbol, const std::string& id) override {
+        return confirmed_result(query_order(symbol, id, true));
     }
     double round_qty(const std::string& symbol, double qty) override;
     bool   set_leverage(const std::string& symbol, int lev) override;
@@ -567,6 +572,10 @@ private:
     // 设杠杆成功过的（品种 → 杠杆）。同样的杠杆不再重复设：每次开仓都发一次 POST，
     // 多一个请求就多一次在代理上失败的机会
 
+    static OrderOutcome confirmed_result(const OrderResult& r) {
+        const bool confirmed = r.ok && r.terminal && !r.uncertain;
+        return {confirmed, r.order_id, r.error, r.avg_price, r.executed_qty, !confirmed, r.client_order_id, r.not_found};
+    }
     std::string sign(const std::string& q) const;
     int64_t     ts_ms() const;
     // 墙上时钟读数；测试可经 set_wall_clock_for_test 替换
@@ -578,7 +587,8 @@ private:
 
     // 带签名（需要 timestamp + HMAC）
     std::string http_get (const std::string& path, std::string params = "",
-                         long* out_code = nullptr, int max_attempts = 2, bool* out_transient = nullptr);
+                         long* out_code = nullptr, int max_attempts = 2, bool* out_transient = nullptr,
+                         bool order_priority = false, int* out_curl = nullptr);
     std::string profit_evidence_get(const std::string& path, const std::string& params, bool* retry_soon);
     // out_code：可选，带回 HTTP 状态码。
     //
@@ -591,7 +601,7 @@ private:
     //   实测里同一个端点 5 秒内一次成功一次拿到 HTML，没有状态码就只能靠猜。
     //   用出参而不是成员变量：并发下的成员会串味，而这条信息要跟着那一次请求
     std::string http_post(const std::string& path, std::string params = "",
-                          long* out_code = nullptr, bool* out_transient = nullptr);
+                          long* out_code = nullptr, bool* out_transient = nullptr, int* out_curl = nullptr);
     std::string http_del (const std::string& path, std::string params = "");
     // 公开行情。critical = 行情轮询（标记价 / 备用成交价）：走专用句柄，
     // 限流闸门按订单优先级放行（只在被封禁时等）——权重逼近上限时，非订单请求要等到下一分钟，

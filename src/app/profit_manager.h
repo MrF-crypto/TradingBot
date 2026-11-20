@@ -35,6 +35,8 @@ private:
         bool settled = false;
         double net = 0;
         int64_t first_fill = 0, last_fill = 0;
+        // First negative lookup for a close with no live engine owner. Restart requires fresh evidence.
+        int64_t first_close_missing_ms = 0;
         // Only historical closes carry a link to their settled opening receipt.
         std::string recovery_open_key;
         double recovery_gross = 0, recovery_fee = 0;
@@ -86,6 +88,7 @@ private:
     std::array<bool, 2> inventory_ok_{true, true};
     std::map<std::string, std::array<bool, 2>> inventory_discrepancies_;
     std::map<std::string, Entry> entries_;
+    std::string settlement_cursor_; // Rotate the bounded lookup batch past still-pending orders.
     std::map<std::string, uint64_t> receipt_revision_;
     struct RecoveryCheck { int64_t last = 0, next = 0; };
     std::map<std::string, RecoveryCheck> recovery_checks_;

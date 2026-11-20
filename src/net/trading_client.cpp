@@ -508,7 +508,8 @@ TradingClient::TimeSyncResult TradingClient::sync_server_time() {
 }
 
 std::string TradingClient::http_get(const std::string& path, std::string params,
-                                  long* out_code, int max_attempts, bool* out_transient) {
+                                  long* out_code, int max_attempts, bool* out_transient,
+                                  bool order_priority, int* out_curl) {
     tl_net_err.clear();
     std::string resp, rhdr;
     const std::string base_params = params;
@@ -527,7 +528,9 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
     std::unique_lock<std::mutex> lk;
     CurlSlot* slot = nullptr;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        gate_->acquire(false);
+        gate_->acquire(order_priority);
+        // Sign a live request only after a busy connection pool has handed us a slot.
+        if (!test_hook_ && !slot) slot = grab_slot(get_pool_, lk);
         params = base_params;
         if (!params.empty()) {
             params += "&timestamp=" + std::to_string(ts_ms());
@@ -539,8 +542,10 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
             FakeReply fr;
             if (test_hook_("GET", path, params, fr)) {
                 gate_->observe(fr.code, fr.headers, fr.body);
-                tl_net_err = describe_net(fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK, fr.code, fr.body);
+                const auto rc = fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK;
+                tl_net_err = describe_net(rc, fr.code, fr.body);
                 if (out_code) *out_code = fr.code;
+                if (out_curl) *out_curl = static_cast<int>(rc);
                 if (out_transient) *out_transient = fr.timed_out || transient_net(CURLE_OK, fr.code);
                 return fr.body;
             }
@@ -561,6 +566,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
         gate_->observe(code, rhdr, resp);
         tl_net_err = describe_net(rc, code, resp);
         if (out_code) *out_code = code;
+        if (out_curl) *out_curl = static_cast<int>(rc);
         if (out_transient) *out_transient = transient_net(rc, code);
         if (!transient_net(rc, code)) break;
     }
@@ -568,7 +574,7 @@ std::string TradingClient::http_get(const std::string& path, std::string params,
 }
 
 std::string TradingClient::http_post(const std::string& path, std::string params,
-                                     long* out_code, bool* out_transient) {
+                                     long* out_code, bool* out_transient, int* out_curl) {
     tl_net_err.clear();
     const bool spot = path.rfind("/api/", 0) == 0 || path.rfind("/sapi/", 0) == 0;
     std::string url = (spot ? (cfg_.testnet ? std::string("https://testnet.binance.vision") : std::string("https://api.binance.com")) : base_) + path;
@@ -598,6 +604,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
             const auto rc = fr.timed_out ? CURLE_OPERATION_TIMEDOUT : CURLE_OK;
             tl_net_err = describe_net(rc, fr.code, fr.body);
             if (out_code) *out_code = fr.code;
+            if (out_curl) *out_curl = static_cast<int>(rc);
             if (out_transient) *out_transient = transient_net(rc, fr.code);
             return fr.body;
         }
@@ -617,6 +624,7 @@ std::string TradingClient::http_post(const std::string& path, std::string params
     gate_->observe(code, rhdr, resp);
     tl_net_err = describe_net(rc, code, resp);
     if (out_code) *out_code = code;
+    if (out_curl) *out_curl = static_cast<int>(rc);
     if (out_transient) *out_transient = transient_net(rc, code);
     return resp;
 }
@@ -853,32 +861,50 @@ static std::string pos_side_param(bool dual, const std::string& side, bool reduc
     return "&positionSide=" + std::string(is_long_side ? "LONG" : "SHORT");
 }
 
+// These details may be written into the trading ledger. Gateway bodies and headers
+// can echo signed requests; only report numeric status, libcurl's fixed label and known categories.
+static std::string order_transport(const char* method, long http, int curl_code) {
+    std::string text = std::string(method) + " HTTP=" + std::to_string(http) + "，curl=" + std::to_string(curl_code);
+    if (curl_code != CURLE_OK) text += "（" + std::string(curl_easy_strerror(static_cast<CURLcode>(curl_code))) + "）";
+    return text;
+}
+
 TradingClient::OrderResult TradingClient::query_order(const std::string& sym,
-                                                       const std::string& client_order_id) {
+                                                       const std::string& client_order_id, bool order_priority) {
     OrderResult r;
     r.client_order_id = client_order_id;
+    long http = 0;
+    int transfer = 0;
     auto resp = http_get(ep(Ep::Order),
                          "symbol=" + url::encode(sym) + "&origClientOrderId=" + url::encode(client_order_id) +
-                         "&recvWindow=5000");
-    if (resp.empty()) { r.error = "无响应（" + net_why(last_error()) + "）"; r.uncertain = true; return r; }
+                         "&recvWindow=5000", &http, order_priority ? 1 : 2, nullptr, order_priority, &transfer);
+    if (resp.empty() || transfer != CURLE_OK) {
+        r.error = order_transport("GET", http, transfer) + (resp.empty() ? "，空响应" : "，传输中断");
+        r.uncertain = true; return r;
+    }
 
     simdjson::dom::parser p;
     simdjson::dom::element doc;
     auto ps = simdjson::padded_string(resp);
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) {
-        r.error = "JSON解析失败（" + net_why(last_error()) + "）";
+        r.error = order_transport("GET", http, transfer) + "，响应无法解析";
         r.uncertain = true;
         return r;
     }
-    if (binance_error(doc, r.error)) {
+    int64_t code = 0;
+    if (get_or_keep(doc["code"], code) && code < 0) {
         // 只有 -2013（订单不存在）是"确认没到交易所"的可靠答案；其他业务错误
         // （-1021时间戳超窗/-1003限流/-1022签名…）说明【查询本身】没成功，
         // 订单状态依然未知——绝不能让恢复路径误判为"确认未成交"然后放行重试
-        int64_t code = 0;
-        r.not_found = doc["code"].get(code) == simdjson::SUCCESS && code == -2013;
+        r.error = order_transport("GET", http, transfer) + "，交易所代码=" + std::to_string(code);
+        r.not_found = code == -2013 && (http == 200 || http == 400 || http == 404);
         r.uncertain = !r.not_found;
         r.terminal = r.not_found;
         return r;
+    }
+    if (http < 200 || http >= 300) {
+        r.error = order_transport("GET", http, transfer) + "，查单未获有效回执";
+        r.uncertain = true; return r;
     }
 
     int64_t oid = 0;
@@ -926,7 +952,10 @@ static bool is_timestamp_reject(const std::string& resp) {
     if (p.parse(ps).get(doc) != simdjson::SUCCESS) return false;
     int64_t code = 0;
     if (doc["code"].get(code) != simdjson::SUCCESS) return false;
-    return code == -1021;
+    int64_t oid = 0;
+    double executed = 0;
+    return code == -1021 && (!get_or_keep(doc["orderId"], oid) || oid <= 0) &&
+           (!order_decimal(doc, "executedQty", executed) || executed == 0);
 }
 
 // -4061 "Order's position side does not match user's setting."
@@ -985,6 +1014,7 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
     // 遇到 -1111 自动放宽精度，最多尝试 4 次：0.001→0.01→0.1→1
     double try_step = minfo.effective_market_step();
     for (int attempt = 0; attempt < 4; ++attempt, try_step *= 10.0) {
+        r = {};
         double try_qty = floor_to_step(qty, try_step);
         if (try_qty < minfo.min_qty) { r.error = "数量小于最小下单量"; return r; }
 
@@ -997,7 +1027,8 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
             + "&newOrderRespType=RESULT&recvWindow=5000" + extra;
 
         long http_code = 0;
-        auto resp = http_post(ep(Ep::Order), body, &http_code);
+        int transfer = 0;
+        auto resp = http_post(ep(Ep::Order), body, &http_code, nullptr, &transfer);
 
         // -1021 就地重发：网络（尤其 TCP 隧道）的秒级停顿会让时间戳抵达时已超窗，
         // 而这类停顿是离散的、过去就好。时间戳在 http_post 内部每次重算，
@@ -1007,10 +1038,11 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         // 万一"确定没成交"这个判断有误、原单真进去了，重复 ID 会被币安拒掉，
         // 而不是开出第二个仓位
         for (int ts_retry = 0;
-             ts_retry < kTimestampRetries && is_timestamp_reject(resp);
+             ts_retry < kTimestampRetries && transfer == CURLE_OK &&
+                 (http_code == 400 || http_code == 200) && is_timestamp_reject(resp);
              ++ts_retry) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            resp = http_post(ep(Ep::Order), body, &http_code);
+            resp = http_post(ep(Ep::Order), body, &http_code, nullptr, &transfer);
         }
 
         // 可疑响应统一走查单恢复：空响应（超时/断网）和"非空但不是JSON"（网关5xx
@@ -1019,51 +1051,76 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
         simdjson::dom::parser p;
         simdjson::dom::element doc;
         simdjson::padded_string ps(resp);   // 必须活到 doc 使用结束（doc 内字符串指向此缓冲）
-        bool suspicious = resp.empty();
-        if (!suspicious && p.parse(ps).get(doc) != simdjson::SUCCESS) suspicious = true;
-        if (!suspicious) {
-            int64_t error_code = 0;
-            std::string_view message;
-            get_or_keep(doc["code"], error_code);
+        const bool parsed = !resp.empty() && p.parse(ps).get(doc) == simdjson::SUCCESS;
+        int64_t code = 0, oid = 0;
+        std::string_view message;
+        if (parsed) {
+            get_or_keep(doc["code"], code);
+            get_or_keep(doc["orderId"], oid);
             get_or_keep(doc["msg"], message);
-            // A valid JSON response can still mean the order was executed.
-            // Do not release reservations or submit another order until queried.
-            suspicious = error_code == -1006 || error_code == -1007 || error_code == -1000 ||
-                (http_code == 503 && message.find("Unknown error") != std::string_view::npos);
         }
+        if (oid > 0) r.order_id = std::to_string(oid);
+        double reported_qty = 0;
+        const bool has_fill = parsed && order_decimal(doc, "executedQty", reported_qty) && reported_qty > 0;
+        const bool suspicious = !parsed || transfer != CURLE_OK || code == -1006 || code == -1007 || code == -1000 ||
+            (code < 0 && (oid > 0 || has_fill)) || (code == -1021 && http_code != 200 && http_code != 400) ||
+            (http_code == 503 && message.find("Unknown error") != std::string_view::npos) ||
+            (code >= 0 && (oid <= 0 || http_code < 200 || http_code >= 300));
+        const auto submit_info = [&] {
+            auto info = order_transport("POST", http_code, transfer);
+            if (resp.empty()) return info + "，空响应";
+            if (!parsed) return info + "，响应无法解析";
+            if (code < 0) return info + "，交易所代码=" + std::to_string(code);
+            return info + (oid > 0 ? "，收到订单号" : "，未取得订单号");
+        };
         if (suspicious) {
-            for (int q = 0; q < 3; ++q) {
+            r.submit_diagnostic = submit_info();
+            if (parsed) order_execution(doc, r.executed_qty, r.avg_price);
+            constexpr int lookups = 3;
+            int missing = 0;
+            std::string lookup_error;
+            for (int q = 1; q <= lookups; ++q) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(600));
-                auto qr = query_order(sym, coid);
-                if (qr.ok) {
-                    if (!qr.terminal) {
+                auto qr = query_order(sym, coid, reduce_only);
+                if (!qr.order_id.empty()) {
+                    if (oid > 0 && qr.order_id != r.order_id) {
+                        r.uncertain = true;
+                        r.error = "查单与下单回执的订单号不一致，等待原单核对";
+                        r.submit_diagnostic += "；查单与已知订单号冲突";
+                        return r;
+                    }
+                    qr.submit_diagnostic = r.submit_diagnostic + "；第" + std::to_string(q) + "次查到原单" +
+                        (missing ? "（此前缺单 " + std::to_string(missing) + " 次）" : "");
+                    if (!qr.terminal || !qr.ok) {
                         qr.ok = false; qr.uncertain = true;
-                        qr.error = "订单尚未终结，保留风险预留等待核对";
+                        if (qr.error.empty()) qr.error = "订单尚未终结，等待原单核对";
                     }
                     return qr;
-                }                      // 找到了：实际已到达交易所，按真实成交返回
-                if (!qr.uncertain) {                       // 明确回答"-2013订单不存在"：确认没下进去
-                    r.error = "下单响应异常，已确认订单未到达交易所";
-                    return r;
                 }
+                if (qr.not_found) ++missing;
+                else lookup_error = qr.error;
             }
-            r.error     = "下单响应异常且无法确认订单状态（网络中断?）";
-            r.uncertain = true;
+            r.submit_diagnostic += "；原单查询 " + std::to_string(lookups) + " 次，返回 -2013 共 " +
+                std::to_string(missing) + " 次";
+            if (!lookup_error.empty()) r.submit_diagnostic += "；查单异常：" + lookup_error;
+            r.not_found = missing == lookups && r.order_id.empty() && r.executed_qty == 0;
+            r.terminal = r.not_found;
+            r.uncertain = !r.not_found;
+            r.error = r.not_found ? "下单回报异常，已连续三次查无原订单" : "下单回报异常，原单状态待核对";
             return r;
         }
 
         // -1111 = 精度超限，放宽一档重试
-        int64_t code = 0;
-        get_or_keep(doc["code"], code);
         if (code == -1111) {
             r.error = "[-1111]";
+            r.submit_diagnostic = submit_info();
             continue;
         }
 
-        if (binance_error(doc, r.error)) return r;
-        int64_t oid = 0;
-        get_or_keep(doc["orderId"], oid);
-        r.order_id     = std::to_string(oid);
+        if (binance_error(doc, r.error)) {
+            r.submit_diagnostic = submit_info();
+            return r;
+        }
         const bool execution_known = order_execution(doc, r.executed_qty, r.avg_price);
         std::string_view status;
         if (doc["status"].get(status) == simdjson::SUCCESS)
@@ -1071,12 +1128,29 @@ TradingClient::OrderResult TradingClient::place_market_once(const std::string& s
                          status == "EXPIRED_IN_MATCH" || status == "REJECTED";
         r.ok = r.terminal && execution_known;
         r.uncertain = !r.ok;
+        if (r.uncertain) r.submit_diagnostic = submit_info() + "，执行结果待核对";
         if (r.terminal && !execution_known) {
             // A terminal response with no average is not permission to substitute
             // the pre-order mark price. Query the existing order, never POST again.
             for (int query = 0; query < 3; ++query) {
-                auto recovered = query_order(sym, coid);
-                if (recovered.ok && recovered.terminal && !recovered.uncertain) return recovered;
+                auto recovered = query_order(sym, coid, reduce_only);
+                if (!recovered.order_id.empty() && recovered.order_id != r.order_id) {
+                    r.error = "查单与下单回执的订单号不一致，等待原单核对";
+                    r.submit_diagnostic += "；查单与已知订单号冲突";
+                    return r;
+                }
+                if (recovered.ok && recovered.terminal && !recovered.uncertain) {
+                    // Both responses are terminal. A subsequent zero or a different
+                    // final quantity cannot supply the price for the original fill.
+                    if (r.executed_qty > 0 && std::abs(recovered.executed_qty - r.executed_qty) >
+                        1e-12 * std::max(r.executed_qty, recovered.executed_qty)) {
+                        r.error = "原单两次终态回执的成交量不一致，等待核对";
+                        r.submit_diagnostic += "；终态成交量冲突";
+                        return r;
+                    }
+                    recovered.submit_diagnostic = r.submit_diagnostic + "；原单成交已核对";
+                    return recovered;
+                }
                 if (query < 2) std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
             r.error = "已收到订单回执，但成交数量或均价尚未核实，保留预留等待核对";

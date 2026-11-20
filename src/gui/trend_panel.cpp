@@ -1580,6 +1580,7 @@ static SaveResult write_trend_bots(const std::string& path, const std::vector<Tr
         o["uncertain_qty"] = b.uncertain_qty;
         o["uncertain_stop"] = b.uncertain_stop;
         o["pending_close_key"] = QString::fromStdString(b.pending_close_key);
+        o["pending_close_seen_on_exchange"] = b.pending_close_seen_on_exchange;
         o["pending_close_reason"] = QString::fromStdString(b.pending_close_reason);
         put_exit_evidence(o, "pending_close_evidence", b.pending_close_evidence);
         o["pending_close_ms"] = static_cast<qint64>(b.pending_close_ms);
@@ -1915,6 +1916,8 @@ void MainWindow::load_and_restore_trend() {
         b.uncertain_qty = o["uncertain_qty"].toDouble();
         b.uncertain_stop = o["uncertain_stop"].toDouble();
         b.pending_close_key = o["pending_close_key"].toString().toStdString();
+        // Legacy pending orders may already have been accepted by the exchange.
+        b.pending_close_seen_on_exchange = !b.pending_close_key.empty() && o["pending_close_seen_on_exchange"].toBool(true);
         b.pending_close_reason = o["pending_close_reason"].toString().toStdString();
         b.pending_close_evidence = get_exit_evidence(o["pending_close_evidence"]);
         b.pending_close_ms = o["pending_close_ms"].toVariant().toLongLong();

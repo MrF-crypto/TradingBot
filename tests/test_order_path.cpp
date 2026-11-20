@@ -149,20 +149,111 @@ int main() {
         // 交易所明确说没有这笔单 ⇒ 确认没下进去 ⇒ uncertain 必须为 false，
         // 上层才敢安全重试。若误标 uncertain，bot 会被无谓地停掉
         TradingClient tc(test_cfg());
+        int missing = 0;
         tc.set_test_hook([&](const std::string& m, const std::string& path,
                              const std::string&, TradingClient::FakeReply& out) {
             if (path.find("exchangeInfo") != std::string::npos) { out.body = kExchangeInfo; return true; }
-            if (m == "POST") { out.body = ""; return true; }
+            if (m == "POST") { out.code = 502; out.body = "<html>private-gateway-text</html>"; return true; }
             if (m == "GET" && path.find("/order") != std::string::npos) {
+                ++missing;
                 out.body = R"({"code":-2013,"msg":"Order does not exist."})";
                 return true;
             }
             return false;
         });
-        auto r = tc.place_market("BTCUSDT", "BUY", 0.015, false);
+        auto r = tc.place_tagged_order("BTCUSDT", "SELL", 0.015, true, "rave-close-a");
         check(!r.ok, "返回失败");
-        check(!r.uncertain, "【关键】确认未到达交易所，uncertain=false（上层可安全重试）");
-        check(r.error.find("未到达") != std::string::npos, "错误信息说明已确认: " + r.error);
+        check(!r.uncertain && r.not_found && missing == 3 && r.client_order_id == "rave-close-a",
+              "连续三次明确查无本单才返回已核实缺单");
+        check(r.submit_diagnostic.find("POST HTTP=502") != std::string::npos &&
+              r.submit_diagnostic.find("响应无法解析") != std::string::npos &&
+              r.submit_diagnostic.find("-2013 共 3 次") != std::string::npos &&
+              r.submit_diagnostic.find("private-gateway-text") == std::string::npos,
+              "原始 POST 类型和查单次数可追查，网关响应正文不写入账本");
+    }
+
+    for (bool late_fill : {false, true}) {
+        TradingClient tc(test_cfg());
+        int posts = 0, queries = 0;
+        tc.set_test_hook([&](const auto& method, const auto& path, const auto& params, auto& reply) {
+            if (path.find("exchangeInfo") != std::string::npos) reply.body = kExchangeInfo;
+            else if (method == "POST") {
+                ++posts;
+                reply.code = 0;
+                reply.timed_out = true;
+                reply.headers = "X-MBX-USED-WEIGHT-1M: 2000\r\n";
+            } else {
+                ++queries;
+                check(params.find("origClientOrderId=rave-close-b&") != std::string::npos, "核对同一平仓编号");
+                if (queries == 2 && late_fill) reply.body = R"({"orderId":77,"status":"FILLED","avgPrice":"100","executedQty":"0.015"})";
+                else if (queries == 2) {
+                    reply.code = 503;
+                    reply.body = "<html>private-query-text</html>";
+                } else {
+                    reply.code = 400;
+                    reply.body = R"({"code":-2013,"msg":"private-lookup-text"})";
+                }
+            }
+            return true;
+        });
+        const auto result = tc.place_tagged_order("BTCUSDT", "SELL", .015, true, "rave-close-b");
+        check(posts == 1 && tc.rate_status().throttled == 0 && result.submit_diagnostic.find("curl=28") != std::string::npos,
+              "保护性平仓恢复按原编号优先查询并保留发送超时原因");
+        if (late_fill) {
+            check(result.ok && !result.uncertain && result.order_id == "77" && result.avg_price == 100 &&
+                  queries == 2 && result.submit_diagnostic.find("此前缺单 1 次") != std::string::npos,
+                  "一次 -2013 后迟到的成交覆盖早期查无结果");
+        } else {
+            check(!result.ok && result.uncertain && !result.not_found && queries == 3 &&
+                  result.submit_diagnostic.find("GET HTTP=503") != std::string::npos &&
+                  result.submit_diagnostic.find("-2013 共 2 次") != std::string::npos &&
+                  result.submit_diagnostic.find("private-") == std::string::npos,
+                  "缺单与查询失败混合时继续核单，报告脱敏传输证据");
+        }
+        tc.confirmed_close_order("BTCUSDT", "rave-close-b");
+        check(tc.rate_status().throttled == 0, "后续保护性查原单仍享有订单优先级");
+        tc.confirmed_order("BTCUSDT", "rave-close-b");
+        check(tc.rate_status().throttled > 0, "普通查单遵守常规软限速");
+    }
+
+    {
+        TradingClient tc(test_cfg());
+        int phase = 0, posts = 0;
+        tc.set_test_hook([&](const auto& method, const auto& path, const auto&, auto& reply) {
+            if (path.find("exchangeInfo") != std::string::npos) reply.body = kExchangeInfo;
+            else if (method == "POST") {
+                ++posts;
+                reply.body = R"({"orderId":61,"status":"FILLED","executedQty":"0.015","avgPrice":"0"})";
+            } else if (phase == 0) {
+                reply.code = 503;
+                reply.body = R"({"code":-2013,"msg":"private-lookup-text"})";
+            } else if (phase == 1) {
+                reply.body = R"({"orderId":62,"status":"FILLED","avgPrice":"102","executedQty":"0.015"})";
+            } else if (phase == 3) {
+                reply.body = R"({"orderId":61,"status":"EXPIRED","executedQty":"0"})";
+            } else {
+                reply.code = 400;
+                reply.body = R"({"code":-2013})";
+            }
+            return true;
+        });
+        const auto absent = tc.confirmed_close_order("BTCUSDT", "rave-close-c");
+        check(absent.uncertain && !absent.not_found && absent.error.find("private-") == std::string::npos,
+              "HTTP 503 携带 -2013 仍无法确认缺单");
+        ++phase;
+        const auto mismatch = tc.place_tagged_order("BTCUSDT", "SELL", .015, true, "rave-close-c");
+        check(posts == 1 && mismatch.uncertain && !mismatch.ok && !mismatch.not_found &&
+              mismatch.order_id == "61" && mismatch.executed_qty == .015 && mismatch.avg_price == 0,
+              "查得不同订单号不能覆盖原平仓委托已有的部分证据");
+        ++phase;
+        const auto unpriced = tc.place_tagged_order("BTCUSDT", "SELL", .015, true, "rave-close-d");
+        check(posts == 2 && unpriced.uncertain && !unpriced.not_found && unpriced.order_id == "61" &&
+              unpriced.executed_qty == .015 && unpriced.avg_price == 0,
+              "已终结但缺均价的平仓回执在后续 -2013 时保留原单和成交量");
+        ++phase;
+        const auto conflict = tc.place_tagged_order("BTCUSDT", "SELL", .015, true, "rave-close-e");
+        check(posts == 3 && conflict.uncertain && conflict.executed_qty == .015 && conflict.avg_price == 0,
+              "同单号冲突的零成交终态不能抹去已知成交量");
     }
 
     std::printf("\n── 用例4：下单和查单都联系不上 ──\n");

@@ -79,6 +79,37 @@ std::string close_log(const TrendTrade& tr, bool partial) {
         " 毛盈亏=" + fmt(tr.pnl, 2) + "U，预估净盈亏=" + fmt(tr.estimated_net(TrendEngine::kEstFeeRate), 2) +
         "U，" + format_exit_evidence(tr.exit_evidence, tr.exit_price, tr.reason);
 }
+std::string close_protection_status(const TrendBot& b, std::chrono::steady_clock::time_point now) {
+    if (b.disaster_stop_id.empty()) return "｜本地无已登记硬止损单";
+    const std::string stop = "｜保留原硬止损单 " + b.disaster_stop_id + "，登记触发价=" + exit_price_text(b.disaster_stop_price);
+    if (b.ds_last_confirmed_id != b.disaster_stop_id) return stop + "，本次运行尚未收到该单的交易所确认";
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - b.ds_last_confirmation);
+    return stop + "，最近收到该单交易所确认距今 " + std::to_string(elapsed.count()) + " 秒";
+}
+
+void clear_close_order(TrendBot& b) {
+    b.pending_close_key.clear();
+    b.pending_close_reason.clear();
+    b.pending_close_evidence = {};
+    b.pending_close_ms = 0;
+    b.pending_close_seen_on_exchange = false;
+    b.close_missing_last_query = false;
+}
+
+std::string close_retry_counts(const TrendBot::CloseRetry& retry, std::chrono::steady_clock::time_point now) {
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - retry.started).count();
+    return "本仓平仓提交 " + std::to_string(retry.submissions) + " 次，后续原单核对 " +
+           std::to_string(retry.queries) + " 次，历时 " + std::to_string(seconds) + " 秒";
+}
+
+std::string finish_close_retry(TrendBot& b, std::chrono::steady_clock::time_point now) {
+    std::string result;
+    if (b.close_retry.reported) result = "｜" + close_retry_counts(b.close_retry, now) +
+        "｜最近一次异常=" + b.close_retry.last_detail;
+    else if (b.close_retry.queries) result = "｜本次运行核对了原平仓单";
+    b.close_retry = {};
+    return result;
+}
 // Keep an active smart position eligible for the usual post-close signal. A stopped
 // bot may have been paused by its owner, even if its holding later disappeared.
 bool monitor_after_external_close(const TrendBot& b) {
@@ -227,6 +258,10 @@ std::string TrendEngine::restore_bot(TrendBot snap) {
     snap.rotation_reserved = false;
     snap.leverage_retry_after = {};
     snap.leverage_failure_noted = false;
+    snap.close_missing_last_query = false;
+    snap.ds_last_confirmed_id.clear();
+    snap.close_retry = {};
+    snap.close_last_query = {};
     if (snap.open_uncertain) snap.state = TrendBot::State::Stopped;
     snap.pending = false;              // 落盘时的在途标记一律作废
     // 信号一律作废重拉：落盘的 ATR 可能是几小时前的，而止损线的距离由它决定。
@@ -435,7 +470,7 @@ std::vector<std::string> TrendEngine::reconcile_positions(
             }
             b.last_action = monitor ? "连续两次确认交易所无仓位，等待新的收盘突破；实际成交与盈亏待核对"
                                     : "连续两次确认交易所无仓位，已停止；实际成交与盈亏待核对";
-            note_once(TrendBot::Recon::ExtGone, b.cfg.symbol + " " + b.last_action);
+            note_once(TrendBot::Recon::ExtGone, b.cfg.symbol + " " + b.last_action + finish_close_retry(b, now));
             trend::on_closed(b.st);
             start_reentry_wait(b);
             clear_ds_runtime(b);
@@ -550,6 +585,8 @@ std::vector<std::string> TrendEngine::reconcile_stop_orders(
         if (b.ds_syncing)                 continue;   // 正有一次挂单在途
 
         if (live_ids.count(b.disaster_stop_id)) {
+            b.ds_last_confirmed_id = b.disaster_stop_id;
+            b.ds_last_confirmation = host_.now_steady();
             b.ds_probe_needs_stop_check = false;
             if (confirm_probe_protection(b)) log("✅ 试探成交与硬止损均已确认，账户级熔断解除");
             continue;
@@ -902,7 +939,7 @@ bool TrendEngine::persist_stop_checkpoint() {
         try { ok = save_checkpoint(stop_checkpoint_); }
         catch (...) { ok = false; }
     }
-    if (!ok && !stop_checkpoint_dirty_) log("⚠ 账户熔断断点保存失败，试探需等待断点可写");
+    if (!ok && !stop_checkpoint_dirty_) log("⚠ 交易断点保存失败，保护性平仓继续执行，试探开仓等待断点可写");
     stop_checkpoint_dirty_ = !ok;
     return ok;
 }
@@ -2279,6 +2316,8 @@ void TrendEngine::try_place_hard_stop(const std::string& bot_id) {
                 log(sym + " 硬止损挂上时仓位已平，撤掉这张孤儿单");
             } else {
                 b.disaster_stop_id = placed.order_id;
+                b.ds_last_confirmed_id = placed.order_id;
+                b.ds_last_confirmation = host_.now_steady();
                 b.ds_probe_needs_stop_check = false;
                 if (b.ds_unprotected)
                     log("✅ " + sym + " 硬止损补挂成功（第 " + std::to_string(attempt) + " 次）");
@@ -2480,7 +2519,7 @@ void TrendEngine::submit_close(const std::string& id, const std::string& reason,
     host_.submit([this, id, reason, reverse_to, evidence]() { execute_close(id, reason, reverse_to, evidence); });
 }
 
-void TrendEngine::verify_external_close(const std::string& id) {
+void TrendEngine::verify_external_close(const std::string& id, ExecutionEvent* missing_close) {
     try {
         TrendBot before;
         {
@@ -2499,6 +2538,9 @@ void TrendEngine::verify_external_close(const std::string& id) {
             evidence = client_->verify_close(before.cfg.symbol, side_of(before.st.pos, false), stop_id);
         }
         const auto& verified_fill = evidence.protective_fill;
+        // A missing close key remains in flight if this independent flat-position check fails.
+        if (missing_close && evidence.position_known && evidence.remaining_qty == 0 &&
+            !record_execution(*missing_close)) set_persistence_error("profit", "平仓账本待核对");
         if (evidence.position_known && evidence.remaining_qty == 0 && verified_fill.ok && !verified_fill.uncertain &&
             std::isfinite(verified_fill.executed_qty) && verified_fill.executed_qty >= before.qty - std::max(1.0, before.qty) * 1e-12 &&
             std::isfinite(verified_fill.avg_price) && verified_fill.avg_price > 0) {
@@ -2520,13 +2562,15 @@ void TrendEngine::verify_external_close(const std::string& id) {
             b.pending = false;
             if (b.qty != before.qty || b.st.pos != before.st.pos) return;
             if (!evidence.position_known || !std::isfinite(evidence.remaining_qty) || evidence.remaining_qty != 0) {
-                const auto message = evidence.position_known ?
+                const char* message = evidence.position_known ?
                     "平仓被拒，已确认仍有持仓；保留跟踪和保护单" : "平仓被拒且持仓未确认；保留跟踪和保护单";
+                if (missing_close) message = "原单查无记录，但第二次核对未确认空仓，保留原委托和保护单继续核对";
                 if (!evidence.position_known) b.needs_reconcile = true;
                 if (b.last_action != message) log(b.cfg.symbol + " " + message);
                 b.last_action = message;
                 return;
             }
+            if (missing_close) clear_close_order(b);
             const auto& fill = evidence.protective_fill;
             const bool planned = fill.ok && !fill.uncertain && std::isfinite(fill.executed_qty) &&
                 fill.executed_qty >= b.qty - std::max(1.0, b.qty) * 1e-12 &&
@@ -2574,8 +2618,10 @@ void TrendEngine::verify_external_close(const std::string& id) {
             b.qty = 0;
             b.needs_reconcile = false;
             b.last_pos_change = host_.now_steady();
-            log(emit ? close_log(trade, false) : b.cfg.symbol + " " + b.last_action);
-            flush_stop_checkpoint();
+            log((emit ? close_log(trade, false) : b.cfg.symbol + " " + b.last_action) +
+                finish_close_retry(b, host_.now_steady()));
+            if (missing_close) persist_stop_checkpoint();
+            else flush_stop_checkpoint();
         }
         if (cancel_live_stop) cancel_disaster_stop(id);
         if (emit && trade_cb_) trade_cb_(trade);
@@ -2584,6 +2630,38 @@ void TrendEngine::verify_external_close(const std::string& id) {
     } catch (...) {
         clear_pending_after_throw(id, "平仓核对失败，保留持仓");
     }
+}
+
+OrderOutcome TrendEngine::lookup_pending_close(const std::string& id, const std::string& symbol, const std::string& key,
+                                             trend::Pos pos, double qty, std::optional<double>& verified_remainder) {
+    auto result = client_->confirmed_close_order(symbol, key);
+    bool verify_missing;
+    {
+        std::lock_guard<std::recursive_mutex> lk(mtx_);
+        auto& b = bots_.at(id);
+        if (b.close_retry.submissions == 0 && b.close_retry.queries == 0)
+            b.close_retry.started = host_.now_steady();
+        ++b.close_retry.queries;
+        if (result.not_found && b.pending_close_seen_on_exchange)
+            result.error = "交易所曾确认原单，本轮未查到，继续等待终态";
+        verify_missing = result.not_found && b.close_missing_last_query && !b.pending_close_seen_on_exchange;
+        b.close_missing_last_query = result.not_found;
+    }
+    if (!result.not_found) return result;
+    result.uncertain = true; // A single miss never releases an in-flight order.
+    if (!verify_missing) return result;
+
+    // Query outside the engine mutex. Never manufacture a fill from a quantity difference.
+    const auto position = client_->verify_close(symbol, side_of(pos, false), {});
+    if (!position.position_known || position.has_opposite_position || !std::isfinite(position.remaining_qty) ||
+        position.remaining_qty < 0 || position.remaining_qty > qty + std::max(1.0, qty) * 1e-12) return result;
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    const auto& b = bots_.at(id);
+    if (b.pending_close_key != key || b.pending_close_seen_on_exchange || b.st.pos != pos || b.qty != qty) return result;
+    verified_remainder = std::min(qty, position.remaining_qty);
+    result.uncertain = false;
+    result.error = "原平仓单连续两轮查无记录，已核对交易所剩余持仓=" + exit_number(*verified_remainder);
+    return result;
 }
 
 void TrendEngine::execute_close(const std::string& id, const std::string& requested_reason,
@@ -2677,40 +2755,58 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reques
             if (!previous_key.empty()) { execution.key = previous_key; execution.at_ms = previous_ms; }
             // A ledger failure may block entries, never a protective reduce-only exit.
             OrderOutcome r;
+            std::optional<double> verified_remainder;
             if (previous_key.empty()) {
                 if (!record_execution(execution)) set_persistence_error("profit", "平仓账本待核对");
+                if (execution.key.empty()) execution.key = make_client_order_id();
                 {
                     std::lock_guard<std::recursive_mutex> lk(mtx_);
                     auto& b = bots_.at(id);
+                    if (b.close_retry.submissions == 0 && b.close_retry.queries == 0)
+                        b.close_retry.started = host_.now_steady();
+                    ++b.close_retry.submissions;
                     b.pending_close_key = execution.key; b.pending_close_ms = execution.at_ms;
                     b.pending_close_reason = reason;
                     b.pending_close_evidence = evidence;
+                    b.pending_close_seen_on_exchange = b.close_missing_last_query = false;
+                    persist_stop_checkpoint(); // Also preserve the lookup key when the profit ledger is disabled.
                 }
                 r = client_->place_tagged_order(cfg.symbol, side_of(pos, true), qty, true, execution.key);
             } else {
-                r = client_->confirmed_order(cfg.symbol, previous_key);
+                r = lookup_pending_close(id, cfg.symbol, previous_key, pos, qty_have, verified_remainder);
                 reverse_to = trend::Pos::Flat; // A late receipt must never trigger a stale reversal.
             }
             require_execution_price(r);
             execution.result = r; execution.completed = true;
-            if (previous_key.empty() || !r.uncertain)
-                if (!record_execution(execution)) set_persistence_error("profit", "平仓成交账本写入失败");
+            if (verified_remainder == 0) {
+                verify_external_close(id, &execution);
+                return;
+            }
+            bool newly_acknowledged = false;
             {
                 std::lock_guard<std::recursive_mutex> lk(mtx_);
                 auto& b = bots_.at(id);
                 if (r.uncertain) {
+                    const bool seen = b.pending_close_seen_on_exchange || (!r.order_id.empty() && r.order_id != "0") || r.executed_qty > 0;
+                    newly_acknowledged = seen && !b.pending_close_seen_on_exchange;
+                    const bool changed = newly_acknowledged ||
+                        (!r.client_order_id.empty() && r.client_order_id != b.pending_close_key);
+                    b.pending_close_seen_on_exchange = seen;
                     if (!r.client_order_id.empty()) b.pending_close_key = r.client_order_id;
+                    if (changed) persist_stop_checkpoint();
                 }
             }
+            if ((previous_key.empty() || !r.uncertain || newly_acknowledged) && !record_execution(execution))
+                set_persistence_error("profit", "平仓成交账本写入失败");
 
             bool closed_ok = false;
             double exit_px = r.avg_price, closed_qty = 0;
-            if (!r.ok && r.error.find("[-2022]") != std::string::npos) {
+            if (!r.ok && !r.uncertain && r.error.find("[-2022]") != std::string::npos) {
                 {
                     std::lock_guard<std::recursive_mutex> lk(mtx_);
                     auto& b = bots_.at(id);
-                    b.pending_close_key.clear(); b.pending_close_reason.clear(); b.pending_close_ms = 0;
-                    b.pending_close_evidence = {};
+                    clear_close_order(b);
+                    persist_stop_checkpoint();
                 }
                 verify_external_close(id);
                 return; // Rejection is never proof of a completed rotation close.
@@ -2734,20 +2830,29 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reques
                 auto& b = it->second;
 
                 if (!closed_ok) {
-                    if (!r.uncertain) {
-                        b.pending_close_key.clear(); b.pending_close_reason.clear(); b.pending_close_ms = 0;
-                        b.pending_close_evidence = {};
+                    if (!r.uncertain) clear_close_order(b);
+                    if (verified_remainder && *verified_remainder < b.qty) {
+                        log(cfg.symbol + " 核实原方向仓位已降至 " + exit_number(*verified_remainder) + "，成交归属待核，保留剩余仓位保护");
+                        b.qty = *verified_remainder;
+                        b.last_pos_change = host_.now_steady();
                     }
                     b.pending = false;
-                    b.last_action = r.uncertain ? "平仓回执待核对，保留止损" : "平仓未成交，下个tick重试";
-                    if (previous_key.empty()) log(cfg.symbol + " 平仓待确认: " + r.error +
-                        (r.uncertain ? "（保留止损，核对原订单）" : ""));
+                    b.last_action = r.uncertain ? "平仓回执待核对，继续查原订单" : "平仓未确认成交，下一行情重新判断";
+                    auto& retry = b.close_retry;
+                    const auto now = host_.now_steady();
+                    retry.last_detail = !r.submit_diagnostic.empty() ? r.submit_diagnostic :
+                        (r.error.empty() ? b.last_action : r.error);
+                    if (!retry.reported || r.uncertain != retry.awaiting_receipt || now - retry.last_report >= std::chrono::minutes(1)) {
+                        log(cfg.symbol + " " + b.last_action + "｜" + retry.last_detail + "｜" + close_retry_counts(retry, now) +
+                            close_protection_status(b, now));
+                        retry.reported = true; retry.awaiting_receipt = r.uncertain; retry.last_report = now;
+                    }
+                    if (!r.uncertain) persist_stop_checkpoint();
                     return;
                 }
 
                 // Receipt cursor and position must enter the checkpoint atomically.
-                b.pending_close_key.clear(); b.pending_close_reason.clear(); b.pending_close_ms = 0;
-                b.pending_close_evidence = {};
+                clear_close_order(b);
 
                 const double sign = (pos == trend::Pos::Long) ? 1.0 : -1.0;
                 const double pnl  = (exit_px - entry) * closed_qty * sign;
@@ -2799,8 +2904,8 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reques
                 // reverse_to != Flat 时【保持 pending=true】，紧接着开反向，
                 // 整段不放开，别的 tick 插不进来
                 }   // 完全平仓
-                log(close_log(tr, partial_close));
-                flush_stop_checkpoint();
+                log(close_log(tr, partial_close) + finish_close_retry(b, host_.now_steady()));
+                persist_stop_checkpoint();
             }       // ← mtx_ 在此释放
             // 完全平仓才撤保护；部分平仓发完成交记录后返回，不反手。
             if (need_ds_cancel) cancel_disaster_stop(id);
