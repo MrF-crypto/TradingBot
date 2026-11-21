@@ -109,7 +109,15 @@ void MainWindow::applySmartConfig(const smart::Config& c) {
 void MainWindow::smartTick() {
     if (!smart_) return;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    smart_->evaluate_profits(client_ ? client_->market_time_ms() : now);
+    const auto marketNow = client_ ? client_->market_time_ms() : now;
+    smart_->evaluate_profits(marketNow);
+    if (smart_->rebound_due(marketNow) && !reboundBusy_.exchange(true)) {
+        auto sr = smart_;
+        run_async([this, sr] {
+            try { sr->refresh_rebound(); } catch (...) {}
+            reboundBusy_.store(false);
+        });
+    }
     if (slowTickCount_ % 5 == 1 && smart_->needs_breadth_quotes() && !breadthBusy_.exchange(true)) {
         auto sr = smart_;
         run_async([this, sr] {
@@ -174,6 +182,10 @@ void MainWindow::refreshSmartBadge() {
     }
     if (smart_) {
         const auto rep = smart_->last_report();
+        if (smartCfg_.enabled && smartCfg_.short_rebound_guard) {
+            if (!tip.isEmpty()) tip += "\n";
+            tip += QString::fromStdString(smart_->rebound_status());
+        }
         if (smartCfg_.profit.protect || smartCfg_.profit.accumulate)
             tip += "\n" + QString::fromStdString(smart_->profit_status());
         if (rep.at_ms > 0)
@@ -380,6 +392,20 @@ void MainWindow::openSmartDialog() {
     fList->addRow(hint("通过硬过滤的品种全部进入统一候选池，不评分、不分多空榜、不限制候选数量。"
                        "向上突破做多、向下突破做空，仍需通过趋势确认和账户风控。"
                        "明确不合格时暂停新仓，空仓 bot 可移除；持仓和在途委托继续管理。"));
+    auto* cbRebound = new QCheckBox("急反弹保护（暂停新增智能空头风险）");
+    cbRebound->setChecked(c0.short_rebound_guard);
+    cbRebound->setToolTip("每根 5 分钟 K 线收盘时，检查候选过去 15 分钟的涨幅。"
+                          "有效数据覆盖至少 90% 时，若至少 70% 的品种上涨，且按各自 1 小时 ATR(14) 折算的涨幅中位数达到 0.50，就暂停新开空单和满仓换仓开空。\n"
+                          "上涨占比连续两根低于 50% 后解除暂停，等待新的 1 小时收盘向下突破。已有仓位继续执行原有止损和出场规则。");
+    fList->addRow(cbRebound);
+    auto* reboundStatus = hint(QString());
+    reboundStatus->setVisible(c0.enabled && c0.short_rebound_guard);
+    fList->addRow(reboundStatus);
+    const auto refreshRebound = [this, reboundStatus] {
+        reboundStatus->setText(smart_ ? QString::fromStdString(smart_->rebound_status())
+                                      : QString("连接后显示急反弹保护状态"));
+    };
+    if (c0.enabled && c0.short_rebound_guard) refreshRebound();
 
     auto* fTpl = group(tv, "趋势跟踪参数（不反手、硬止损强制开）");
     auto* cbIv = new QComboBox();
@@ -583,6 +609,8 @@ void MainWindow::openSmartDialog() {
     refreshProfit(); pv->addWidget(profitStatus); pv->addStretch();
     auto* profitTimer = new QTimer(&dlg); profitTimer->setInterval(3000);
     connect(profitTimer, &QTimer::timeout, &dlg, refreshProfit); profitTimer->start();
+    if (c0.enabled && c0.short_rebound_guard)
+        connect(profitTimer, &QTimer::timeout, &dlg, refreshRebound);
     tabs->addTab(profitPage, "利润保护 · BTC 积累");
 
     // ── 候选名单──────────────────────────────────────
@@ -649,6 +677,7 @@ void MainWindow::openSmartDialog() {
         c.dir_short = cbShort->isChecked();
         c.max_positions  = sMaxPos->value();
         c.rotate_when_full = cbRotate->isChecked();
+        c.short_rebound_guard = cbRebound->isChecked();
         c.profit.protect = cbProtect->isChecked(); c.profit.accumulate = cbAccumulate->isChecked();
         c.profit.wait_btc_up = cbBtcTrend->isChecked(); c.profit.arm_usdt = sArm->value();
         c.profit.soft_drawdown = sSoft->value() / 100; c.profit.hard_drawdown = sHard->value() / 100;

@@ -187,6 +187,7 @@ static void test_config_json() {
     Config c;
     c.enabled = true;
     c.rotate_when_full = true;
+    c.short_rebound_guard = true;
     c.dir_short = false;
     c.min_quote_vol = 8e6;
     c.blacklist = {"XUSDT", "YUSDT"};
@@ -199,17 +200,24 @@ static void test_config_json() {
     std::string err;
     check(config_from_json(config_to_json(c), d, &err), "配置 JSON 往返：能读回");
     check(d.rotate_when_full, "满仓换仓开关往返保留");
+    check(d.short_rebound_guard, "急反弹保护开关往返保留");
     check(!Config{}.rotate_when_full, "旧配置默认不启用满仓换仓");
     const auto before_rotation = config_to_json(d);
     for (const auto bad : {R"({"rotate_when_full":1})", R"({"rotate_when_full":"true"})", R"({"rotate_when_full":null})"})
         check(!config_from_json(bad, d, &err) && config_to_json(d) == before_rotation,
               "换仓开关类型错误拒绝，原配置不变");
+    for (const auto bad : {R"({"short_rebound_guard":1})", R"({"short_rebound_guard":"true"})", R"({"short_rebound_guard":null})"})
+        check(!config_from_json(bad, d, &err) && config_to_json(d) == before_rotation &&
+              has(err, "short_rebound_guard"), "急反弹保护拒绝错误类型并保留现有设置");
+    check(config_from_json(R"({"short_rebound_guard":false})", d, &err) && !d.short_rebound_guard,
+          "可单独关闭急反弹保护");
     check(d.enabled && !d.dir_short && near(d.min_quote_vol, 8e6) && d.blacklist.size() == 2 &&
           near(d.daily_loss_limit, 123.5), "  各项一致");
     check(near(d.tmpl.rule.atr_mult, 2.5) && d.tmpl.size_mode == TrendConfig::SizeMode::RiskBased &&
           near(d.tmpl.risk_usdt, 7), "  模板一致");
     check(near(d.tmpl.rule.following.short_vol_ratio, 0.8), "空头量比配置保留");
     Config legacy;
+    check(config_from_json("{}", legacy, &err) && !legacy.short_rebound_guard, "旧配置默认关闭急反弹保护");
     std::string previous = config_to_json(legacy);
     check(config_from_json(R"({"dir_mode":"mixed","long_n":1,"short_n":1,"strong_n":0,"mid_n":0,"min_score":100,"prio_reserve":999,"prio_min_score":100,"drop_rank_factor":9})", legacy, &err) &&
           config_to_json(legacy) == previous, "旧评分和分榜字段不再改变配置或隐藏限制候选");
@@ -349,7 +357,10 @@ static void test_single_strategy_config() {
           !excluded_asset_base("SOL"), "保留趋势选币共用的黄金代币排除");
 }
 
+#include "rebound_guard_scenarios.h"
+
 int main() {
+    test_rebound_guard();
     test_single_strategy_config();
     test_gates();
     test_features();

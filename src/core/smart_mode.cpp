@@ -278,6 +278,7 @@ std::string config_to_json(const Config& c) {
     o << "],"
       << "\"max_positions\":" << c.max_positions << ","
       << "\"rotate_when_full\":" << b(c.rotate_when_full) << ","
+      << "\"short_rebound_guard\":" << b(c.short_rebound_guard) << ","
       << "\"daily_loss_limit\":" << c.daily_loss_limit << ","
       << "\"float_loss_limit\":" << c.float_loss_limit << ","
       << "\"pause_new\":" << b(c.pause_new) << ",";
@@ -404,6 +405,11 @@ bool config_from_json(std::string_view s, Config& cfg, std::string* err) {
         if (o["rotate_when_full"].get(el) == simdjson::SUCCESS &&
             el.get(c.rotate_when_full) != simdjson::SUCCESS) {
             if (err) *err = "智能模式：rotate_when_full 必须是布尔值";
+            return false;
+        }
+        if (o["short_rebound_guard"].get(el) == simdjson::SUCCESS &&
+            el.get(c.short_rebound_guard) != simdjson::SUCCESS) {
+            if (err) *err = "智能模式：short_rebound_guard 必须是布尔值";
             return false;
         }
     }

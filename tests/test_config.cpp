@@ -210,12 +210,12 @@ int main() {
     {
         // 智能模式段：读进来、非法值拒绝启动、不写就是关
         write_file(path, "{\"api_key\":\"k\",\"api_secret\":\"s\","
-                         "\"smart_mode\":{\"enabled\":true,\"dir_short\":false,\"long_n\":30,"
+                         "\"smart_mode\":{\"enabled\":true,\"dir_short\":false,\"long_n\":30,\"short_rebound_guard\":true,"
                          "\"min_quote_vol\":8000000,\"daily_loss_limit\":150,\"blacklist\":[\"XUSDT\"],"
                          "\"template\":{\"budget_usdt\":50,\"atr_mult\":2.5}}}");
         HeadlessConfig hc; std::string err;
         check(load_headless_config(path, hc, err), "smart_mode 段能加载（不配 trend_bots 也行）");
-        check(hc.smart.enabled && !hc.smart.dir_short &&
+        check(hc.smart.enabled && !hc.smart.dir_short && hc.smart.short_rebound_guard &&
               std::fabs(hc.smart.min_quote_vol - 8e6) < 1e-6 &&
               std::fabs(hc.smart.daily_loss_limit - 150) < 1e-9 && hc.smart.blacklist.count("XUSDT"),
               "  各项读入");

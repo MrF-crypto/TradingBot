@@ -124,9 +124,11 @@ std::vector<TrendEngine::Inspection> TrendEngine::inspect_bots() const {
             row.filtered = verdict.filtered;
             row.has_signal = fresh && (verdict.filtered || verdict.action == trend::Action::OpenLong ||
                 verdict.action == trend::Action::OpenShort || b.following.long_confirmed || b.following.short_confirmed);
+            const auto dir = verdict.action == trend::Action::OpenLong ? trend::Pos::Long :
+                verdict.action == trend::Action::OpenShort ? trend::Pos::Short : trend::Pos::Flat;
+            if (fresh && dir != trend::Pos::Flat && row.gate.empty())
+                row.gate = direction_entry_block(b, dir);
             if (b.waiting_reentry()) {
-                const auto dir = verdict.action == trend::Action::OpenLong ? trend::Pos::Long :
-                    verdict.action == trend::Action::OpenShort ? trend::Pos::Short : trend::Pos::Flat;
                 if (const char* why = reentry_block(b, dir); *why) row.decision = why;
             }
         }

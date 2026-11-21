@@ -41,6 +41,7 @@ std::string monitor_checkpoint_json(const TrendBot& b) {
     std::ostringstream s; s << std::setprecision(17);
     s << "{\"version\":1,\"armed\":" << (b.armed ? "true" : "false")
       << ",\"last_counted\":" << b.last_counted_bar_ms << ",\"rotation_attempt\":" << b.rotation_attempt_bar_ms
+      << ",\"last_rebound_release\":" << b.last_rebound_release_ms
       << ",\"key\":" << quote(m.model_key) << ",\"cursor\":" << m.cursor_ms << ",\"target\":" << m.target_ms
       << ",\"updated\":" << m.updated_ms << ",\"trend_since\":" << m.trend_since_ms << ",\"trend_bars\":" << m.trend_bars
       << ",\"regime\":" << static_cast<int>(m.regime) << ",\"previous\":" << static_cast<int>(m.previous)
@@ -70,6 +71,8 @@ bool restore_monitor_checkpoint(std::string_view json, TrendBot& b, std::string&
         TrendBot copy = b; auto& m = copy.monitor; auto& h = copy.rotation_health;
         copy.armed = boolean(o, "armed"); copy.last_counted_bar_ms = integer(o, "last_counted");
         copy.rotation_attempt_bar_ms = integer(o, "rotation_attempt");
+        copy.last_rebound_release_ms = o["last_rebound_release"].error() == simdjson::NO_SUCH_FIELD
+            ? 0 : integer(o, "last_rebound_release");
         m.model_key = string(o, "key"); m.cursor_ms = integer(o, "cursor"); m.target_ms = integer(o, "target");
         m.updated_ms = integer(o, "updated"); m.trend_since_ms = integer(o, "trend_since");
         m.trend_bars = static_cast<int>(integer(o, "trend_bars", 1000000));

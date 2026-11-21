@@ -337,6 +337,7 @@ private:
     std::atomic<bool>            smartBusy_{false};
     std::atomic<bool>            profitBusy_{false};
     std::atomic<bool>            breadthBusy_{false};
+    std::atomic<bool>            reboundBusy_{false};
     QPushButton*                 smartBtn_ = nullptr;
 
     // ── 日志 ──

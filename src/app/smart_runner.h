@@ -1,5 +1,6 @@
 #pragma once
 #include "core/market_wake.h"
+#include "core/rebound_guard.h"
 #include "core/journal.h"
 #include "core/smart_mode.h"
 #include "core/trend_engine.h"
@@ -18,6 +19,7 @@ namespace ccbot {
 
 class TradingClient;
 class ProfitManager;
+namespace rebound { class Sampler; }
 
 // 智能模式的执行层：拉全市场数据 → 硬过滤 → 候选池决策 → 落到引擎上。
 // GUI 与 headless 共用这一份，两边只负责"什么时候调"和"界面/日志怎么显示"。
@@ -36,9 +38,11 @@ struct MarketScan {
     int eligible = 0;        // 特征算得出且 ATR% 合格
     std::string error;       // outcome.ok=false 时的原因
     std::map<std::string, smart::OiStat> oi;   // 合格币的持仓量（数据记录层）；没拿到的不在里面
+    std::map<std::string, int64_t> rebound_short_breakouts;
 };
 MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
-                       const std::set<std::string>& pool_syms, int64_t now_ms, int parallel = 3);
+                       const std::set<std::string>& pool_syms, int64_t now_ms, int parallel = 3,
+                       rebound::Sampler* sampler = nullptr);
 
 // 用成交历史算某个 UTC 日的已实现盈亏，扣估算手续费——口径与引擎的当日亏损一致
 // （TrendEngine::book_day）。启动时状态文件里没有今天的数（升级后第一次运行、
@@ -88,6 +92,9 @@ public:
     void service_profits(int64_t now_ms);
     bool needs_breadth_quotes() const;
     void refresh_breadth();
+    bool rebound_due(int64_t now_ms) const;
+    void refresh_rebound();
+    std::string rebound_status() const;
     std::string profit_status() const;
     std::vector<TrendTrade> recovered_trades() const;
 
@@ -109,6 +116,10 @@ public:
     void cancel();
 
 private:
+    bool rebound_due_locked(int64_t now_ms) const;
+    void stage_rebound_candidates_locked(const MarketScan& scan, int64_t now_ms);
+    std::string rebound_checkpoint_locked() const;
+    void restore_rebound_checkpoint(const std::string& json);
     void apply_engine_gates_locked();
     void save_locked() const;
     static bool same_params(const TrendConfig& a, const TrendConfig& b);
@@ -124,6 +135,13 @@ private:
     mutable std::mutex mtx_;
     smart::Config      cfg_;
     smart::Pool        pool_;
+    std::shared_ptr<rebound::Sampler> rebound_sampler_;
+    rebound::State rebound_state_;
+    rebound::Breadth rebound_reading_;
+    std::set<std::string> rebound_pool_, rebound_next_pool_;
+    int64_t rebound_next_close_ms_ = 0, rebound_reading_ms_ = 0, rebound_retry_ms_ = 0;
+    std::mutex rebound_fetch_mtx_;
+    std::atomic<uint64_t> rebound_generation_{0};
     Report             last_;
     int64_t            next_due_ms_ = 0;   // 0 = 立刻
     smart::MarketWake market_wake_;

@@ -1,6 +1,7 @@
 #include "core/trend_engine.h"
 #include "core/client_order_id.h"
 #include "core/monitor_state.h"
+#include "core/rebound_guard.h"
 #include "core/strategy_exit.h"
 
 #include <algorithm>
@@ -678,6 +679,23 @@ void TrendEngine::set_profit_gate(trend::Pos direction, std::string reason, int6
     (direction == trend::Pos::Long ? profit_long_gate_ : profit_short_gate_) = std::move(reason);
     (direction == trend::Pos::Long ? profit_long_after_ : profit_short_after_) = fresh_after;
 }
+
+void TrendEngine::set_rebound_gate(bool paused, int64_t released_ms) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    rebound_paused_ = paused;
+    rebound_released_ms_ = released_ms;
+}
+
+void TrendEngine::set_rebound_breakouts(std::map<std::string,int64_t> confirmed_hours) {
+    std::lock_guard<std::recursive_mutex> lk(mtx_);
+    rebound_breakouts_ = std::move(confirmed_hours);
+}
+
+void TrendEngine::note_rebound_entry(TrendBot& b, trend::Pos dir, int64_t sent_ms) {
+    // A late fill receipt for an order sent before this release cannot consume it.
+    if (b.is_auto && dir == trend::Pos::Short && rebound_released_ms_ > 0 && sent_ms > rebound_released_ms_)
+        b.last_rebound_release_ms = rebound_released_ms_;
+}
 int TrendEngine::close_auto_direction(trend::Pos direction, const std::string& reason, const ExitEvidence& evidence) {
     std::vector<std::string> ids;
     {
@@ -749,6 +767,7 @@ void TrendEngine::maintain_paused_hard_stops() {
                     b.pending = true;
                     trend::on_filled(b.st, b.reserved_dir, result.avg_price, b.uncertain_stop, b.cfg.rule, false,
                                      0, 0, 0);
+                    note_rebound_entry(b, b.reserved_dir, b.open_ms);
                     b.qty = result.executed_qty; b.open_stop = b.uncertain_stop; b.trough = result.avg_price;
                     b.open_uncertain = false; b.uncertain_qty = b.uncertain_stop = 0;
                     b.reserved_risk = b.reserved_margin = 0; b.reserved_dir = trend::Pos::Flat;
@@ -1081,7 +1100,7 @@ void TrendEngine::set_risk_limits(double total, double direction, double cost_bp
     risk_cost_rate_ = std::isfinite(cost_bps) && cost_bps > 0 ? cost_bps / 10000 : 0;
 }
 
-std::string TrendEngine::profit_entry_block(const TrendBot& self, trend::Pos dir) const {
+std::string TrendEngine::direction_entry_block(const TrendBot& self, trend::Pos dir) const {
     if (self.is_auto) {
         const auto& reason = dir == trend::Pos::Long ? profit_long_gate_ : profit_short_gate_;
         if (!reason.empty()) return reason;
@@ -1089,13 +1108,31 @@ std::string TrendEngine::profit_entry_block(const TrendBot& self, trend::Pos dir
         if (after > 0 && self.open_ms <= after && (self.bar_open_ms <= after || !self.following.closed_entry.ready ||
             !(dir == trend::Pos::Long ? self.following.closed_entry.long_confirmed : self.following.closed_entry.short_confirmed)))
             return "组合保护恢复后，等待新的收盘突破";
+        if (dir == trend::Pos::Short) {
+            if (rebound_paused_) return "急反弹保护：暂停新增空头风险";
+            if (rebound_released_ms_ > 0 && self.last_rebound_release_ms != rebound_released_ms_) {
+                const int64_t hour = wall_ms(host_) / rebound::kHour * rebound::kHour;
+                bool confirmed = false;
+                if (self.cfg.interval == "1h" && self.cfg.rule.following.enabled) {
+                    const auto closed = following::closed_signal(self.following);
+                    confirmed = self.bar_open_ms == hour && self.sig_ok && closed.ready &&
+                        self.following.settings == self.signal_following_config() &&
+                        self.following.regime == following::Regime::Down && closed.short_confirmed;
+                } else {
+                    const auto it = rebound_breakouts_.find(self.cfg.symbol);
+                    confirmed = it != rebound_breakouts_.end() && it->second == hour;
+                }
+                if (hour <= rebound_released_ms_ || !confirmed)
+                    return "急反弹保护已解除，等待新的1小时下跌趋势和收盘下破";
+            }
+        }
     }
     return {};
 }
 
 std::string TrendEngine::risk_gate_block(const TrendBot& self, trend::Pos dir, double want,
                                         const TrendBot* releasing) const {
-    if (auto why = profit_entry_block(self, dir); !why.empty()) return why;
+    if (auto why = direction_entry_block(self, dir); !why.empty()) return why;
     if (!(std::isfinite(want) && want > 0)) return "计划风险数据不合法";
     for (const auto& [key, count] : untracked_seen_)
         if (count >= 2) return "交易所有未跟踪仓位，暂停新增风险";
@@ -1693,7 +1730,7 @@ void TrendEngine::tick(const std::string& symbol, double price) {
                     break;
                 }
                 cap_logged_.erase(b.bot_id);
-                if (auto why = profit_entry_block(b, v.action == trend::Action::OpenLong ?
+                if (auto why = direction_entry_block(b, v.action == trend::Action::OpenLong ?
                                                   trend::Pos::Long : trend::Pos::Short); !why.empty()) {
                     b.last_decision = "空仓 | " + why;
                     if (b.is_auto) gate_blocked_auto_.insert(b.bot_id);
@@ -1799,7 +1836,7 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 if (!trend::allows(cfg.rule, dir)) return "当前配置不允许该方向";
                 if (const auto why = reentry_block(b, dir); *why) return why;
                 if (auto why = open_gate_block(b); !why.empty()) return why;
-                if (auto why = profit_entry_block(b, dir); !why.empty()) return why;
+                if (auto why = direction_entry_block(b, dir); !why.empty()) return why;
                 const auto quote_age = host_.now_steady() - b.price_time;
                 if (quote_age < std::chrono::steady_clock::duration::zero() || quote_age > std::chrono::seconds(15))
                     return "下单前报价已过期，等待最新报价";
@@ -2080,6 +2117,7 @@ void TrendEngine::execute_open(const std::string& id, trend::Pos dir, bool from_
                 }
                 trend::on_filled(b.st, dir, fill, init_stop, cfg.rule, from_reverse,
                                  entry_bar, entry_atr, entry_edge > 0 ? entry_edge : 0);
+                note_rebound_entry(b, dir, execution.at_ms);
                 b.reentry_after_ms = 0; // 只有实际开仓成交才消费等待状态。
                 b.rotation_health = {};
                 // 假突破从哪一根的收盘开始判：这根已经走到最后 1/4 才开仓的，留到下一根
@@ -2759,17 +2797,32 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reques
             if (previous_key.empty()) {
                 if (!record_execution(execution)) set_persistence_error("profit", "平仓账本待核对");
                 if (execution.key.empty()) execution.key = make_client_order_id();
+                std::string rotation_cancel;
                 {
                     std::lock_guard<std::recursive_mutex> lk(mtx_);
                     auto& b = bots_.at(id);
-                    if (b.close_retry.submissions == 0 && b.close_retry.queries == 0)
-                        b.close_retry.started = host_.now_steady();
-                    ++b.close_retry.submissions;
-                    b.pending_close_key = execution.key; b.pending_close_ms = execution.at_ms;
-                    b.pending_close_reason = reason;
-                    b.pending_close_evidence = evidence;
-                    b.pending_close_seen_on_exchange = b.close_missing_last_query = false;
-                    persist_stop_checkpoint(); // Also preserve the lookup key when the profit ledger is disabled.
+                    // A new short pause may have arrived while the rotation intent was saved.
+                    // Check before committing the replacement close, while its hard stop is still in place.
+                    if (fully_closed) rotation_cancel = rotation_close_block(b);
+                    if (!rotation_cancel.empty()) {
+                        b.pending = false;
+                    } else {
+                        if (b.close_retry.submissions == 0 && b.close_retry.queries == 0)
+                            b.close_retry.started = host_.now_steady();
+                        ++b.close_retry.submissions;
+                        b.pending_close_key = execution.key; b.pending_close_ms = execution.at_ms;
+                        b.pending_close_reason = reason;
+                        b.pending_close_evidence = evidence;
+                        b.pending_close_seen_on_exchange = b.close_missing_last_query = false;
+                        persist_stop_checkpoint(); // Also preserve the lookup key when the profit ledger is disabled.
+                    }
+                }
+                if (!rotation_cancel.empty()) {
+                    execution.completed = true;
+                    execution.result.error = "换仓平仓发送前取消：" + rotation_cancel;
+                    if (!record_execution(execution)) set_persistence_error("profit", "取消换仓账本写入失败");
+                    log(cfg.symbol + " " + execution.result.error);
+                    return;
                 }
                 r = client_->place_tagged_order(cfg.symbol, side_of(pos, true), qty, true, execution.key);
             } else {
@@ -2857,6 +2910,12 @@ void TrendEngine::execute_close(const std::string& id, const std::string& reques
                 const double sign = (pos == trend::Pos::Long) ? 1.0 : -1.0;
                 const double pnl  = (exit_px - entry) * closed_qty * sign;
 
+                if (reverse_to != trend::Pos::Flat) {
+                    if (const auto why = direction_entry_block(b, reverse_to); !why.empty()) {
+                        reverse_to = trend::Pos::Flat;
+                        reason = "触线出场（不反手：" + why + "）";
+                    }
+                }
                 tr.symbol      = cfg.symbol;
                 tr.side        = pos;
                 tr.entry_price = entry;

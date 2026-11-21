@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.20)
-project(TradingBot VERSION 1.4.6 LANGUAGES CXX)
+project(TradingBot VERSION 1.4.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -110,7 +110,8 @@ set(CORE_SOURCES
     src/core/funding_ledger.cpp
     src/core/smart_mode.cpp
     src/core/journal.cpp
-    src/app/smart_runner.cpp src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp src/app/profit_recovery.cpp
+    src/app/smart_runner.cpp src/app/rebound_service.cpp src/app/rebound_sampler.cpp
+    src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp src/app/profit_recovery.cpp
     src/net/trading_client.cpp src/net/profit_api.cpp
     src/net/rate_gate.cpp
     # GUI 与 headless 统一使用 REST 行情。
@@ -352,7 +353,8 @@ endif()
 
 # ── 智能模式执行层测试：假交易所 → 扫描 → 候选池决策落到引擎 ─────────────────
 add_executable(ccg_smart_runner_tests tests/test_smart_runner.cpp
-                                      src/app/smart_runner.cpp src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp src/app/profit_recovery.cpp src/core/smart_mode.cpp
+                                      src/app/smart_runner.cpp src/app/rebound_service.cpp src/app/rebound_sampler.cpp
+                                      src/app/profit_manager.cpp src/app/profit_checkpoint.cpp src/app/profit_service.cpp src/app/profit_recovery.cpp src/core/smart_mode.cpp
                                       src/core/journal.cpp
                                       src/core/trend_engine.cpp src/core/position_rotation.cpp src/core/monitor_state.cpp
                                       src/net/trading_client.cpp src/net/profit_api.cpp src/net/rate_gate.cpp)

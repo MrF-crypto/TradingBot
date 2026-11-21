@@ -375,6 +375,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> smart_busy{false};
     std::atomic<bool> profit_busy{false};
     std::atomic<bool> breadth_busy{false};
+    std::atomic<bool> rebound_busy{false};
     auto smart = std::make_shared<SmartRunner>(
         client, trend_engine, cfg.state_path + ".smart",
         [webhook](const std::string& m, bool warn) {
@@ -686,7 +687,14 @@ int main(int argc, char** argv) {
         //     到点检查每拍都做（只是比一下时间，很便宜；按分钟查会晚最多一分钟）
         {
             const int64_t now_ms = RestPriceFeed::now_ms();
-            smart->evaluate_profits(client->market_time_ms());
+            const int64_t market_now = client->market_time_ms();
+            smart->evaluate_profits(market_now);
+            if (smart->rebound_due(market_now) && !rebound_busy.exchange(true)) {
+                fetch_pool->submit([smart, &rebound_busy] {
+                    try { smart->refresh_rebound(); } catch (...) {}
+                    rebound_busy.store(false);
+                });
+            }
             if (tick_n % 5 == 1 && smart->needs_breadth_quotes() && !breadth_busy.exchange(true)) {
                 fetch_pool->submit([smart, &breadth_busy] {
                     try { smart->refresh_breadth(); } catch (...) {}

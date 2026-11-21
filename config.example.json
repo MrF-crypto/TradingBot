@@ -13,6 +13,7 @@
     "strategy": "trend_following",
     "dir_long": true,
     "dir_short": true,
+    "short_rebound_guard": false,
     "atr_pct_min": 0.1,
     "atr_pct_max": 8,
     "max_abs_chg24": 0,

@@ -1,5 +1,6 @@
 #include "core/atomic_file.h"
 #include "app/smart_runner.h"
+#include "app/rebound_sampler.h"
 #include "app/profit_manager.h"
 #include "core/parallel.h"
 #include "net/trading_client.h"
@@ -28,8 +29,10 @@ std::string fmt(double v, int prec) {
 std::vector<smart::Bar> closed_bars(const std::vector<TradingClient::Bar>& bars) {
     std::vector<smart::Bar> out;
     if (bars.size() < 2) return out;
-    out.reserve(bars.size() - 1);
-    for (size_t i = 0; i + 1 < bars.size(); ++i) {
+    // Keep the existing 200-hour feature horizon even for a longer breakout EMA.
+    const auto count = std::min<size_t>(bars.size() - 1, 200);
+    out.reserve(count);
+    for (size_t i = bars.size()-1-count; i + 1 < bars.size(); ++i) {
         const auto& b = bars[i];
         out.push_back({b.open_ms, b.open, b.high, b.low, b.close, b.volume,
                        b.quote_volume, b.taker_buy_quote});
@@ -133,7 +136,8 @@ bool gate_universe(TradingClient& c, const smart::Config& cfg,
 } // namespace
 
 MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
-                       const std::set<std::string>& pool_syms, int64_t now_ms, int parallel) {
+                       const std::set<std::string>& pool_syms, int64_t now_ms, int parallel,
+                       rebound::Sampler* sampler) {
     MarketScan r;
     auto& out = r.outcome;
     std::vector<std::string> cand;
@@ -143,12 +147,20 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
 
     std::vector<smart::Features> feats(cand.size());
     std::vector<char> got(cand.size(), 0);
+    std::vector<int64_t> confirmed(cand.size(), 0);
+    const int history = cfg.short_rebound_guard ? rebound::confirmation_history(cfg.tmpl.rule) : 0;
     parallel_for((int)cand.size(), parallel, [&](int i) {
         try {
-            const auto bars = closed_bars(c.fetch_klines(cand[i], "1h", 201));
+            const auto raw = c.fetch_klines(cand[i], "1h", std::max(201, history));
+            const auto bars = closed_bars(raw);
             if ((int)bars.size() < smart::kMinBars) return;
             feats[i] = smart::compute_features(bars);
             got[i] = 1;
+            if (cfg.short_rebound_guard) {
+                const auto closed = c.market_time_ms()/kHourMs*kHourMs;
+                if (sampler) sampler->seed_hourly(cand[i], raw, closed);
+                if (rebound::confirmed_short(raw, closed, cfg.tmpl.rule)) confirmed[i] = closed;
+            }
         } catch (...) {}
     });
 
@@ -168,6 +180,7 @@ MarketScan scan_market(TradingClient& c, const smart::Config& cfg,
             continue;
         }
         eligible[s] = feats[i];
+        if (confirmed[i] > 0) r.rebound_short_breakouts.emplace(s, confirmed[i]);
     }
     // K线大面积拉不到：按数据故障处理，不据此批量移除已有候选。
     if (!cand.empty() && fetched * 10 < (int)cand.size() * 7) {
@@ -223,7 +236,15 @@ void SmartRunner::seed_day_from_history(const std::vector<TrendTrade>& trades) {
     }
 }
 
-void SmartRunner::cancel() { cancelled_.store(true); if (profits_) profits_->cancel(); }
+void SmartRunner::cancel() {
+    {
+        // A replacement runner can load this state file as soon as cancel returns.
+        // Serialize cancellation with any snapshot already being committed.
+        std::lock_guard lock(mtx_);
+        cancelled_.store(true);
+    }
+    if (profits_) profits_->cancel();
+}
 
 SmartRunner::SmartRunner(std::shared_ptr<TradingClient> client, std::shared_ptr<TrendEngine> engine,
                          std::string state_path, LogFn log)
@@ -252,10 +273,29 @@ void SmartRunner::set_config(const smart::Config& cfg) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         const std::string before = smart::config_to_json(cfg_);
+        const bool refresh_breakouts = cfg.enabled != cfg_.enabled ||
+            cfg.short_rebound_guard != cfg_.short_rebound_guard ||
+            cfg.tmpl.rule.following != cfg_.tmpl.rule.following ||
+            cfg.tmpl.rule.donchian_period != cfg_.tmpl.rule.donchian_period ||
+            cfg.tmpl.rule.atr_period != cfg_.tmpl.rule.atr_period;
         cfg_ = cfg;
         // 任何变化都立刻重扫一次：门槛、方向、模板变了，名单和 bot 参数都要跟上。
-        if (smart::config_to_json(cfg_) != before) {
+        const bool changed = smart::config_to_json(cfg_) != before;
+        if (changed) {
             next_due_ms_ = 0;
+            ++rebound_generation_;
+        }
+        if (refresh_breakouts && engine_) engine_->set_rebound_breakouts({});
+        if (cfg_.enabled && cfg_.short_rebound_guard) {
+            if (!rebound_sampler_) rebound_sampler_ = std::make_shared<rebound::Sampler>();
+        } else if (rebound_sampler_ || rebound_state_.paused || rebound_state_.last_close_ms ||
+                   rebound_next_close_ms_ || !rebound_pool_.empty()) {
+            rebound_sampler_.reset();
+            rebound_state_ = {};
+            rebound_reading_ = {};
+            rebound_pool_.clear(); rebound_next_pool_.clear();
+            rebound_next_close_ms_ = rebound_reading_ms_ = rebound_retry_ms_ = 0;
+            save_locked();
         }
         apply_engine_gates_locked();
     }
@@ -290,6 +330,8 @@ smart::Config SmartRunner::config() const {
 
 void SmartRunner::apply_engine_gates_locked() {
     if (!engine_) return;
+    engine_->set_rebound_gate(rebound_sampler_ && rebound_state_.paused,
+                              rebound_sampler_ ? rebound_state_.released_ms : 0);
     // 暂停开新仓是全局应急开关，智能模式关着也照样生效
     engine_->set_pause_new(cfg_.pause_new);
     engine_->set_rotation_enabled(cfg_.enabled && cfg_.rotate_when_full);
@@ -350,7 +392,15 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     std::unique_lock<std::mutex> rl(run_mtx_, std::try_to_lock);
     if (!rl.owns_lock()) return last_report();   // 上一轮还在跑
 
-    const smart::Config cfg = config();
+    smart::Config cfg;
+    std::shared_ptr<rebound::Sampler> sampler;
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        cfg = cfg_;
+        sampler = rebound_sampler_;
+        generation = rebound_generation_.load();
+    }
     Report rep;
     rep.at_ms = now_ms;
     if (cancelled_.load()) return rep;
@@ -386,7 +436,7 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
         if (b.is_auto) pool_syms.insert(b.cfg.symbol);
     }
 
-    const auto scan = scan_market(*client_, cfg, pool_syms, now_ms);
+    const auto scan = scan_market(*client_, cfg, pool_syms, now_ms, 3, sampler.get());
     // 扫描要几十秒，期间这个运行器可能已经被作废（断线重连换了新的）：不落地
     if (cancelled_.load() || smart::config_to_json(config()) != smart::config_to_json(cfg)) return rep;
     {
@@ -536,6 +586,8 @@ SmartRunner::Report SmartRunner::run_once(int64_t now_ms) {
     }
 
     std::lock_guard<std::mutex> lk(mtx_);
+    if (sampler && generation == rebound_generation_ && !cancelled_ && scan.complete_catalog)
+        stage_rebound_candidates_locked(scan, client_->market_time_ms());
     last_ = rep;
     save_locked();
     return rep;
@@ -572,7 +624,9 @@ void SmartRunner::save_locked() const {
     std::ostringstream o;
     o << std::setprecision(std::numeric_limits<double>::max_digits10);
     const auto d = engine_ ? engine_->day_pnl_checkpoint() : TrendEngine::DayPnl{};
-    o << "{\"pool\":" << pool_.to_json() << ",\"day\":{\"d\":" << d.day << ",\"r\":" << d.realized << "}}";
+    o << "{\"pool\":" << pool_.to_json() << ",\"day\":{\"d\":" << d.day << ",\"r\":" << d.realized << '}';
+    if (rebound_sampler_) o << ",\"rebound\":" << rebound_checkpoint_locked();
+    o << '}';
     const auto result = write_atomic_file(state_path_, o.str());
     if (engine_) engine_->set_persistence_error("智能状态", result.error);
 }
@@ -587,6 +641,9 @@ void SmartRunner::load() {
     simdjson::dom::element root;
     auto ps = simdjson::padded_string(raw);
     if (p.parse(ps).get(root) != simdjson::SUCCESS) return;
+    simdjson::dom::element rebound_checkpoint;
+    if (root["rebound"].get(rebound_checkpoint) == simdjson::SUCCESS)
+        restore_rebound_checkpoint(simdjson::to_string(rebound_checkpoint));
     simdjson::dom::element pool;
     if (root["pool"].get(pool) == simdjson::SUCCESS) {
         std::lock_guard<std::mutex> lk(mtx_);

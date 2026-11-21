@@ -46,6 +46,7 @@ struct Config {
     double event_move_atr = 2, event_min_move_pct = 1;
     int    max_positions    = 20;    // 同时持仓上限（全部 bot）
     bool   rotate_when_full = false; // 满仓时，以收盘突破替换持续失去趋势许可的自动持仓
+    bool   short_rebound_guard = false; // 市场普遍反弹时暂停新增智能空头风险
     double daily_loss_limit = 0;     // 当日亏损限额（U，0=关）
     double float_loss_limit = 0;     // 持仓浮亏限额（U，0=关）
     bool   pause_new        = false; // 应急：暂停全部 bot 开新仓（不删 bot、不动已有仓位）

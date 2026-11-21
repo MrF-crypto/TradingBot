@@ -327,6 +327,7 @@ struct TrendBot {
     // 智能趋势跟踪平仓后：最早可用的收盘确认时间（下一根完整K线收盘）。
     // 保留到下一笔开仓成交；落盘、换参数与候选重扫都不能清掉等待。
     int64_t reentry_after_ms = 0;
+    int64_t last_rebound_release_ms = 0; // Most recent release followed by a filled automatic short.
     bool waiting_reentry() const {
         return is_auto && cfg.rule.strategy == trend::Strategy::TrendFollowing && reentry_after_ms > 0;
     }
@@ -452,6 +453,8 @@ public:
     int  close_all();
     int close_auto_direction(trend::Pos direction, const std::string& reason, const ExitEvidence& evidence = {});
     void set_profit_gate(trend::Pos direction, std::string reason, int64_t fresh_after);
+    void set_rebound_gate(bool paused, int64_t released_ms);
+    void set_rebound_breakouts(std::map<std::string,int64_t> confirmed_hours);
     using ExecutionCb = std::function<bool(ExecutionEvent&)>;
     void set_execution_cb(ExecutionCb cb);
     void remove_bot(const std::string& bot_id);
@@ -748,7 +751,8 @@ private:
     std::string open_gate_block(const TrendBot& self, const TrendBot* releasing = nullptr) const;
     void start_reentry_wait(TrendBot& bot);
     const char* reentry_block(const TrendBot& bot, trend::Pos direction) const;
-    std::string profit_entry_block(const TrendBot& self, trend::Pos dir) const;
+    std::string direction_entry_block(const TrendBot& self, trend::Pos dir) const;
+    void note_rebound_entry(TrendBot& bot, trend::Pos dir, int64_t sent_ms);
     std::string risk_gate_block(const TrendBot& self, trend::Pos dir, double risk,
                                 const TrendBot* releasing = nullptr) const;
     double max_total_risk_ = 0, max_direction_risk_ = 0, risk_cost_rate_ = 0;
@@ -791,6 +795,9 @@ private:
     bool record_execution(ExecutionEvent& event);
     std::string profit_long_gate_, profit_short_gate_;
     int64_t profit_long_after_ = 0, profit_short_after_ = 0;
+    bool rebound_paused_ = false;
+    int64_t rebound_released_ms_ = 0;
+    std::map<std::string,int64_t> rebound_breakouts_; // Confirmed 1h evidence for other signal timeframes.
     FilterCb                        filter_cb_;
     int                             seq_ = 0;
     double                          max_total_margin_   = 0;   // 0=不限

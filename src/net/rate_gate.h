@@ -51,10 +51,11 @@ public:
         int     throttled   = 0;      // 累计被本地限速推迟的次数
         int     rejected    = 0;      // 累计收到的 429/418/-1003 次数
     };
-    Snapshot snapshot() const;
+    Snapshot snapshot(std::chrono::steady_clock::time_point as_of = std::chrono::steady_clock::now()) const;
 
 private:
     using clock = std::chrono::steady_clock;
+    int current_weight_locked(clock::time_point now) const;
     mutable std::mutex mtx_;
     Limits  lim_{};
     int     used_weight_ = 0;

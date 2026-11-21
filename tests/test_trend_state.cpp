@@ -657,6 +657,7 @@ int main() {
         saved.rotation_health.best_close = 119.876543210987;
         saved.st.cooldown_left = 2; saved.last_counted_bar_ms = saved.monitor.cursor_ms;
         saved.rotation_attempt_bar_ms = saved.monitor.cursor_ms;
+        saved.last_rebound_release_ms = saved.open_ms - 300000;
         saved.monitor.waiting_for_bar = saved.monitor.recovering = true;
         saved.monitor.data_error = "新K线尚未就绪";
         save_trend_state(path, {saved});
@@ -678,9 +679,16 @@ int main() {
                   "arming, cooldown, same-bar rotation guard and actual strategy survive restart");
             check(restored.monitor.events.front().text == saved.monitor.events.front().text,
                   "event timeline survives escaped JSON round trip");
+            check(restored.last_rebound_release_ms == saved.last_rebound_release_ms,
+                  "a filled post-rebound short remains confirmed across a restart");
         }
         auto invalid = saved; invalid.rotation_health.weak_bars = 7;
         auto destination = saved; std::string error;
+        auto legacy = monitor_checkpoint_json(saved);
+        const auto field = legacy.find(",\"last_rebound_release\":");
+        if (field != std::string::npos) legacy.erase(field, legacy.find(',', field + 1) - field);
+        check(restore_monitor_checkpoint(legacy, destination, error) && destination.last_rebound_release_ms == 0,
+              "existing monitor checkpoints safely default the per-symbol rebound release to zero");
         check(!restore_monitor_checkpoint(monitor_checkpoint_json(invalid), destination, error) &&
               destination.rotation_health.weak_bars == 3 && !error.empty(),
               "corrupt counter ordering is rejected without partial mutation");

@@ -214,6 +214,7 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "risk_budget_scenarios.h"
 #include "reentry_scenarios.h"
 #include "rotation_scenarios.h"
+#include "rebound_order_scenarios.h"
 #include "resume_scenarios.h"
 #include "audit_engine_scenarios.h"
 #include "leverage_engine_scenarios.h"
@@ -223,6 +224,7 @@ static void feed(TrendEngine& e, const std::string& id, double atr,
 #include "close_retry_scenarios.h"
 
 int main() {
+    test_rebound_orders();
     test_close_retry_scenarios();
     test_exit_evidence_scenarios();
     test_stop_reconciliation_scenarios();

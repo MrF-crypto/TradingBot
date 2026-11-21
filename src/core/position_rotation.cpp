@@ -85,7 +85,7 @@ bool TrendEngine::rotation_exit_eligible(const TrendBot& b, bool allow_pending) 
 std::string TrendEngine::rotation_entry_block(const TrendBot& b, trend::Pos dir,
                                               int64_t signal_bar, trend::Inputs* out) const {
     if (!rotation_enabled_ || max_open_positions_ <= 0) return "满仓换仓已关闭或未设置持仓上限";
-    if (auto why = profit_entry_block(b, dir); !why.empty()) return why;
+    if (auto why = direction_entry_block(b, dir); !why.empty()) return why;
     if (!b.is_auto || b.cfg.rule.strategy != trend::Strategy::TrendFollowing || !b.cfg.rule.following.enabled ||
         b.needs_reconcile || b.monitor.recovering || b.state != TrendBot::State::Running || b.retiring || b.open_uncertain || !b.armed ||
         b.st.pos != trend::Pos::Flat || b.qty != 0 || (b.pending && rotation_.incoming != b.bot_id))

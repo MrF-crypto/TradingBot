@@ -33,6 +33,11 @@ int to_int(const std::string& s, int def = 0) {
 
 } // namespace
 
+int RateGate::current_weight_locked(clock::time_point now) const {
+    return weight_at_ != clock::time_point{} && now - weight_at_ < std::chrono::minutes(1)
+        ? used_weight_ : 0;
+}
+
 void RateGate::acquire(bool is_order) {
     for (;;) {
         clock::duration wait{};
@@ -46,11 +51,8 @@ void RateGate::acquire(bool is_order) {
             } else {
                 // ② 权重逼近上限：只限速非订单请求。
                 //    权重读数超过 1 分钟视为过期（窗口已滚过），按 0 处理
-                const bool weight_fresh =
-                    weight_at_.time_since_epoch().count() != 0 &&
-                    (now - weight_at_) < std::chrono::seconds(60);
-                const double ratio = (weight_fresh && lim_.weight_per_min > 0)
-                    ? (double)used_weight_ / lim_.weight_per_min : 0.0;
+                const double ratio = lim_.weight_per_min > 0
+                    ? (double)current_weight_locked(now) / lim_.weight_per_min : 0.0;
 
                 if (!is_order && ratio >= lim_.hard_ratio) {
                     // 硬阈值：等到当前分钟窗口过完再说
@@ -109,12 +111,11 @@ void RateGate::observe(long http_code, const std::string& headers,
     }
 }
 
-RateGate::Snapshot RateGate::snapshot() const {
+RateGate::Snapshot RateGate::snapshot(clock::time_point now) const {
     std::lock_guard<std::mutex> lk(mtx_);
     Snapshot s;
-    s.used_weight = used_weight_;
+    s.used_weight = current_weight_locked(now);
     s.limit       = lim_.weight_per_min;
-    const auto now = clock::now();
     s.banned = ban_until_ > now;
     if (s.banned)
         s.ban_left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -127,6 +127,11 @@ int main() {
         RateGate g(lim);
         long long ms = timed_acquire(g, false);
         check(ms < 50, "从未收到过权重头时不限速（实测 " + std::to_string(ms) + "ms）");
+        g.observe(200, "X-MBX-USED-WEIGHT-1M: 970\r\n", "{}");
+        const auto now = std::chrono::steady_clock::now();
+        check(g.snapshot(now + std::chrono::seconds(59)).used_weight == 970 &&
+              g.snapshot(now + std::chrono::seconds(60)).used_weight == 0,
+              "后台可选行情在旧权重过期后自动恢复，不依赖其他请求刷新权重");
     }
 
     std::printf(g_fail ? "\n%d 项失败\n" : "\n全部通过\n", g_fail);

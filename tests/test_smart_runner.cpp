@@ -25,6 +25,8 @@ static void check(bool ok, const std::string& what) {
 }
 static bool has(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
 
+#include "rebound_sampler_scenarios.h"
+
 static constexpr int64_t kDay = 24LL * 3600 * 1000;
 static constexpr int64_t kNow = 1'800'000'000'000LL;
 
@@ -49,6 +51,7 @@ struct FakeMarket {
     bool oi_429 = false;                   // 持仓量接口整组被限流（它有自己的独立配额）
     std::atomic<int> oi_calls{0};
     std::atomic<int> btc_kline_calls{0};
+    std::function<std::string(const std::string&, const std::string&)> candle_reply;
 
     // 持仓量：25 个整点，每小时 +10，持仓价值固定 5e6
     static std::string oi_hist(const std::string& sym) {
@@ -126,7 +129,8 @@ struct FakeMarket {
             if (path.rfind("/fapi/v1/klines?symbol=", 0) == 0) {
                 const auto s = path.substr(23, path.find('&') - 23);
                 if (s == "BTCUSDT") ++btc_kline_calls;
-                out.body = fail_klines.count(s) ? "" : klines(s);
+                if (fail_klines.count(s)) out.body = "";
+                else out.body = candle_reply ? candle_reply(s, path) : klines(s);
                 return true;
             }
             if (path.rfind("/futures/data/openInterestHist?symbol=", 0) == 0) {
@@ -209,10 +213,50 @@ static void basic_market(FakeMarket& m) {
     m.syms["NEWUSDT"]  = {0.05, 20e6, kNow - 3 * kDay};     // 上线太短
 }
 
+#include "rebound_runner_scenarios.h"
+
+static void test_rebound_scan_history(const std::string& dir) {
+    Rig r(dir + "/rebound_scan.json");
+    r.mk.syms["AAAUSDT"] = {};
+    r.tc->set_wall_clock_for_test([]{ return kNow; });
+    std::vector<int> limits;
+    r.mk.candle_reply = [&](const std::string&, const std::string& path) {
+        const int count = std::stoi(path.substr(path.find("limit=") + 6));
+        limits.push_back(count);
+        std::ostringstream rows;
+        rows << '[';
+        for (int age = count-1; age >= 0; --age) {
+            const double close = 100 + age;
+            const double high = close + (age > 200 ? 250 : .4);
+            if (age != count-1) rows << ',';
+            rows << '[' << kNow - age*rebound::kHour << ",\"" << close+.3 << "\",\""
+                 << high << "\",\"" << close-.1 << "\",\"" << close << "\",\"10\"]";
+        }
+        return rows.str() + ']';
+    };
+    auto cfg = r.cfg();
+    cfg.tmpl.interval = "15m";
+    cfg.tmpl.rule.following.enabled = false;
+    cfg.tmpl.rule.following.slow_period = 120;
+    const auto base = scan_market(*r.tc, cfg, {}, kNow, 1);
+    cfg.short_rebound_guard = true;
+    const auto guarded = scan_market(*r.tc, cfg, {}, kNow, 1);
+    check(limits == std::vector<int>{201, rebound::confirmation_history(cfg.tmpl.rule)} &&
+          guarded.rebound_short_breakouts.contains("AAAUSDT") &&
+          guarded.rebound_short_breakouts.at("AAAUSDT") == kNow,
+          "非1h模板及手动关闭EMA时，复用一次长小时历史确认收盘下破");
+    check(base.outcome.candidates.contains("AAAUSDT") && guarded.outcome.candidates.contains("AAAUSDT") &&
+          base.outcome.candidates.at("AAAUSDT").atr_pct == guarded.outcome.candidates.at("AAAUSDT").atr_pct,
+          "长EMA所需额外历史不改变原候选的200小时 ATR及准入");
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    rebound_sampler_scenarios();
     const std::string dir = (std::filesystem::temp_directory_path() / "ccg_smart_runner_test").string();
     std::filesystem::create_directories(dir);
+    test_rebound_scan_history(dir);
+    test_rebound_runner(dir);
 
     // ── 基本流程：扫描 → 全部合格币 → 自动建 bot ─────────────────────
     {
